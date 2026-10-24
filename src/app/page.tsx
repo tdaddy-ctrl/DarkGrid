@@ -26,6 +26,7 @@ const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
 const CHART_EVERY_S = 2;     // one ChartPoint every 2 sim-seconds
 const MAX_FRAME_S = 0.25;    // a stalled tab doesn't fast-forward minutes at once
+const FOLLOW_SPEED = 0.3;    // following the ambulance runs the sim in slow motion (3x instead of 10x) so the camera can keep up
 
 type Mode = SimSnapshot['mode'];
 type View = {
@@ -148,6 +149,9 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const [split, setSplit] = useState(false);                // both cities side by side
   const [follow, setFollow] = useState(false);              // 3D camera chases the ambulance
   const [expanded, setExpanded] = useState(false);          // the map takes the whole screen below the header
+  const slowRef = useRef(false);
+  const ambDriving = view ? (mode === 'FIFO' ? view.fifo : view.darkgrid).ambulance?.status === 'EN_ROUTE' : false;
+  useEffect(() => { slowRef.current = follow && ambDriving; }, [follow, ambDriving]);
   const [proposal, setProposal] = useState<ChaosResult | null>(null);   // Claude's draft for the zone card
   const [hazard, setHazard] = useState<{ center: LatLng; label: string } | null>(null);   // where this run's blackout hit
 
@@ -287,7 +291,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
       const realDt = Math.min(MAX_FRAME_S, (now - last) / 1000);
       last = now;
       if (sims && !pausedRef.current) {
-        acc += realDt * SIM_SPEED;
+        acc += realDt * SIM_SPEED * (slowRef.current ? FOLLOW_SPEED : 1);
         while (acc >= STEP_S) {
           const before = sims.fifo.t;
           step(sims.fifo, STEP_S);

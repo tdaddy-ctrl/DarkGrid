@@ -10,6 +10,7 @@ import type { Deck, Layer, MapViewState } from '@deck.gl/core';
 import type { Ambulance, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
 import { followCamera } from '@/lib/followCamera';
+import { civilianPos, createTraffic, updateTraffic } from './civilianTraffic';
 
 type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
 
@@ -35,8 +36,10 @@ const STATE_RGB: Record<string, Rgba> = {
   STAGED: [56, 189, 248, 245], ARRIVED: [148, 163, 184, 200],
 };
 const LEGEND: [string, string][] = [
-  ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'],
+  ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'], ['Civilian cars', '#9ca3af'],
 ];
+// Everyday car colors for civilian traffic (the Waymos are all white).
+const CIVILIAN_PAINT: Rgba[] = [[24, 26, 30, 255], [70, 74, 82, 255], [130, 134, 140, 255], [120, 18, 22, 255], [22, 38, 70, 255], [190, 190, 196, 255]];
 // Home view: from the SoMa blackout looking north-northeast at the downtown skyline
 // (Salesforce Tower), so the hazard sits in the lower middle and the towers fill the top.
 const HOME = { longitude: -122.4030, latitude: 37.7776, zoom: 13.75, pitch: 60, bearing: 15 };
@@ -52,8 +55,9 @@ const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
 const WAYMO_GLB = '/models/waymo.glb';
 const AMBULANCE_GLB = '/models/ambulance.glb';
 const CAR_MIN_PX = 1.7;
+const CHASE_PITCH = 66;           // low enough to see the towers around the street
 const CAR_LIFT_M = 0.5;           // models sit this far above the sampled ground so small height errors never bury them
-const CHASE_ZOOM = 19.0;          // follow mode: close enough to see the ambulance and the cars around it
+const CHASE_ZOOM = 18.6;          // follow mode: close enough to see the ambulance and the cars around it
 // Models face +X (east) at yaw 0; yaw turns them to the compass heading (clockwise from north).
 const orient = (headingDeg: number): [number, number, number] => [0, 90 - headingDeg, 0];
 // Painted parts take the scene lights like the buildings; lamps and beacons ignore lighting so they glow.
@@ -68,16 +72,17 @@ const PHOTO_GROUND_OFFSET_M = -31.0;
 // Height of the ground (m above sea level) anywhere on the map, from the nearest intersections (inverse distance).
 function groundSampler(points: [number, number, number][]): (lng: number, lat: number) => number {
   const CELL = 0.002;
-  const grid = new Map<string, [number, number, number][]>();
+  const key = (cx: number, cy: number) => cx * 1_000_003 + cy;   // numeric keys: this runs thousands of times a frame
+  const grid = new Map<number, [number, number, number][]>();
   for (const p of points) {
-    const k = `${Math.floor(p[0] / CELL)},${Math.floor(p[1] / CELL)}`;
+    const k = key(Math.floor(p[0] / CELL), Math.floor(p[1] / CELL));
     (grid.get(k) ?? grid.set(k, []).get(k)!).push(p);
   }
   return (lng, lat) => {
     const cx = Math.floor(lng / CELL), cy = Math.floor(lat / CELL);
     let w = 0, z = 0;
     for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
-      for (const p of grid.get(`${cx + dx},${cy + dy}`) ?? []) {
+      for (const p of grid.get(key(cx + dx, cy + dy)) ?? []) {
         const d2 = ((p[0] - lng) * 0.79) ** 2 + (p[1] - lat) ** 2 + 1e-10;
         const k = 1 / d2;
         w += k; z += k * p[2];
@@ -386,13 +391,14 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         // Cars: white Waymo models gliding between updates (headlights and taillights glow). A car that is
         // queued or waiting for help gets a colored ring on the ground; help requests also pulse red.
         // One SimpleMeshLayer per material of a model, all sharing positions and headings.
-        const modelLayers = <T,>(id: string, parts: CarPart[], data: T[], pos: (d: T) => Pt, heading: (d: T) => number, scale: number, now: number): Layer[] => {
+        const modelLayers = <T,>(id: string, parts: CarPart[], data: T[], pos: (d: T) => Pt, heading: (d: T) => number, scale: number, now: number,
+          paint?: (d: T) => Rgba): Layer[] => {
           const strobe = Math.floor(now / 250) % 2 === 0;
           return parts.map((p) => {
             const color: Rgba = p.name === 'beaconR' ? (strobe ? p.color : [70, 8, 8, 255]) : p.name === 'beaconW' ? (strobe ? [60, 60, 60, 255] : p.color) : p.color;
             return new mesh.SimpleMeshLayer({
               id: `${id}-${p.name}`, data, mesh: p.mesh, getPosition: pos, getOrientation: (d: T) => orient(heading(d)),
-              getColor: color, sizeScale: scale, material: p.glow ? false : p.name === 'glass' ? GLASS : PAINT,
+              getColor: paint && p.name === 'paint' ? paint : color, sizeScale: scale, material: p.glow ? false : p.name === 'glass' ? GLASS : PAINT,
               updateTriggers: { getColor: strobe },
             });
           });
@@ -426,6 +432,14 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           ];
         };
 
+        // Civilian traffic (visual only, see civilianTraffic.ts): same body as the Waymo, no sensors.
+        const traffic = createTraffic(graph);
+        const civilianParts = waymoParts.filter((p) => p.name !== 'sensor');
+        const nodeIdAt = new Map(graph.nodes.map((n) => [`${n.lat},${n.lng}`, n.id]));
+        let darkIds = new Set<number>();
+        let trafficSimT = -1;
+        const mPerLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
+
         // Streetlights at every lit intersection; the ones inside the blackout go out.
         let lightsFor: SimSnapshot | null = null;
         let lightsPhoto = photo;
@@ -449,11 +463,17 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           const chase = followRef.current ? ambNow : null;
           if (chase) {
             const next = followCamera(chase, { latitude: view.latitude, longitude: view.longitude, zoom: view.zoom, pitch: view.pitch ?? 0, bearing: view.bearing ?? 0 });
-            // Keep the ambulance itself in the middle of the frame (the patient clock covers the top), closer in.
-            view = { ...view, ...next, zoom: view.zoom + (CHASE_ZOOM - view.zoom) * 0.1,
-              latitude: view.latitude + (chase.pos.lat - view.latitude) * 0.18, longitude: view.longitude + (chase.pos.lng - view.longitude) * 0.18 };
+            // Fly in, then stay locked on the ambulance (its position is already smoothed), a bit lower and closer.
+            const away = Math.hypot((chase.pos.lng - view.longitude) * mPerLng, (chase.pos.lat - view.latitude) * 110540);
+            const k = away > 40 ? 1 - Math.exp(-dt * 4) : 1;
+            view = { ...view, ...next, zoom: view.zoom + (CHASE_ZOOM - view.zoom) * (1 - Math.exp(-dt * 2)),
+              pitch: (view.pitch ?? 0) + (CHASE_PITCH - (view.pitch ?? 0)) * (1 - Math.exp(-dt * 2)),
+              latitude: view.latitude + (chase.pos.lat - view.latitude) * k, longitude: view.longitude + (chase.pos.lng - view.longitude) * k,
+              position: [0, 0, gz(chase.pos.lng, chase.pos.lat)] };   // aim at the street, not at height 0
             target = null; lastTouch = now;
             swayBase = view.bearing ?? 0; swayT = 0;
+          } else if (view.position && view.position[2] !== 0) {
+            view = { ...view, position: [0, 0, 0] };   // leaving follow mode: aim at height 0 again
           } else if (target) {
             const k = Math.min(1, dt * 6), t = target;
             const ease = (a: number | undefined, b: number | undefined) => (a ?? 0) + ((b ?? 0) - (a ?? 0)) * k;
@@ -474,12 +494,23 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           const center: [number, number, number] = [hz.lng, hz.lat, gz(hz.lng, hz.lat)];
           const outage = snap.darkNodes.length > 0;
           const pulse = (now / 1000) % 2.4 / 2.4;
+          // The red wash reads well from above but floods a street-level close-up: fade it when zoomed in.
+          const hazardFade = Math.round(Math.min(1, Math.max(0.15, (17.5 - view.zoom) / 2)) * 20) / 20;
           const dyn: Layer[] = [];
           if (snap !== lightsFor || photo !== lightsPhoto) {
             lightsFor = snap; lightsPhoto = photo;
-            const dark = new Set(snap.darkNodes.map((p) => `${p.lat},${p.lng}`));
-            streetLights = graph.nodes.filter((n) => !dark.has(`${n.lat},${n.lng}`)).map((n) => [n.lng, n.lat, gz(n.lng, n.lat) + 3] as Pt);
+            darkIds = new Set(snap.darkNodes.map((p) => nodeIdAt.get(`${p.lat},${p.lng}`) ?? -1));
+            streetLights = graph.nodes.filter((n) => !darkIds.has(n.id)).map((n) => [n.lng, n.lat, gz(n.lng, n.lat) + 3] as Pt);
           }
+          // Civilian cars advance with sim time (frozen while paused or replaying).
+          const simDt = live ? (trafficSimT < 0 ? 0 : Math.max(0, live.t - trafficSimT)) : 0;
+          if (live) trafficSimT = live.t;
+          updateTraffic(traffic, simDt, dt, ambNow, darkIds, snap.corridor);
+          // Positions once per frame; every part layer of the model reads the same array.
+          const civilians = traffic.cars.map((c) => {
+            const p = civilianPos(traffic, c);
+            return { at: [p.lng, p.lat, gz(p.lng, p.lat) + CAR_LIFT_M] as Pt, heading: c.heading, paint: c.paint };
+          });
           dyn.push(new L.ScatterplotLayer({
             id: 'street-lights', parameters: GLOW, data: streetLights, getPosition: (p: Pt) => p,
             getRadius: 2.5, radiusUnits: 'pixels', getFillColor: [255, 186, 110, photo ? 150 : 110],
@@ -493,8 +524,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             dyn.push(
               new L.ScatterplotLayer({
                 id: 'hazard-glow', parameters: ON_TOP, data: [0.35, 0.65, 1], getPosition: () => center,
-                getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(40 * (1.2 - f))],
-                stroked: false, filled: true, radiusUnits: 'meters',
+                getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(40 * (1.2 - f) * hazardFade)],
+                stroked: false, filled: true, radiusUnits: 'meters', updateTriggers: { getFillColor: hazardFade },
               }),
               new L.ScatterplotLayer({
                 id: 'hazard-rings', parameters: ON_TOP, data: [0, 1 / 3, 2 / 3], getPosition: () => center,
@@ -538,6 +569,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
               getWidth: 2, widthUnits: 'pixels', capRounded: true, jointRounded: true,
             }),
             ...carLayers(L, now),
+            ...modelLayers('civ', civilianParts, civilians, (c) => c.at, (c) => c.heading, carScale(), now, (c) => CIVILIAN_PAINT[c.paint]),
           );
           const amb = ambNow;
           if (amb) {
