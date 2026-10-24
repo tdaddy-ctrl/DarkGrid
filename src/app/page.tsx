@@ -11,6 +11,9 @@ import {
   answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
 } from '@/lib/sim';
 import { SEED, SIM_SPEED } from '@/lib/config';
+import type { ChaosResult } from '@/app/api/analyze-chaos/route';
+import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
+import AskWhyBar from '@/components/AskWhyBar';
 
 const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
@@ -75,6 +78,11 @@ export default function Home() {
     injectEvent(sims.darkgrid, { type: 'OUTAGE' });
     publish();
   }, [publish]);
+
+  // Only OUTAGE drives the sim today; the other event types are shown but change nothing.
+  const onChaos = useCallback((r: ChaosResult) => {
+    if (r.event.type === 'OUTAGE') blackout();
+  }, [blackout]);
 
   useEffect(() => {
     freshSims();             // first publish happens in the loop below
@@ -165,6 +173,11 @@ export default function Home() {
         <MetricsPlaceholder snapshot={view.fifo} />
         <MetricsPlaceholder snapshot={view.darkgrid} />
         <ChartPlaceholder data={view.chart} />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <ChaosInjectorPanel onResult={onChaos} />
+        <AskWhyBar jobs={snap.jobs} />
       </div>
     </main>
   );

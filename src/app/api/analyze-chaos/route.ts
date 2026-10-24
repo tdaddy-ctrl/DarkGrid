@@ -2,9 +2,9 @@
 // Uses Claude when ANTHROPIC_API_KEY is set; otherwise, or on any failure, a keyword
 // parser answers instead. Always returns valid JSON, never throws.
 
-type EventType = 'OUTAGE' | 'DEMAND_SURGE' | 'COMMS_DEGRADATION';
+export type EventType = 'OUTAGE' | 'DEMAND_SURGE' | 'COMMS_DEGRADATION';
 
-type ChaosResult = {
+export type ChaosResult = {
   event: { type: EventType; zone?: string; radius_m?: number; magnitude?: number };
   policy: { dispatch: 'WSPT_TRIAGE'; batchMax: number; darkSignalsAsFourWayStop: number[] };
   rationale: string;
