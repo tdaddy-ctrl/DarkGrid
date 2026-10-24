@@ -104,7 +104,8 @@ function lerp(a: RoadNode, b: RoadNode, f: number): LatLng {
 // ---------- stand-ins (swap for B's versions when they land) ----------
 
 // Stand-in for B's graph: an n x n grid of two-way streets around SoMa.
-export function makeGridGraph(n = 5, spacingM = 250): RoadGraph {
+// 9x9 at 250 m = 2 km across, so the 700 m outage covers the middle 21 of 81 nodes.
+export function makeGridGraph(n = 9, spacingM = 250): RoadGraph {
   const center = { lat: 37.7785, lng: -122.4056 };
   const mPerLng = 111320 * Math.cos((center.lat * Math.PI) / 180);
   const nodes: RoadNode[] = [];
