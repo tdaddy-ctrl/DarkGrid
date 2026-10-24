@@ -11,6 +11,7 @@ import {
   answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
 } from '@/lib/sim';
 import { REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
+import { loadRoadGraph } from '@/lib/graph';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
 import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
@@ -22,9 +23,73 @@ const MAX_FRAME_S = 0.25;    // a stalled tab doesn't fast-forward minutes at on
 
 type Mode = SimSnapshot['mode'];
 type View = { fifo: SimSnapshot; darkgrid: SimSnapshot; chart: ChartPoint[] };
+type Environment = 'SF' | 'GRID';
+const ENVIRONMENT_LABELS = { SF: 'San Francisco', GRID: 'Test Grid' };
 
 export default function Home() {
-  const [graph] = useState<RoadGraph>(() => makeGridGraph());   // B's real graph replaces makeGridGraph()
+  const [environment, setEnvironment] = useState<Environment>('SF');
+  const [generation, setGeneration] = useState(0);
+  const [loaded, setLoaded] = useState<{
+    environment: Environment; generation: number; graph?: RoadGraph; error?: string;
+  } | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function load() {
+      try {
+        let graph: RoadGraph;
+        if (environment === 'GRID') {
+          graph = makeGridGraph();
+        } else {
+          const response = await fetch('/data/soma_roads.json', { signal: controller.signal });
+          if (!response.ok) throw new Error(`Road data request failed (HTTP ${response.status})`);
+          graph = loadRoadGraph(await response.json());
+          if (!graph.nodes.length || !graph.edges.length) throw new Error('Road data is empty');
+        }
+        if (!controller.signal.aborted) setLoaded({ environment, generation, graph });
+      } catch (error) {
+        if (!controller.signal.aborted) setLoaded({ environment, generation,
+          error: error instanceof Error ? error.message : 'Unable to load road data' });
+      }
+    }
+    void load();
+    return () => controller.abort();
+  }, [environment, generation]);
+
+  // A changed selection immediately unmounts the old run, before the next load completes.
+  const current = loaded?.environment === environment && loaded.generation === generation ? loaded : null;
+  return (
+    <>
+      <div className="relative z-10 mx-auto flex w-full max-w-[1680px] items-center gap-3 px-4 pt-4 lg:px-6">
+        <label htmlFor="simulation-environment" className="dg-label">Environment</label>
+        <select id="simulation-environment" value={environment}
+          onChange={event => { setEnvironment(event.target.value as Environment); setGeneration(n => n + 1); }}
+          className="rounded-md border border-dg-line bg-slate-950 px-3 py-2 text-sm text-slate-100">
+          <option value="SF">San Francisco</option>
+          <option value="GRID">Test Grid</option>
+        </select>
+      </div>
+      {current?.graph ? (
+        <Simulation key={`${environment}-${generation}`} graph={current.graph}
+          onReset={() => setGeneration(n => n + 1)} />
+      ) : (
+        <main className="relative z-10 flex flex-1 flex-col items-center justify-center gap-3 p-6">
+          {current?.error ? (
+            <>
+              <p role="alert" className="text-dg-red">Unable to load {ENVIRONMENT_LABELS[environment]}: {current.error}</p>
+              <button className={btn('ghost')} onClick={() => setGeneration(n => n + 1)}>Retry</button>
+              {environment === 'SF' && <button className={btn('cyan')}
+                onClick={() => { setEnvironment('GRID'); setGeneration(n => n + 1); }}>Use Test Grid</button>}
+            </>
+          ) : <p role="status" className="dg-label">Loading {ENVIRONMENT_LABELS[environment]}…</p>}
+        </main>
+      )}
+    </>
+  );
+}
+
+// Each environment/run gets its own component instance: refs, clocks and controls reset together.
+function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void }) {
   const simsRef = useRef<{ fifo: Sim; darkgrid: Sim } | null>(null);
   const chartRef = useRef<ChartPoint[]>([]);
   const pausedRef = useRef(false);
@@ -44,12 +109,6 @@ export default function Home() {
     simsRef.current = { fifo: createSim(graph, SEED, 'FIFO'), darkgrid: createSim(graph, SEED, 'DARKGRID') };
     chartRef.current = [];
   }, [graph]);
-
-  const reset = useCallback(() => {
-    freshSims();
-    setJudge(null);
-    publish();
-  }, [freshSims, publish]);
 
   // The judge becomes the only operator of one city; the other city stays automatic.
   const takeOver = useCallback((m: Mode | null) => {
@@ -167,7 +226,7 @@ export default function Home() {
           {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
           {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
           <button onClick={togglePause} className={btn('ghost')}>{paused ? 'Resume' : 'Pause'}</button>
-          <button onClick={reset} className={btn('ghost')}>Reset</button>
+          <button onClick={onReset} className={btn('ghost')}>Reset</button>
         </nav>
       </header>
 
