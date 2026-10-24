@@ -30,6 +30,10 @@ const SWAY_DEG = 10;              // idle camera sways ±10° instead of spinnin
 const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
 const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
+const UPDATE_MS = 250;            // the page sends a new snapshot 4x/s; cars glide between them
+const STREAK_M = 14;              // a moving car draws as a light streak this long, pointing where it drives
+
+type Car = { id: number; from: [number, number]; to: [number, number]; heading: number; state: string; moving: boolean };
 const HAZARD_LABEL_ALT_M = 220;
 
 export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel = 'SoMa Substation Fire' }: {
@@ -41,6 +45,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
   const snapRef = useRef(snapshot);
   const [failed, setFailed] = useState(false);
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
+  const carsRef = useRef<{ list: Car[]; at: number }>({ list: [], at: 0 });
   const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
 
   useEffect(() => {
@@ -61,6 +66,20 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
     }
     for (const id of trails.map.keys()) if (!seen.has(id)) trails.map.delete(id);
     trails.data = data;
+
+    // Each car glides from where it was drawn last to its new position over the next update.
+    const prev = new Map(carsRef.current.list.map((c) => [c.id, c]));
+    const f = Math.min(1, (performance.now() - carsRef.current.at) / UPDATE_MS);
+    carsRef.current = {
+      at: performance.now(),
+      list: snapshot.vehicles.filter((v) => v.state !== 'STAGED').map((v) => {
+        const p = prev.get(v.id);
+        const drawn: [number, number] = p ? [p.from[0] + (p.to[0] - p.from[0]) * f, p.from[1] + (p.to[1] - p.from[1]) * f] : [v.pos.lng, v.pos.lat];
+        const to: [number, number] = [v.pos.lng, v.pos.lat];
+        const jump = Math.abs(to[0] - drawn[0]) + Math.abs(to[1] - drawn[1]) > 0.01;   // a teleport (new trip) doesn't glide
+        return { id: v.id, from: jump ? to : drawn, to, heading: v.headingDeg, state: v.state, moving: v.state === 'DRIVING' };
+      }),
+    };
   }, [snapshot]);
 
   useEffect(() => {
@@ -141,6 +160,50 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           onError: () => setFailed(true),
         });
 
+        // Cars: moving ones are short light streaks along their heading (bright head, soft glow);
+        // stopped ones are dots, and cars asking for help pulse red.
+        const mPerDegLat = 110540;
+        const mPerDegLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
+        const carLayers = (layers: typeof L, now: number): Layer[] => {
+          const { list, at } = carsRef.current;
+          const f = Math.min(1, (now - at) / UPDATE_MS);
+          const cars = list.map((c) => {
+            const lng = c.from[0] + (c.to[0] - c.from[0]) * f, lat = c.from[1] + (c.to[1] - c.from[1]) * f;
+            const h = (c.heading * Math.PI) / 180;
+            const tail: Pt = [lng - (Math.sin(h) * STREAK_M) / mPerDegLng, lat - (Math.cos(h) * STREAK_M) / mPerDegLat, 2];
+            return { ...c, head: [lng, lat, 2] as Pt, tail };
+          });
+          const moving = cars.filter((c) => c.moving), stopped = cars.filter((c) => !c.moving);
+          const help = stopped.filter((c) => c.state === 'REQUESTING_HELP');
+          const pulse = 0.5 + 0.5 * Math.sin(now / 300);
+          return [
+            new layers.LineLayer({
+              id: 'car-streak-glow', parameters: ON_TOP, data: moving, getSourcePosition: (c: typeof moving[number]) => c.tail,
+              getTargetPosition: (c: typeof moving[number]) => c.head, getWidth: 6, widthUnits: 'pixels',
+              getColor: (c: typeof moving[number]) => { const k = STATE_RGB[c.state]; return [k[0], k[1], k[2], 45]; },
+            }),
+            new layers.LineLayer({
+              id: 'car-streak', parameters: ON_TOP, data: moving, getSourcePosition: (c: typeof moving[number]) => c.tail,
+              getTargetPosition: (c: typeof moving[number]) => c.head, getWidth: 2, widthUnits: 'pixels',
+              getColor: (c: typeof moving[number]) => STATE_RGB[c.state],
+            }),
+            new layers.ScatterplotLayer({
+              id: 'car-heads', parameters: ON_TOP, data: moving, getPosition: (c: typeof moving[number]) => c.head,
+              getRadius: 1.6, radiusUnits: 'pixels', getFillColor: [235, 255, 245, 255],
+            }),
+            new layers.ScatterplotLayer({
+              id: 'car-stopped', parameters: ON_TOP, data: stopped, getPosition: (c: typeof stopped[number]) => c.head,
+              getRadius: 2.2, radiusUnits: 'pixels', getFillColor: (c: typeof stopped[number]) => STATE_RGB[c.state],
+            }),
+            new layers.ScatterplotLayer({
+              id: 'car-help-pulse', parameters: ON_TOP, data: help, getPosition: (c: typeof help[number]) => c.head,
+              getRadius: 4 + 5 * pulse, radiusUnits: 'pixels', stroked: true, filled: false, lineWidthUnits: 'pixels',
+              getLineWidth: 1.2, getLineColor: [255, 42, 84, Math.round(200 * (1 - pulse))],
+              updateTriggers: { getRadius: Math.round(now / 40), getLineColor: Math.round(now / 40) },
+            }),
+          ];
+        };
+
         let last = performance.now();
         let lastHud = 0;
         const center: [number, number] = [graph.center.lng, graph.center.lat];
@@ -203,19 +266,10 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
             }),
             new L.PathLayer({
               id: 'trails', parameters: ON_TOP, data: trailsRef.current.data, getPath: (d: { path: Pt[] }) => d.path,
-              getColor: (d: { state: string }) => { const c = STATE_RGB[d.state]; return [c[0], c[1], c[2], 90]; },
+              getColor: (d: { state: string }) => { const c = STATE_RGB[d.state]; return [c[0], c[1], c[2], 45]; },
               getWidth: 2, widthUnits: 'pixels', capRounded: true, jointRounded: true,
             }),
-            new L.ScatterplotLayer({
-              id: 'vehicle-glow', parameters: ON_TOP, data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
-              getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 9 : 6), radiusUnits: 'pixels',
-              getFillColor: (v: SimSnapshot['vehicles'][number]) => { const c = STATE_RGB[v.state]; return [c[0], c[1], c[2], 45]; },
-            }),
-            new L.ScatterplotLayer({
-              id: 'vehicles', parameters: ON_TOP, data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
-              getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 3.6 : 2.4), radiusUnits: 'pixels',
-              getFillColor: (v: SimSnapshot['vehicles'][number]) => STATE_RGB[v.state],
-            }),
+            ...carLayers(L, now),
           );
           const amb = snap.ambulance;
           if (amb) {
