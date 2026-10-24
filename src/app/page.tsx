@@ -7,7 +7,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChartPoint, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
-import { createSim, getSnapshot, injectEvent, makeGridGraph, step, type Sim } from '@/lib/sim';
+import {
+  answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
+} from '@/lib/sim';
 import { SEED, SIM_SPEED } from '@/lib/config';
 
 const STEP_S = 0.5;          // fixed sim timestep
@@ -27,6 +29,7 @@ export default function Home() {
   const [view, setView] = useState<View | null>(null);
   const [mode, setMode] = useState<Mode>('DARKGRID');
   const [paused, setPaused] = useState(false);
+  const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
 
   const publish = useCallback(() => {
     const sims = simsRef.current;
@@ -34,11 +37,34 @@ export default function Home() {
     setView({ fifo: getSnapshot(sims.fifo), darkgrid: getSnapshot(sims.darkgrid), chart: [...chartRef.current] });
   }, []);
 
-  const reset = useCallback(() => {
+  const freshSims = useCallback(() => {
     simsRef.current = { fifo: createSim(graph, SEED, 'FIFO'), darkgrid: createSim(graph, SEED, 'DARKGRID') };
     chartRef.current = [];
+  }, [graph]);
+
+  const reset = useCallback(() => {
+    freshSims();
+    setJudge(null);
     publish();
-  }, [graph, publish]);
+  }, [freshSims, publish]);
+
+  // The judge becomes the only operator of one city; the other city stays automatic.
+  const takeOver = useCallback((m: Mode | null) => {
+    const sims = simsRef.current;
+    if (!sims) return;
+    setControl(sims.fifo, m === 'FIFO' ? 'MANUAL' : 'AUTO');
+    setControl(sims.darkgrid, m === 'DARKGRID' ? 'MANUAL' : 'AUTO');
+    setJudge(m);
+    if (m) setMode(m);
+    publish();
+  }, [publish]);
+
+  const onAnswer = useCallback((jobId: string) => {
+    const sims = simsRef.current;
+    if (!sims || !judge) return;
+    answerJob(judge === 'FIFO' ? sims.fifo : sims.darkgrid, jobId);
+    publish();
+  }, [judge, publish]);
 
   const blackout = useCallback(() => {
     const sims = simsRef.current;
@@ -49,7 +75,7 @@ export default function Home() {
   }, [publish]);
 
   useEffect(() => {
-    reset();
+    freshSims();             // first publish happens in the loop below
     let raf = 0;
     let last = performance.now();
     let lastUi = 0;
@@ -79,7 +105,7 @@ export default function Home() {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [reset, publish]);
+  }, [freshSims, publish]);
 
   const togglePause = () => { pausedRef.current = !pausedRef.current; setPaused(pausedRef.current); };
 
@@ -105,6 +131,21 @@ export default function Home() {
           className="rounded-md bg-amber-500 px-3 py-1.5 text-sm font-medium text-zinc-950 disabled:opacity-40">
           Blackout
         </button>
+        {judge === null && (
+          <button onClick={() => takeOver('FIFO')} className="rounded-md bg-rose-500 px-3 py-1.5 text-sm font-medium text-zinc-950">
+            Judge takes over
+          </button>
+        )}
+        {judge === 'FIFO' && (
+          <button onClick={() => takeOver('DARKGRID')} className="rounded-md bg-emerald-400 px-3 py-1.5 text-sm font-medium text-zinc-950">
+            Dark Grid on
+          </button>
+        )}
+        {judge !== null && (
+          <button onClick={() => takeOver(null)} className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800">
+            Auto operators
+          </button>
+        )}
         <button onClick={togglePause} className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800">
           {paused ? 'Resume' : 'Pause'}
         </button>
@@ -115,7 +156,7 @@ export default function Home() {
 
       <div className="grid flex-1 gap-4 lg:grid-cols-[1fr_340px]">
         <MapPlaceholder snapshot={snap} graph={graph} />
-        <QueuePlaceholder snapshot={snap} />
+        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[1fr_1fr_1.4fr]">
@@ -182,13 +223,21 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
   );
 }
 
-// Stand-in for RequestQueuePanel: top of the job queue.
-function QueuePlaceholder({ snapshot }: { snapshot: SimSnapshot }) {
+// Stand-in for RequestQueuePanel: top of the job queue. In MANUAL the cards are clickable.
+function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAnswer: (jobId: string) => void }) {
+  const manual = snapshot.control === 'MANUAL';
+  const locked = snapshot.manual.lockRemainingS > 0;
   return (
     <section className="flex min-h-[360px] flex-col rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
       <h2 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
         RequestQueuePanel placeholder · {snapshot.jobs.length} jobs
       </h2>
+      {manual && (
+        <p className="mb-2 rounded bg-rose-500/15 px-2 py-1.5 text-sm text-rose-200">
+          {locked ? `Reviewing… ${snapshot.manual.lockRemainingS.toFixed(1)} s` : 'You are the operator. Click a card.'}
+          <span className="float-right font-mono">answered {snapshot.manual.answered}</span>
+        </p>
+      )}
       <ul className="mb-3 space-y-1 text-xs text-zinc-400">
         {snapshot.operators.map((op) => (
           <li key={op.id} className="flex justify-between gap-2">
@@ -198,9 +247,12 @@ function QueuePlaceholder({ snapshot }: { snapshot: SimSnapshot }) {
       </ul>
       <ol className="flex-1 space-y-1.5 overflow-y-auto">
         {snapshot.jobs.slice(0, 12).map((j) => (
-          <li key={j.id} className="rounded border border-zinc-800 px-2 py-1.5">
-            <div className="flex justify-between text-sm"><span>{j.title}</span><span className="font-mono text-zinc-500">{j.kind}</span></div>
-            <div className="text-xs text-zinc-500">{j.sub}</div>
+          <li key={j.id}>
+            <button disabled={!manual || locked} onClick={() => onAnswer(j.id)}
+              className="w-full rounded border border-zinc-800 px-2 py-1.5 text-left enabled:hover:border-zinc-500 enabled:hover:bg-zinc-800 disabled:cursor-default">
+              <div className="flex justify-between text-sm"><span>{j.title}</span><span className="font-mono text-zinc-500">{j.kind}</span></div>
+              <div className="text-xs text-zinc-500">{j.sub}</div>
+            </button>
           </li>
         ))}
       </ol>
