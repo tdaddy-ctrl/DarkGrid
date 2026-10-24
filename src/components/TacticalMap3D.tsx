@@ -16,11 +16,10 @@ type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, ln
 // falls back to OpenStreetMap footprints extruded to their real heights.
 const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 const GOOGLE_TILES_URL = 'https://tile.googleapis.com/v1/3dtiles/root.json';
-const NIGHT_TINT: [number, number, number, number] = [6, 11, 19, 150];   // grades the daytime photo city to night
-// On a slow network the photo city can stay blank or blurry. If it hasn't reached building-level
-// tiles by then, switch to the OSM blocks (instant, offline). The presenter can switch back.
-const PHOTO_TIMEOUT_MS = 15000;
-const PHOTO_MIN_DEPTH = 15;
+const NIGHT_TINT: [number, number, number, number] = [6, 11, 19, 110];   // grades the daytime photo city to night
+// If no photo tile has loaded by then (blocked key, no network), switch to the OSM blocks
+// (instant, offline). A slow but working network keeps the photo city; it sharpens as tiles arrive.
+const PHOTO_TIMEOUT_MS = 20000;
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
 // Drawn over the buildings (tactical x-ray): the hazard, corridor and traffic must never hide behind towers.
@@ -41,6 +40,7 @@ const HOME_DOWNTOWN = { longitude: -122.4078, latitude: 37.7838, zoom: 14.35, pi
 const SWAY_DEG = 10;              // idle camera sways ±10° instead of spinning away from the skyline
 const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
+const ROTATE_STEP_DEG = 45;       // one press of the on-map rotate buttons
 const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
 const UPDATE_MS = 250;            // the page sends a new snapshot 4x/s; cars glide between them
 const STREAK_M = 14;              // a moving car draws as a light streak this long, pointing where it drives
@@ -61,6 +61,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
   const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
+  const cameraRef = useRef<((cmd: 'left' | 'right' | 'home') => void) | null>(null);
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
   const carsRef = useRef<{ list: Car[]; at: number }>({ list: [], at: 0 });
   const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
@@ -163,7 +164,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
 
         let lastCredits = '';
         let tileErrors = 0;
-        let maxDepth = 0;
+        let tilesLoaded = 0;
         let photoSince = performance.now();
         let autoFallback = true;   // off once the presenter picks a mode by hand
         const fallBackToOsm = () => {
@@ -204,7 +205,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
                 return selected;
               };
             },
-            onTileLoad: (tile) => { maxDepth = Math.max(maxDepth, tile.depth); },
+            onTileLoad: () => { tilesLoaded++; },
             onTileError: () => { if (autoFallback && ++tileErrors > 5) fallBackToOsm(); },
           }),
           new L.SolidPolygonLayer({
@@ -224,19 +225,28 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         // The home view is framed for the real San Francisco map; other maps (the test grid) center on themselves.
         const sf = Math.abs(graph.center.lat - 37.77) < 0.02 && Math.abs(graph.center.lng + 122.408) < 0.02;
         const downtown = Math.abs(graph.center.lat - 37.788) < 0.01 && Math.abs(graph.center.lng + 122.406) < 0.01;
-        let view: MapViewState = downtown ? { ...HOME_DOWNTOWN, maxPitch: 70 } : sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
+        const home: MapViewState = downtown ? { ...HOME_DOWNTOWN, maxPitch: 70 } : sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
+        let view: MapViewState = home;
         let swayBase = view.bearing ?? 0;
         let swayT = 0;
         let lastTouch = 0;
         let interacting = false;
+        // On-map buttons ease the camera toward a target instead of jumping.
+        let target: MapViewState | null = null;
+        cameraRef.current = (cmd) => {
+          const from = target ?? view;
+          target = cmd === 'home' ? home : { ...from, bearing: (from.bearing ?? 0) + (cmd === 'left' ? -ROTATE_STEP_DEG : ROTATE_STEP_DEG) };
+          lastTouch = performance.now();
+        };
 
         deck = new core.Deck({
           parent: host,
           width: '100%', height: '100%',
           viewState: view,
-          controller: { inertia: 400, dragRotate: true, touchRotate: true },
+          // Left drag orbits the camera (rotate + tilt); Shift/Ctrl/Cmd + drag pans.
+          controller: { inertia: 400, dragMode: 'rotate', dragRotate: true, touchRotate: true },
           effects: [lighting],
-          onViewStateChange: ({ viewState }) => { view = viewState as MapViewState; lastTouch = performance.now(); },
+          onViewStateChange: ({ viewState }) => { view = viewState as MapViewState; target = null; lastTouch = performance.now(); },
           onInteractionStateChange: (s) => { interacting = !!(s.isDragging || s.isPanning || s.isRotating || s.isZooming); if (interacting) lastTouch = performance.now(); },
           onError: () => { if (photo) fallBackToOsm(); else setFailed(true); },
         });
@@ -289,9 +299,17 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         let lastHud = 0;
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
-          if (photo && autoFallback && maxDepth < PHOTO_MIN_DEPTH && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
+          if (photo && autoFallback && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
           const dt = (now - last) / 1000; last = now;
-          if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
+          if (target) {
+            const k = Math.min(1, dt * 6), t = target;
+            const ease = (a: number | undefined, b: number | undefined) => (a ?? 0) + ((b ?? 0) - (a ?? 0)) * k;
+            view = { ...view, longitude: ease(view.longitude, t.longitude), latitude: ease(view.latitude, t.latitude),
+              zoom: ease(view.zoom, t.zoom), pitch: ease(view.pitch, t.pitch), bearing: ease(view.bearing, t.bearing) };
+            if (Math.abs((view.bearing ?? 0) - (t.bearing ?? 0)) < 0.1 && Math.abs(view.zoom - t.zoom) < 0.001) { view = { ...t }; target = null; }
+            lastTouch = now;
+            swayBase = view.bearing ?? 0; swayT = 0;
+          } else if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
             swayT += dt;
             view = { ...view, bearing: swayBase + SWAY_DEG * Math.sin((2 * Math.PI * swayT) / SWAY_PERIOD_S) };
           } else {
@@ -401,7 +419,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
       }
     })();
 
-    return () => { cancelled = true; switchRef.current = null; cancelAnimationFrame(raf); deck?.finalize(); };
+    return () => { cancelled = true; switchRef.current = null; cameraRef.current = null; cancelAnimationFrame(raf); deck?.finalize(); };
   }, [graph]);
 
   if (failed) return <>{fallback}</>;
@@ -463,6 +481,16 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         <span className="absolute size-1.5 rounded-full bg-dg-cyan" />
       </div>
 
+      {/* camera buttons, under the compass */}
+      <div role="group" aria-label="Camera" className="absolute right-6 top-[7.5rem] flex w-20 justify-between rounded-md border border-dg-line bg-black/55 p-0.5 backdrop-blur">
+        {([['left', 'Rotate left', 'M10 4 6 8l4 4'], ['home', 'Reset view', 'M3 8.5 8 4l5 4.5M5 7.5V12h6V7.5'], ['right', 'Rotate right', 'm6 4 4 4-4 4']] as const).map(([cmd, label, d]) => (
+          <button key={cmd} type="button" aria-label={label} title={label} onClick={() => cameraRef.current?.(cmd)}
+            className="grid size-7 place-items-center rounded text-dg-label transition-colors hover:bg-dg-cyan/15 hover:text-dg-cyan">
+            <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>
+          </button>
+        ))}
+      </div>
+
       {/* legend */}
       <ul className="absolute bottom-4 left-4 flex flex-wrap gap-x-3 gap-y-1 rounded-lg border border-dg-line bg-black/55 px-3 py-1.5 backdrop-blur">
         {LEGEND.map(([label, color]) => (
@@ -484,7 +512,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
       </dl>
 
       {!outage && (
-        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Drag to rotate · scroll to zoom</p>
+        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Drag: rotate · Shift+drag: pan · Scroll: zoom</p>
       )}
       <p className="pointer-events-none absolute bottom-1 left-1/2 max-w-[70%] -translate-x-1/2 truncate text-center font-mono text-[9px] text-slate-500">
         {source === 'google'
