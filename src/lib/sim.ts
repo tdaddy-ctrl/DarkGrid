@@ -192,6 +192,25 @@ function stageEmptyCars(sim: Sim) {
   });
 }
 
+// Staging lots: up to STAGING_LOTS of the map's lots, outside the blackout (so empty cars leave
+// the dark zone) and spread out (each pick is the lot farthest from the ones already picked).
+function stagingLots(graph: RoadGraph): LatLng[] {
+  const all = graph.pois.lots.map((pos) => ({ pos, ...toXY(graph.center, pos) }));
+  const outside = all.filter((l) => Math.hypot(l.x, l.y) > C.STAGING_MIN_DIST_M);
+  const pool = (outside.length ? outside : all)
+    .sort((a, b) => Math.hypot(b.x, b.y) - Math.hypot(a.x, a.y) || a.pos.lat - b.pos.lat || a.pos.lng - b.pos.lng);
+  const picked = pool.slice(0, 1);
+  while (picked.length < Math.min(C.STAGING_LOTS, pool.length)) {
+    let best = pool[0], bestD = -1;
+    for (const l of pool) {
+      const d = Math.min(...picked.map((q) => Math.hypot(l.x - q.x, l.y - q.y)));
+      if (d > bestD) { best = l; bestD = d; }
+    }
+    picked.push(best);
+  }
+  return picked.map((l) => l.pos);
+}
+
 // One empty car at a time, for cars that were busy (in a box, at the curb) during staging.
 function assignLot(sim: Sim, from: number): number {
   let best = -1;
@@ -244,7 +263,7 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
     agents: [], amb: blankAgent(C.VEHICLES, 'AMBULANCE'), ambRoute: [],
     dispatchT: null, arriveT: null, outageT: null, zonePolicy: false, zoneJobTaken: false,
     corridorActive: false, corridorEdges: new Set(), corridorNodes: new Set(),
-    lots: graph.pois.lots.map((pos) => ({ pos, node: nearestNode(graph, pos), cap: C.LOT_CAPACITY, used: 0, reserved: 0 })),
+    lots: stagingLots(graph).map((pos) => ({ pos, node: nearestNode(graph, pos), cap: C.LOT_CAPACITY, used: 0, reserved: 0 })),
     requests: new Map(), reqSeq: 0, arrivals: [],
     operators: Array.from({ length: C.OPERATORS }, (_, i) => ({ id: `op${i + 1}`, job: null, doneT: 0 })),
     review: null, answered: 0, jobs: [], seenJobs: new Map(),

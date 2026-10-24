@@ -21,6 +21,8 @@ export const SERVICE_SINGLE_S = 30;
 export const SERVICE_BATCH_S = 45;
 
 export const LOT_CAPACITY = 25;
+export const STAGING_LOTS = 8;            // at most this many lots are used for staging
+export const STAGING_MIN_DIST_M = 850;     // ...and only lots this far from the blackout center
 export const OUTAGE_RADIUS_M = 700;
 export const AMBULANCE_DISPATCH_DELAY_S = 60;
 
