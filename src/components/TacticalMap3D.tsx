@@ -11,6 +11,12 @@ import type { RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
 
 type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
+
+// Google Photorealistic 3D Tiles (Map Tiles API). Without a key, or if the tiles fail, the map
+// falls back to OpenStreetMap footprints extruded to their real heights.
+const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+const GOOGLE_TILES_URL = 'https://tile.googleapis.com/v1/3dtiles/root.json';
+const NIGHT_TINT: [number, number, number, number] = [6, 11, 19, 150];   // grades the daytime photo city to night
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
 // Drawn over the buildings (tactical x-ray): the hazard, corridor and traffic must never hide behind towers.
@@ -44,6 +50,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
   const leaderRef = useRef<SVGLineElement>(null);
   const snapRef = useRef(snapshot);
   const [failed, setFailed] = useState(false);
+  const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
+  const [credits, setCredits] = useState('');
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
   const carsRef = useRef<{ list: Car[]; at: number }>({ list: [], at: 0 });
   const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
@@ -93,6 +101,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
       try {
         const core = await import('@deck.gl/core');
         const L = await import('@deck.gl/layers');
+        const geo = GOOGLE_KEY ? await import('@deck.gl/geo-layers').catch(() => null) : null;
+        let photo = !!geo;
+        if (!photo) setSource('osm');
         const res = await fetch('/data/sf_buildings.json');
         const buildings: Building[] = res.ok ? await res.json() : [];
         if (cancelled) return;
@@ -117,7 +128,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           rim: new core.DirectionalLight({ color: [80, 140, 190], intensity: 0.7, direction: [-0.4, -1, -0.6] }),
         });
 
-        const staticLayers: Layer[] = [
+        const osmLayers = (): Layer[] => [
           new L.PathLayer({
             id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 14],
             getWidth: 1, widthUnits: 'pixels',
@@ -141,6 +152,54 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           }),
         ];
 
+        let lastCredits = '';
+        let tileErrors = 0;
+        const fallBackToOsm = () => {
+          if (!photo) return;
+          photo = false;
+          staticLayers = osmLayers();
+          setSource('osm');
+        };
+        const tint = [[box.w - 0.05, box.s - 0.05], [box.e + 0.05, box.s - 0.05], [box.e + 0.05, box.n + 0.05], [box.w - 0.05, box.n + 0.05]] as Pt[];
+        const photoLayers = (): Layer[] => [
+          new geo!.Tile3DLayer({
+            id: 'google-3d',
+            data: GOOGLE_TILES_URL,
+            loadOptions: {
+              fetch: { headers: { 'X-GOOG-API-KEY': GOOGLE_KEY! } },
+              // The default 32 MB cache evicts building-level tiles as soon as they load, so the
+              // city stays blurry; give it room and fetch more tiles in parallel.
+              tileset: { maximumMemoryUsage: 1024, memoryCacheOverflow: 256, maximumScreenSpaceError: 6, maxRequests: 48 },
+            },
+            onTilesetLoad: (tileset) => {
+              // Google's terms: show the data providers for the tiles on screen.
+              tileset.options.onTraversalComplete = (selected) => {
+                const names = new Set<string>();
+                for (const tile of selected) {
+                  const copyright = (tile.content as { gltf?: { asset?: { copyright?: string } } } | undefined)?.gltf?.asset?.copyright;
+                  copyright?.split(';').forEach((c) => { if (c.trim()) names.add(c.trim()); });
+                }
+                const text = [...names].join('; ');
+                if (text !== lastCredits) { lastCredits = text; setCredits(text); }
+                return selected;
+              };
+            },
+            onTileError: () => { if (++tileErrors > 5) fallBackToOsm(); },
+          }),
+          new L.SolidPolygonLayer({
+            id: 'night-tint', data: [tint], getPolygon: (d: Pt[]) => d, getFillColor: NIGHT_TINT, parameters: ON_TOP,
+          }),
+          new L.PathLayer({
+            id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 12], parameters: ON_TOP,
+            getWidth: 1, widthUnits: 'pixels',
+          }),
+          new L.PathLayer({
+            id: 'roads', data: roads, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 55], parameters: ON_TOP,
+            getWidth: 1, widthUnits: 'pixels',
+          }),
+        ];
+        let staticLayers: Layer[] = photo ? photoLayers() : osmLayers();
+
         // The home view is framed for the real San Francisco map; other maps (the test grid) center on themselves.
         const sf = Math.abs(graph.center.lat - 37.77) < 0.02 && Math.abs(graph.center.lng + 122.408) < 0.02;
         let view: MapViewState = sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
@@ -157,7 +216,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           effects: [lighting],
           onViewStateChange: ({ viewState }) => { view = viewState as MapViewState; lastTouch = performance.now(); },
           onInteractionStateChange: (s) => { interacting = !!(s.isDragging || s.isPanning || s.isRotating || s.isZooming); if (interacting) lastTouch = performance.now(); },
-          onError: () => setFailed(true),
+          onError: () => { if (photo) fallBackToOsm(); else setFailed(true); },
         });
 
         // Cars: moving ones are short light streaks along their heading (bright head, soft glow);
@@ -390,7 +449,11 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
       {!outage && (
         <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Drag to rotate · scroll to zoom</p>
       )}
-      <p className="pointer-events-none absolute bottom-1 left-1/2 -translate-x-1/2 font-mono text-[9px] text-slate-600">Buildings & roads © OpenStreetMap contributors</p>
+      <p className="pointer-events-none absolute bottom-1 left-1/2 max-w-[70%] -translate-x-1/2 truncate text-center font-mono text-[9px] text-slate-500">
+        {source === 'google'
+          ? <>Google{credits ? ` · ${credits}` : ''} · roads © OpenStreetMap contributors</>
+          : 'Buildings & roads © OpenStreetMap contributors'}
+      </p>
     </div>
   );
 }
