@@ -5,7 +5,7 @@
 // 4 times per second, so 250 cars never cause 60 re-renders a second.
 // The *Placeholder components below stand in for C's and D's real components.
 
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
   answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, pickOutageCenter, setControl, step, type Sim,
@@ -18,6 +18,9 @@ import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
 import TacticalMap3D from '@/components/TacticalMap3D';
 import TimelineScrubber from '@/components/TimelineScrubber';
+import DemoDirectorBar from '@/components/DemoDirectorBar';
+import MetricsChart from '@/components/MetricsChart';
+import ArrivalOverlay from '@/components/ArrivalOverlay';
 
 const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
@@ -143,6 +146,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const [paused, setPaused] = useState(false);
   const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
   const [split, setSplit] = useState(false);                // both cities side by side
+  const [follow, setFollow] = useState(false);              // 3D camera chases the ambulance
   const [proposal, setProposal] = useState<ChaosResult | null>(null);   // Claude's draft for the zone card
   const [hazard, setHazard] = useState<{ center: LatLng; label: string } | null>(null);   // where this run's blackout hit
 
@@ -241,6 +245,26 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     blackout();
   }, [blackout]);
 
+  // Demo director (B's bar): one button per act of the 3-minute demo, also on keys 0-5.
+  const director = useMemo(() => [
+    onReset,
+    blackout,
+    () => takeOver('FIFO'),
+    () => takeOver('DARKGRID'),
+    () => { setFollow(false); setSplit(true); },
+    () => { setSplit(false); setMode('DARKGRID'); setFollow(true); },
+  ], [onReset, blackout, takeOver]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement;
+      if (e.metaKey || e.ctrlKey || e.altKey || el.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const i = Number(e.key);
+      if (e.key.length === 1 && i >= 0 && i < director.length) { e.preventDefault(); director[i](); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [director]);
+
   useEffect(() => {
     freshSims();             // first publish happens in the loop below
     let raf = 0;
@@ -293,6 +317,8 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     ? { label: 'Replay', tone: 'cyan' } : judge
     ? { label: `Judge · ${cityShort(judge)}`, tone: 'red' }
     : outage ? { label: 'Blackout', tone: 'amber' } : { label: 'Nominal', tone: 'cyan' };
+  // Which act of the demo we are in, read from what is on screen.
+  const demoStep = follow ? 5 : split ? 4 : judge === 'DARKGRID' ? 3 : judge === 'FIFO' ? 2 : outage ? 1 : 0;
   const timeline = <TimelineScrubber range={view.historyRange} t={snap.t} isLive={view.isLive}
     outageT={view.outageT} onScrub={onScrub} onGoLive={onGoLive} />;
 
@@ -330,13 +356,16 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
           {judge === null && <button onClick={() => takeOver('FIFO')} className={btn('red')}>Judge takes over</button>}
           {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
           {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
-          <button onClick={() => setSplit((v) => !v)} aria-pressed={split} className={btn(split ? 'cyan' : 'ghost')}>
+          <button onClick={() => { setSplit((v) => !v); setFollow(false); }} aria-pressed={split} className={btn(split ? 'cyan' : 'ghost')}>
             {split ? 'Single view' : 'Split view'}
           </button>
           <button onClick={togglePause} className={btn('ghost')}>{paused ? 'Resume' : 'Pause'}</button>
           <button onClick={onReset} className={btn('ghost')}>Reset</button>
         </nav>
       </header>
+
+      <DemoDirectorBar step={demoStep} onReset={director[0]} onBlackout={director[1]} onManual={director[2]}
+        onDarkGrid={director[3]} onSplit={director[4]} onFollow={director[5]} />
 
       <div className="grid min-h-0 gap-3 lg:flex-[62] lg:grid-cols-[minmax(0,7fr)_minmax(0,3fr)]">
         {split ? (
@@ -356,8 +385,13 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
             </PanelHeader>
             <div className="relative min-h-0 flex-1">
               <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}
+                follow={follow} onFollowChange={setFollow}
                 fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />} />
               <PatientClock snapshot={snap} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
+              {/* ARRIVED / STUCK banner: replays when the status changes, then fades so the map stays visible */}
+              <div key={`${snap.mode}-${snap.ambulance?.status}`} className="pointer-events-none absolute inset-0 z-20 [animation:dg-banner_7s_ease-out_forwards]">
+                <ArrivalOverlay ambulance={snap.ambulance} />
+              </div>
             </div>
             {timeline}
           </section>
@@ -368,7 +402,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
 
       <div className="grid min-h-0 gap-3 md:grid-cols-2 lg:flex-[28] xl:grid-cols-4">
         <KpiPanel snapshot={mode === 'FIFO' ? view.darkgrid : view.fifo} other={snap} />
-        <ChartPlaceholder data={view.chart} />
+        <MetricsChart data={view.chart} />
         <ChaosInjectorPanel onResult={onChaos} />
         <AskWhyBar key={view.isLive ? 'live' : snap.t} jobs={snap.jobs} />
       </div>
@@ -829,75 +863,6 @@ function KpiPanel({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnapsh
             <Dot tone={ambTone} pulse={amb?.status === 'STUCK'} />{amb ? amb.status.replace('_', ' ') : 'STANDBY'}
           </span>
         </div>
-      </div>
-    </section>
-  );
-}
-
-// Stand-in for MetricsChart: open requests over time, both cities.
-function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
-  const uid = useId().replace(/:/g, '');
-  const W = 600, H = 240, L = 38, R = 10, T = 12, B = 24;
-  const maxT = Math.max(60, ...data.map((d) => d.t));
-  const rawMax = Math.max(10, ...data.map((d) => Math.max(d.fifo, d.darkgrid)));
-  const step = rawMax > 200 ? 100 : rawMax > 80 ? 50 : rawMax > 40 ? 20 : 10;
-  const maxY = Math.ceil(rawMax / step) * step;
-  const x = (t: number) => L + (t / maxT) * (W - L - R);
-  const y = (v: number) => H - B - (v / maxY) * (H - T - B);
-  const pts = (key: 'fifo' | 'darkgrid') => data.map((d) => `${x(d.t).toFixed(1)},${y(d[key]).toFixed(1)}`).join(' ');
-  const area = (key: 'fifo' | 'darkgrid') =>
-    data.length > 1 ? `M${x(data[0].t)},${y(0)} L${pts(key).replace(/ /g, ' L')} L${x(data[data.length - 1].t)},${y(0)} Z` : '';
-  const yTicks = Array.from({ length: maxY / step + 1 }, (_, i) => i * step);
-  const xTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * maxT);
-  const last = data[data.length - 1];
-
-  return (
-    <section className="dg-panel flex min-h-0 flex-col overflow-hidden">
-      <PanelHeader title="Requests waiting" tone={data.length > 1 ? 'cyan' : 'idle'}>
-        <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-slate-400">
-          <span aria-hidden="true" className="w-3 border-t border-dashed border-slate-400" />FIFO
-        </span>
-        <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-dg-cyan">
-          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-cyan shadow-[0_0_6px_#38bdf8]" />DARK GRID
-        </span>
-      </PanelHeader>
-      <div className="relative min-h-0 flex-1 p-2">
-        <svg viewBox={`0 0 ${W} ${H}`} className="h-full w-full" role="img"
-          aria-label={last ? `Requests waiting at ${formatT(last.t)}: FIFO ${last.fifo}, DARK GRID ${last.darkgrid}` : 'No data yet'}>
-          <defs>
-            <linearGradient id={`${uid}dg`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
-            </linearGradient>
-            <linearGradient id={`${uid}fifo`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#94a3b8" stopOpacity="0.16" />
-              <stop offset="100%" stopColor="#94a3b8" stopOpacity="0" />
-            </linearGradient>
-          </defs>
-          {yTicks.map((v) => (
-            <g key={v}>
-              <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} stroke="rgb(148 163 184 / 0.12)" strokeDasharray="3 5" />
-              <text x={L - 8} y={y(v) + 4} fill="#a9b6cc" fontSize={10} textAnchor="end" fontFamily="var(--font-jetbrains)">{v}</text>
-            </g>
-          ))}
-          {xTicks.map((t) => (
-            <text key={t} x={x(t)} y={H - 6} fill="#a9b6cc" fontSize={10} textAnchor="middle" fontFamily="var(--font-jetbrains)">{formatT(t)}</text>
-          ))}
-          {data.length > 1 && (
-            <>
-              <path d={area('fifo')} fill={`url(#${uid}fifo)`} />
-              <polyline points={pts('fifo')} fill="none" stroke="#94a3b8" strokeWidth={1.75} strokeDasharray="5 4" strokeLinejoin="round" />
-              <path d={area('darkgrid')} fill={`url(#${uid}dg)`} />
-              <polyline points={pts('darkgrid')} fill="none" stroke="#38bdf8" strokeOpacity={0.3} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round" />
-              <polyline points={pts('darkgrid')} fill="none" stroke="#38bdf8" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-              <circle cx={x(last.t)} cy={y(last.fifo)} r={3} fill="#94a3b8" />
-              <circle cx={x(last.t)} cy={y(last.darkgrid)} r={3.5} fill="#38bdf8" />
-            </>
-          )}
-        </svg>
-        {data.length <= 1 && (
-          <p className="dg-label pointer-events-none absolute inset-0 flex items-center justify-center">Awaiting telemetry</p>
-        )}
       </div>
     </section>
   );

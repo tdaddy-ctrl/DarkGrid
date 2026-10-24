@@ -35,7 +35,7 @@ export default function MetricsChart({ data }: { data: ChartPoint[] }) {
   };
 
   return (
-    <section className="dg-panel overflow-hidden">
+    <section className="dg-panel flex min-h-0 flex-col overflow-hidden">
       <div className="flex items-center justify-between gap-3 border-b border-dg-line px-4 py-3">
         <h2 className="dg-label flex items-center gap-2">
           <span aria-hidden="true" className="inline-block size-1.5 rounded-full bg-dg-cyan shadow-[0_0_8px_#38BDF8]" />
@@ -50,10 +50,10 @@ export default function MetricsChart({ data }: { data: ChartPoint[] }) {
           </span>
         </div>
       </div>
-      <div className="relative p-3">
+      <div className="relative min-h-0 flex-1 p-2">
         <svg
           viewBox={`0 0 ${W} ${H}`}
-          className="h-auto w-full"
+          className="h-full w-full"
           role="img"
           aria-label={
             last

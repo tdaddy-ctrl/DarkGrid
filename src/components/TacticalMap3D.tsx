@@ -9,6 +9,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
 import type { LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
+import { followCamera } from '@/lib/followCamera';
 
 type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
 
@@ -48,8 +49,10 @@ const STREAK_M = 14;              // a moving car draws as a light streak this l
 type Car = { id: number; from: [number, number]; to: [number, number]; heading: number; state: string; moving: boolean };
 const HAZARD_LABEL_ALT_M = 220;
 
-export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire' }: {
+export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire', follow = false, onFollowChange }: {
   snapshot: SimSnapshot; graph: RoadGraph; fallback: ReactNode; hazardCenter?: LatLng; hazardLabel?: string;
+  follow?: boolean;                          // chase camera behind the ambulance
+  onFollowChange?: (on: boolean) => void;    // the user turned follow on or off (button, drag, camera button)
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelRef = useRef<HTMLDivElement>(null);
@@ -57,6 +60,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const snapRef = useRef(snapshot);
   const hazardRef = useRef<LatLng | undefined>(hazardCenter);
   useEffect(() => { hazardRef.current = hazardCenter; }, [hazardCenter]);
+  const followRef = useRef(follow);
+  const onFollowRef = useRef(onFollowChange);
+  useEffect(() => { followRef.current = follow; onFollowRef.current = onFollowChange; }, [follow, onFollowChange]);
   const [failed, setFailed] = useState(false);
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
@@ -234,6 +240,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         // On-map buttons ease the camera toward a target instead of jumping.
         let target: MapViewState | null = null;
         cameraRef.current = (cmd) => {
+          if (followRef.current) onFollowRef.current?.(false);
           const from = target ?? view;
           target = cmd === 'home' ? home : { ...from, bearing: (from.bearing ?? 0) + (cmd === 'left' ? -ROTATE_STEP_DEG : ROTATE_STEP_DEG) };
           lastTouch = performance.now();
@@ -246,7 +253,10 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           // Left drag orbits the camera (rotate + tilt); Shift/Ctrl/Cmd + drag pans.
           controller: { inertia: 400, dragMode: 'rotate', dragRotate: true, touchRotate: true },
           effects: [lighting],
-          onViewStateChange: ({ viewState }) => { view = viewState as MapViewState; target = null; lastTouch = performance.now(); },
+          onViewStateChange: ({ viewState }) => {
+            view = viewState as MapViewState; target = null; lastTouch = performance.now();
+            if (followRef.current) onFollowRef.current?.(false);   // grabbing the map ends the chase
+          },
           onInteractionStateChange: (s) => { interacting = !!(s.isDragging || s.isPanning || s.isRotating || s.isZooming); if (interacting) lastTouch = performance.now(); },
           onError: () => { if (photo) fallBackToOsm(); else setFailed(true); },
         });
@@ -301,7 +311,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (photo && autoFallback && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
           const dt = (now - last) / 1000; last = now;
-          if (target) {
+          const chase = followRef.current ? snapRef.current.ambulance : null;
+          if (chase) {
+            view = { ...view, ...followCamera(chase, { latitude: view.latitude, longitude: view.longitude, zoom: view.zoom, pitch: view.pitch ?? 0, bearing: view.bearing ?? 0 }) };
+            target = null; lastTouch = now;
+            swayBase = view.bearing ?? 0; swayT = 0;
+          } else if (target) {
             const k = Math.min(1, dt * 6), t = target;
             const ease = (a: number | undefined, b: number | undefined) => (a ?? 0) + ((b ?? 0) - (a ?? 0)) * k;
             view = { ...view, longitude: ease(view.longitude, t.longitude), latitude: ease(view.latitude, t.latitude),
@@ -482,13 +497,18 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
       </div>
 
       {/* camera buttons, under the compass */}
-      <div role="group" aria-label="Camera" className="absolute right-6 top-[7.5rem] flex w-20 justify-between rounded-md border border-dg-line bg-black/55 p-0.5 backdrop-blur">
+      <div role="group" aria-label="Camera" className="absolute right-6 top-[7.5rem] grid w-20 grid-cols-3 rounded-md border border-dg-line bg-black/55 p-0.5 backdrop-blur">
         {([['left', 'Rotate left', 'M10 4 6 8l4 4'], ['home', 'Reset view', 'M3 8.5 8 4l5 4.5M5 7.5V12h6V7.5'], ['right', 'Rotate right', 'm6 4 4 4-4 4']] as const).map(([cmd, label, d]) => (
           <button key={cmd} type="button" aria-label={label} title={label} onClick={() => cameraRef.current?.(cmd)}
             className="grid size-7 place-items-center rounded text-dg-label transition-colors hover:bg-dg-cyan/15 hover:text-dg-cyan">
             <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>
           </button>
         ))}
+        <button type="button" aria-pressed={follow} disabled={!snapshot.ambulance} onClick={() => onFollowChange?.(!follow)}
+          className={`col-span-3 mt-0.5 min-h-7 rounded font-mono text-[9px] font-semibold uppercase tracking-[0.12em] transition-colors disabled:opacity-40 ${
+            follow ? 'bg-dg-amber/20 text-dg-amber' : 'text-dg-label hover:bg-dg-cyan/15 hover:text-dg-cyan'}`}>
+          Follow amb.
+        </button>
       </div>
 
       {/* legend */}
@@ -511,7 +531,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         <dt>LAT/LON</dt><dd className="text-right text-slate-200">{hud.lat.toFixed(4)}, {hud.lng.toFixed(4)}</dd>
       </dl>
 
-      {!outage && (
+      {follow ? (
+        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap rounded-full border border-dg-amber/40 bg-black/55 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.16em] text-dg-amber backdrop-blur">Following ambulance · drag to stop</p>
+      ) : !outage && (
         <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Drag: rotate · Shift+drag: pan · Scroll: zoom</p>
       )}
       <p className="pointer-events-none absolute bottom-1 left-1/2 max-w-[70%] -translate-x-1/2 truncate text-center font-mono text-[9px] text-slate-500">
