@@ -1,0 +1,91 @@
+// src/types/sim.ts — shared by the whole team. Owner: person A. Nobody else edits it.
+// Units, everywhere: time = SIM seconds since the blackout starts (not wall-clock, not ms);
+// distance = meters; angles = degrees, 0 = north, clockwise.
+
+export type LatLng = { lat: number; lng: number };
+
+export type RoadNode = { id: number; lat: number; lng: number; x: number; y: number }; // x,y = meters from center
+// oneway = true: drivable only from -> to. oneway = false: drivable both ways.
+export type RoadEdge = { id: number; from: number; to: number; lengthM: number; oneway: boolean };
+export type RoadGraph = {
+  center: LatLng;
+  nodes: RoadNode[];
+  edges: RoadEdge[];
+  pois: { fireStation: LatLng; hospital: LatLng; lots: LatLng[] };
+};
+
+export type VehicleState = 'DRIVING' | 'REQUESTING_HELP' | 'QUEUED_BEHIND' | 'STAGED' | 'ARRIVED';
+// The ambulance is NOT in vehicles[]; it lives only in SimSnapshot.ambulance.
+export type Vehicle = { id: number; pos: LatLng; headingDeg: number; state: VehicleState;
+                        type: 'PASSENGER' | 'EMPTY' };
+
+export type HelpRequest = {
+  id: string; vehicleId: number; nodeId: number;
+  reason: 'DARK_SIGNAL_CONFIRM' | 'STUCK';
+  createdAt: number; onCorridor: boolean; insideBox: boolean;
+  queuedBehind: number; passenger: boolean;
+};
+
+// Jobs are sorted by w / p, highest first (WSPT). In FIFO mode they are sorted by createdAt.
+export type Job = {
+  id: string; kind: 'BATCH' | 'CORRIDOR' | 'STUCK' | 'SINGLE' | 'FIFO';
+  requestIds: string[]; vehicleIds: number[];
+  w: number;          // weight: how much answering this job helps (sum of triage weights)
+  p: number;          // expected operator handling time, seconds
+  createdAt: number;
+  title: string; sub: string;
+  breakdown: { label: string; value: number }[];   // how w was computed, shown in the UI
+};
+
+export type Policy = {
+  dispatch: 'FIFO' | 'WSPT_TRIAGE';   // SimSnapshot.mode 'FIFO' <=> 'FIFO', 'DARKGRID' <=> 'WSPT_TRIAGE'
+  batchMax: number;
+  darkSignalsAsFourWayStop: number[]; // RoadNode ids
+  triageWeights: { onCorridor: number; insideBox: number; perQueuedBehind: number; passenger: number };
+};
+
+export type Metrics = {
+  requests: number; jobs: number; lambdaPerMin: number; rho: number;
+  blockingVehMin: number; stuck: number; darkCount: number;
+  ambulanceTripS: number | null;
+};
+
+export type ControlMode = 'AUTO' | 'MANUAL';   // MANUAL = a judge answers requests by clicking
+export type CameraMode = 'OVERVIEW' | 'FOLLOW_AMBULANCE';   // UI only; the sim never reads it
+
+export type Ambulance = {
+  pos: LatLng; headingDeg: number;
+  status: 'WAITING' | 'EN_ROUTE' | 'STUCK' | 'ARRIVED';
+  tripS: number;                                 // seconds since dispatch
+};
+
+export type LotState = { pos: LatLng; used: number; cap: number };
+
+export type SimSnapshot = {
+  t: number; mode: 'FIFO' | 'DARKGRID';
+  control: ControlMode;
+  manual: { reviewingJobId: string | null; lockRemainingS: number; answered: number };
+  vehicles: Vehicle[]; ambulance: Ambulance | null;
+  darkNodes: LatLng[]; corridor: LatLng[];
+  lots: LotState[];
+  jobs: Job[];                      // already sorted, first = answered next
+  operators: { id: string; task: string }[];
+  metrics: Metrics; policy: Policy;
+};
+
+// Everything the UI can ask the sim to do. The UI never changes a snapshot directly.
+export type SimCommand =
+  | { type: 'ANSWER_JOB'; jobId: string }           // MANUAL mode: the judge clicked a job
+  | { type: 'SET_CONTROL'; control: ControlMode }
+  | { type: 'RESET'; seed: number };                // restart the blackout; same seed = same run
+
+export type ChartPoint = { t: number; fifo: number; darkgrid: number }; // requests waiting
+
+// One recorded moment, used for rewind. Recorded every HISTORY_EVERY_S sim-seconds (config.ts).
+// Light: only what the screen draws.
+export type FrameLite = {
+  t: number; vehicles: Vehicle[]; ambulance: Ambulance | null;
+  corridor: LatLng[]; lots: LotState[];
+  metrics: Metrics; jobs: Job[];   // top 8 jobs only
+};
+export type HistoryFrame = { t: number; fifo: FrameLite; darkgrid: FrameLite };
