@@ -1,12 +1,16 @@
 // Simulator core. Pure TypeScript, no React. Same seed + same calls = exactly the same run.
 // Times are sim seconds. Public API: createSim, step, injectEvent, getSnapshot,
-// setControl, answerJob (plus makeGridGraph, the stand-in map until B's graph lands).
+// setControl, answerJob (plus makeGridGraph, the "Test Grid" environment).
+// Routing, dispatch and lot staging come from B: graph.ts, dispatch.ts, hungarian.ts.
 
 import type {
   Ambulance, ControlMode, HelpRequest, Job, LatLng, Metrics, Policy, RoadEdge, RoadGraph,
   RoadNode, SimSnapshot, Vehicle,
 } from '@/types/sim';
 import * as C from './config';
+import { orderJobs } from './dispatch';
+import { shortestPath } from './graph';
+import { hungarian } from './hungarian';
 
 export type SimMode = 'FIFO' | 'DARKGRID';
 // center defaults to graph.center (the substation point).
@@ -47,7 +51,7 @@ type Operator = { id: string; job: Job | null; doneT: number };
 export type Sim = {
   graph: RoadGraph; mode: SimMode; rng: () => number; t: number;
   control: ControlMode; policy: Policy;
-  lanes: Lane[]; nodes: Map<number, NodeState>; nodeIds: number[];
+  lanes: Lane[]; laneByStep: Map<string, Lane>; nodes: Map<number, NodeState>; nodeIds: number[];
   agents: Agent[]; amb: Agent; ambRoute: Lane[];
   dispatchT: number | null; arriveT: number | null;
   outageT: number | null; zonePolicy: boolean; zoneJobTaken: boolean;
@@ -55,7 +59,7 @@ export type Sim = {
   lots: Lot[];
   requests: Map<string, Req>; reqSeq: number; arrivals: number[];
   operators: Operator[]; review: { job: Job; endT: number } | null; answered: number;
-  jobs: Job[]; metrics: Metrics; blockingVehMin: number;
+  jobs: Job[]; seenJobs: Map<string, Job>; metrics: Metrics; blockingVehMin: number;
 };
 
 const SUBSTEP_S = 0.5;
@@ -101,9 +105,9 @@ function lerp(a: RoadNode, b: RoadNode, f: number): LatLng {
   return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
 }
 
-// ---------- stand-ins (swap for B's versions when they land) ----------
+// ---------- maps, routing and lot staging ----------
 
-// Stand-in for B's graph: an n x n grid of two-way streets around SoMa.
+// The "Test Grid" environment: an n x n grid of two-way streets around SoMa.
 // 9x9 at 250 m = 2 km across, so the 700 m outage covers the middle 21 of 81 nodes.
 export function makeGridGraph(n = 9, spacingM = 250): RoadGraph {
   const center = { lat: 37.7785, lng: -122.4056 };
@@ -132,87 +136,69 @@ export function makeGridGraph(n = 9, spacingM = 250): RoadGraph {
   };
 }
 
-// Stand-in for B's shortestPath: Dijkstra over lanes. With avoidCorridor, corridor
-// streets cost 50x so other vehicles stay off them.
-function shortestPath(sim: Sim, from: number, to: number, avoidCorridor: boolean): Lane[] | null {
+const CORRIDOR_PENALTY = 50;   // other vehicles stay off the ambulance corridor unless there's no other way
+
+// B's shortestPath returns node ids; the sim drives lanes, so map each step to its lane.
+function route(sim: Sim, from: number, to: number, avoidCorridor: boolean): Lane[] | null {
   if (from === to) return [];
-  const dist = new Map<number, number>([[from, 0]]);
-  const via = new Map<number, Lane>();
-  const heap: [number, number][] = [[0, from]];
-  while (heap.length) {
-    const [d, u] = heapPop(heap);
-    if (u === to) break;
-    if (d > (dist.get(u) ?? Infinity)) continue;
-    for (const lane of sim.nodes.get(u)!.out) {
-      const cost = lane.len * (avoidCorridor && sim.corridorEdges.has(lane.edgeId) ? 50 : 1);
-      const nd = d + cost;
-      if (nd < (dist.get(lane.to) ?? Infinity)) {
-        dist.set(lane.to, nd);
-        via.set(lane.to, lane);
-        heapPush(heap, [nd, lane.to]);
-      }
-    }
+  const cost = avoidCorridor
+    ? (e: RoadEdge) => e.lengthM * (sim.corridorEdges.has(e.id) ? CORRIDOR_PENALTY : 1)
+    : (e: RoadEdge) => e.lengthM;
+  const path = shortestPath(sim.graph, from, to, cost);
+  if (!path) return null;
+  const lanes: Lane[] = [];
+  for (let i = 1; i < path.length; i++) {
+    const lane = sim.laneByStep.get(`${path[i - 1]}>${path[i]}`);
+    if (!lane) return null;
+    lanes.push(lane);
   }
-  if (!via.has(to)) return null;
-  const path: Lane[] = [];
-  for (let v = to; v !== from; v = via.get(v)!.from) path.push(via.get(v)!);
-  return path.reverse();
+  return lanes;
 }
 
-function heapPush(h: [number, number][], item: [number, number]) {
-  h.push(item);
-  let i = h.length - 1;
-  while (i > 0) {
-    const p = (i - 1) >> 1;
-    if (h[p][0] <= h[i][0]) break;
-    [h[p], h[i]] = [h[i], h[p]];
-    i = p;
+function nodeDist(sim: Sim, a: number, b: number): number {
+  const p = sim.nodes.get(a)!.node, q = sim.nodes.get(b)!.node;
+  return Math.hypot(p.x - q.x, p.y - q.y);
+}
+
+// At the outage, DARK GRID sends every empty car on the road to a lot in one minimum-distance
+// assignment (B's hungarian). Each car only considers its 3 nearest lots with room, which keeps
+// the matrix small even on a map with hundreds of lots.
+function stageEmptyCars(sim: Sim) {
+  const cars = sim.agents.filter((a) => a.place === 'ROAD' && a.type === 'EMPTY' && a.lot < 0);
+  if (!cars.length || !sim.lots.length) return;
+  const from = cars.map((a) => sim.lanes[a.lane].to);
+  const wanted = new Map<number, number>();   // lot index -> how many cars have it in their top 3
+  for (const n of from) {
+    sim.lots
+      .map((lot, i) => ({ i, d: nodeDist(sim, n, lot.node), room: lot.cap - lot.reserved }))
+      .filter((l) => l.room > 0)
+      .sort((p, q) => p.d - q.d || p.i - q.i)
+      .slice(0, 3)
+      .forEach(({ i }) => wanted.set(i, (wanted.get(i) ?? 0) + 1));
   }
-}
-
-function heapPop(h: [number, number][]): [number, number] {
-  const top = h[0];
-  const last = h.pop()!;
-  if (h.length) {
-    h[0] = last;
-    let i = 0;
-    for (;;) {
-      const l = 2 * i + 1, r = l + 1;
-      let m = i;
-      if (l < h.length && h[l][0] < h[m][0]) m = l;
-      if (r < h.length && h[r][0] < h[m][0]) m = r;
-      if (m === i) break;
-      [h[m], h[i]] = [h[i], h[m]];
-      i = m;
-    }
+  const cols: number[] = [];   // one column per parking slot
+  for (const [i, n] of [...wanted].sort((p, q) => p[0] - q[0])) {
+    const room = sim.lots[i].cap - sim.lots[i].reserved;
+    for (let k = 0; k < Math.min(room, n); k++) cols.push(i);
   }
-  return top;
+  const rows = cars.slice(0, cols.length);   // any car left over gets a lot on its next trip
+  const pick = hungarian(rows.map((_, r) => cols.map((lot) => nodeDist(sim, from[r], sim.lots[lot].node))));
+  rows.forEach((a, r) => {
+    const lot = cols[pick[r]];
+    const path = route(sim, from[r], sim.lots[lot].node, true);
+    if (!path) return;
+    a.lot = lot; sim.lots[lot].reserved++;
+    a.dest = sim.lots[lot].node; a.route = path;
+  });
 }
 
-// Stand-in for B's orderJobs: one job per request, oldest first.
-function orderJobs(requests: HelpRequest[], policy: Policy): Job[] {
-  return [...requests]
-    .sort((a, b) => a.createdAt - b.createdAt)
-    .map((r) => ({
-      id: `job-${r.id}`,
-      kind: policy.dispatch === 'FIFO' ? 'FIFO' : 'SINGLE',
-      requestIds: [r.id], vehicleIds: [r.vehicleId],
-      w: 1, p: C.SERVICE_SINGLE_S, createdAt: r.createdAt,
-      title: r.reason === 'STUCK' ? `Stuck vehicle #${r.vehicleId}` : `Dark signal confirm #${r.vehicleId}`,
-      sub: `node ${r.nodeId}${r.insideBox ? ' · inside box' : ''}`,
-      breakdown: [],
-    }));
-}
-
-// Stand-in for B's hungarian(): nearest lot with room, in vehicle-id order.
+// One empty car at a time, for cars that were busy (in a box, at the curb) during staging.
 function assignLot(sim: Sim, from: number): number {
-  const p = sim.nodes.get(from)!.node;
   let best = -1;
   let bestD = Infinity;
   sim.lots.forEach((lot, i) => {
     if (lot.reserved >= lot.cap) return;
-    const q = sim.nodes.get(lot.node)!.node;
-    const d = (p.x - q.x) ** 2 + (p.y - q.y) ** 2;
+    const d = nodeDist(sim, from, lot.node);
     if (d < bestD) { bestD = d; best = i; }
   });
   return best;
@@ -231,10 +217,14 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
   for (const node of graph.nodes) nodes.set(node.id, { node, out: [], in: [], dark: false, nextPassT: 0, box: [], curb: [] });
 
   const lanes: Lane[] = [];
+  const laneByStep = new Map<string, Lane>();
   const addLane = (edgeId: number, from: number, to: number, len: number) => {
     const a = nodes.get(from)!.node, b = nodes.get(to)!.node;
     const lane: Lane = { id: lanes.length, edgeId, from, to, len: Math.max(1, len), headingDeg: bearingDeg(b.x - a.x, b.y - a.y), cars: [] };
     lanes.push(lane);
+    const key = `${from}>${to}`;
+    const prev = laneByStep.get(key);
+    if (!prev || prev.len > lane.len) laneByStep.set(key, lane);   // parallel edges: keep the shorter
     nodes.get(from)!.out.push(lane);
     nodes.get(to)!.in.push(lane);
   };
@@ -250,14 +240,14 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
 
   const sim: Sim = {
     graph, mode, rng: mulberry32(seed), t: 0, control: 'AUTO', policy: policyFor(mode),
-    lanes, nodes, nodeIds: graph.nodes.map((n) => n.id),
+    lanes, laneByStep, nodes, nodeIds: graph.nodes.map((n) => n.id),
     agents: [], amb: blankAgent(C.VEHICLES, 'AMBULANCE'), ambRoute: [],
     dispatchT: null, arriveT: null, outageT: null, zonePolicy: false, zoneJobTaken: false,
     corridorActive: false, corridorEdges: new Set(), corridorNodes: new Set(),
     lots: graph.pois.lots.map((pos) => ({ pos, node: nearestNode(graph, pos), cap: C.LOT_CAPACITY, used: 0, reserved: 0 })),
     requests: new Map(), reqSeq: 0, arrivals: [],
     operators: Array.from({ length: C.OPERATORS }, (_, i) => ({ id: `op${i + 1}`, job: null, doneT: 0 })),
-    review: null, answered: 0, jobs: [],
+    review: null, answered: 0, jobs: [], seenJobs: new Map(),
     metrics: { requests: 0, jobs: 0, lambdaPerMin: 0, rho: 0, blockingVehMin: 0, stuck: 0, darkCount: 0, ambulanceTripS: null },
     blockingVehMin: 0,
   };
@@ -265,7 +255,7 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
   // Ambulance route: fire station -> hospital. Same in both modes.
   const fire = nearestNode(graph, graph.pois.fireStation);
   const hosp = nearestNode(graph, graph.pois.hospital);
-  sim.ambRoute = shortestPath(sim, fire, hosp, false) ?? [];
+  sim.ambRoute = route(sim, fire, hosp, false) ?? [];
   sim.amb.dest = hosp;
 
   // Place vehicles on random lanes with room.
@@ -284,7 +274,7 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
   }
   for (const a of sim.agents) if (a.place === 'ROAD') newTrip(sim, a, lanes[a.lane].to);
 
-  sim.jobs = currentJobs(sim);
+  refreshJobs(sim);
   return sim;
 }
 
@@ -294,7 +284,7 @@ function newTrip(sim: Sim, a: Agent, from: number) {
   if (sim.mode === 'DARKGRID' && sim.outageT !== null && a.type === 'EMPTY' && a.lot < 0) {
     const lot = assignLot(sim, from);
     if (lot >= 0) {
-      const path = shortestPath(sim, from, sim.lots[lot].node, sim.corridorActive);
+      const path = route(sim, from, sim.lots[lot].node, sim.corridorActive);
       if (path) {
         a.lot = lot; sim.lots[lot].reserved++;
         a.dest = sim.lots[lot].node; a.route = path;
@@ -305,7 +295,7 @@ function newTrip(sim: Sim, a: Agent, from: number) {
   for (let tries = 0; tries < 5; tries++) {
     const dest = sim.nodeIds[Math.floor(sim.rng() * sim.nodeIds.length)];
     if (dest === from) continue;
-    const path = shortestPath(sim, from, dest, sim.corridorActive);
+    const path = route(sim, from, dest, sim.corridorActive);
     if (path) { a.dest = dest; a.route = path; return; }
   }
   a.dest = from; a.route = [];
@@ -394,6 +384,28 @@ function currentJobs(sim: Sim): Job[] {
   const jobs = orderJobs(open, sim.policy);
   const zone = zoneJob(sim);
   return zone ? [zone, ...jobs] : jobs;
+}
+
+// Remembers jobs the screen may still show: a batch's id changes when a request joins it.
+function refreshJobs(sim: Sim) {
+  sim.jobs = currentJobs(sim);
+  if (sim.seenJobs.size > 4000) sim.seenJobs = new Map();
+  for (const j of sim.jobs) sim.seenJobs.set(j.id, j);
+}
+
+// The card the judge clicked may have a new id by now (a request joined or left the batch).
+// Pick the current job that shares the most of its requests.
+function successor(sim: Sim, jobId: string): Job | undefined {
+  const seen = sim.seenJobs.get(jobId);
+  if (!seen?.requestIds.length) return undefined;
+  const ids = new Set(seen.requestIds);
+  let best: Job | undefined;
+  let bestN = 0;
+  for (const j of sim.jobs) {
+    const n = j.requestIds.filter((id) => ids.has(id)).length;
+    if (n > bestN) { best = j; bestN = n; }
+  }
+  return best;
 }
 
 function takeJob(sim: Sim, job: Job) {
@@ -545,7 +557,7 @@ function tick(sim: Sim, dt: number) {
       op.job = next; op.doneT = sim.t + next.p;
     }
   }
-  sim.jobs = currentJobs(sim);
+  refreshJobs(sim);
 
   if (Math.floor(sim.t) > Math.floor(prevT)) updateMetrics(sim);
 }
@@ -596,15 +608,16 @@ export function injectEvent(sim: Sim, event: SimEvent) {
 
   // DARK GRID: open the ambulance corridor and stage empty cars right away. The zone policy
   // waits for a human to approve its card (answerJob); automatic operators skip it.
-  sim.jobs = currentJobs(sim);
+  refreshJobs(sim);
   sim.corridorActive = true;
   for (const lane of sim.ambRoute) {
     sim.corridorEdges.add(lane.edgeId);
     sim.corridorNodes.add(lane.from);
     sim.corridorNodes.add(lane.to);
   }
+  stageEmptyCars(sim);
   for (const a of sim.agents) {
-    if (a.place !== 'ROAD') continue;
+    if (a.place !== 'ROAD' || a.lot >= 0) continue;
     const from = sim.lanes[a.lane].to;
     if (a.type === 'EMPTY' || a.route.some((l) => sim.corridorEdges.has(l.edgeId))) newTripTo(sim, a, from, a.dest);
   }
@@ -613,7 +626,7 @@ export function injectEvent(sim: Sim, event: SimEvent) {
 // Reroute keeping the same destination (EMPTY cars get a lot instead).
 function newTripTo(sim: Sim, a: Agent, from: number, dest: number) {
   if (a.type === 'EMPTY') { newTrip(sim, a, from); return; }
-  const path = shortestPath(sim, from, dest, true);
+  const path = route(sim, from, dest, true);
   if (path) a.route = path;
 }
 
@@ -630,18 +643,18 @@ export function setControl(sim: Sim, control: ControlMode) {
       }
       op.job = null;
     }
-    sim.jobs = currentJobs(sim);
+    refreshJobs(sim);
   }
 }
 
 // The judge clicks a job card. False if a review is running or the job is gone.
 export function answerJob(sim: Sim, jobId: string): boolean {
   if (sim.review) return false;
-  const job = sim.jobs.find((j) => j.id === jobId);
+  const job = sim.jobs.find((j) => j.id === jobId) ?? successor(sim, jobId);
   if (!job) return false;
   takeJob(sim, job);
   sim.review = { job, endT: sim.t + C.REVIEW_LOCK_REAL_S * C.SIM_SPEED };
-  sim.jobs = currentJobs(sim);
+  refreshJobs(sim);
   return true;
 }
 
