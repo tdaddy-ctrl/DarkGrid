@@ -101,5 +101,16 @@ describe('graph loading and geometry', () => {
     expect(path[0]).toBe(from); expect(path.at(-1)).toBe(to);
     expect(pathLength(g, path)).toBeGreaterThan(0);
     expect(distancesFrom(g, from, length).get(to)).toBe(pathLength(g, path));
+    // Simulator geometry is the straight segment between each pair of road nodes.
+    const byId = new Map(g.nodes.map(n => [n.id, n]));
+    const distances = path.slice(1).map((id, i) => {
+      const a = byId.get(path[i])!, b = byId.get(id)!;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const t = dx || dy ? Math.max(0, Math.min(1, -(a.x * dx + a.y * dy) / (dx * dx + dy * dy))) : 0;
+      return Math.hypot(a.x + t * dx, a.y + t * dy);
+    });
+    expect(Math.min(...distances)).toBeLessThanOrEqual(300);
+    expect(g.pois.fireStation).toEqual({ lat: byId.get(from)!.lat, lng: byId.get(from)!.lng });
+    expect(g.pois.hospital).toEqual({ lat: byId.get(to)!.lat, lng: byId.get(to)!.lng });
   });
 });
