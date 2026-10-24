@@ -147,6 +147,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
   const [split, setSplit] = useState(false);                // both cities side by side
   const [follow, setFollow] = useState(false);              // 3D camera chases the ambulance
+  const [expanded, setExpanded] = useState(false);          // the map takes the whole screen below the header
   const [proposal, setProposal] = useState<ChaosResult | null>(null);   // Claude's draft for the zone card
   const [hazard, setHazard] = useState<{ center: LatLng; label: string } | null>(null);   // where this run's blackout hit
 
@@ -251,15 +252,17 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     blackout,
     () => takeOver('FIFO'),
     () => takeOver('DARKGRID'),
-    () => { setFollow(false); setSplit(true); },
-    () => { setSplit(false); setMode('DARKGRID'); setFollow(true); },
+    () => { setFollow(false); setExpanded(false); setSplit(true); },
+    () => { setSplit(false); setMode('DARKGRID'); setFollow(true); setExpanded(true); },
   ], [onReset, blackout, takeOver]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement;
       if (e.metaKey || e.ctrlKey || e.altKey || el.closest('input, textarea, select, [contenteditable="true"]')) return;
       const i = Number(e.key);
-      if (e.key.length === 1 && i >= 0 && i < director.length) { e.preventDefault(); director[i](); }
+      if (e.key === 'Escape') setExpanded(false);
+      else if (e.key === 'm' || e.key === 'M') setExpanded((v) => !v);
+      else if (e.key.length === 1 && i >= 0 && i < director.length) { e.preventDefault(); director[i](); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -356,7 +359,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
           {judge === null && <button onClick={() => takeOver('FIFO')} className={btn('red')}>Judge takes over</button>}
           {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
           {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
-          <button onClick={() => { setSplit((v) => !v); setFollow(false); }} aria-pressed={split} className={btn(split ? 'cyan' : 'ghost')}>
+          <button onClick={() => { setSplit((v) => !v); setFollow(false); setExpanded(false); }} aria-pressed={split} className={btn(split ? 'cyan' : 'ghost')}>
             {split ? 'Single view' : 'Split view'}
           </button>
           <button onClick={togglePause} className={btn('ghost')}>{paused ? 'Resume' : 'Pause'}</button>
@@ -367,7 +370,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
       <DemoDirectorBar step={demoStep} onReset={director[0]} onBlackout={director[1]} onManual={director[2]}
         onDarkGrid={director[3]} onSplit={director[4]} onFollow={director[5]} />
 
-      <div className="grid min-h-0 gap-3 lg:flex-[62] lg:grid-cols-[minmax(0,7fr)_minmax(0,3fr)]">
+      <div className={`grid min-h-0 gap-3 ${expanded && !split ? 'flex-1' : 'lg:flex-[62] lg:grid-cols-[minmax(0,1fr)_minmax(320px,25%)]'}`}>
         {split ? (
           /* Same seed, same blackout: the only difference between the two maps is the dispatch policy. */
           <div className="flex min-h-0 flex-col gap-3">
@@ -378,10 +381,18 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
             {timeline}
           </div>
         ) : (
-          <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
+          <section className={`dg-panel flex flex-col overflow-hidden lg:min-h-0 ${expanded ? 'min-h-[75vh]' : 'min-h-[440px]'}`}>
             <PanelHeader title={`Tactical map · ${cityShort(snap.mode)}`} tone={outage ? 'amber' : 'cyan'}>
               <Badge>{snap.vehicles.length} units</Badge>
               {outage && <Badge tone="amber">{snap.darkNodes.length} dark</Badge>}
+              <button type="button" onClick={() => setExpanded((v) => !v)} aria-pressed={expanded}
+                title={expanded ? 'Back to the dashboard (Esc)' : 'Full-screen map (M)'}
+                className="flex min-h-7 items-center gap-1.5 rounded-md border border-dg-line px-2 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label transition-colors hover:border-dg-cyan/40 hover:text-dg-cyan">
+                <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                  <path d={expanded ? 'M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4' : 'M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4'} />
+                </svg>
+                {expanded ? 'Exit' : 'Expand'}
+              </button>
             </PanelHeader>
             <div className="relative min-h-0 flex-1">
               <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}
@@ -396,11 +407,12 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
             {timeline}
           </section>
         )}
-        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer}
-          proposal={outage ? proposal : null} readOnly={!view.isLive} />
+        {!(expanded && !split) && <QueuePlaceholder snapshot={snap} onAnswer={onAnswer}
+          proposal={outage ? proposal : null} readOnly={!view.isLive} />}
       </div>
 
-      <div className="grid min-h-0 gap-3 md:grid-cols-2 lg:flex-[28] xl:grid-cols-4">
+      {/* hidden, not unmounted, in full-screen map mode so the injector and Ask-why keep their state */}
+      <div className={expanded && !split ? 'hidden' : 'grid min-h-0 gap-3 md:grid-cols-2 lg:flex-[28] xl:grid-cols-4'}>
         <KpiPanel snapshot={mode === 'FIFO' ? view.darkgrid : view.fifo} other={snap} />
         <MetricsChart data={view.chart} />
         <ChaosInjectorPanel onResult={onChaos} />
