@@ -7,7 +7,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
-import type { LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
+import type { Ambulance, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
 import { followCamera } from '@/lib/followCamera';
 
@@ -47,7 +47,6 @@ const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
 const ROTATE_STEP_DEG = 45;       // one press of the on-map rotate buttons
 const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
-const UPDATE_MS = 250;            // the page sends a new snapshot 4x/s; cars glide between them
 // Vehicles are 3D models built by scripts/build-car-models.mjs at real size (meters). Far out they would be
 // a pixel or two, so a model never draws smaller than CAR_MIN_PX pixels per meter (about 4 px for a car).
 const WAYMO_GLB = '/models/waymo.glb';
@@ -129,11 +128,52 @@ async function loadCarParts(url: string): Promise<CarPart[]> {
   });
 }
 
-type Car = { id: number; from: [number, number]; to: [number, number]; heading: number; state: string; moving: boolean };
+type Mover = { id: number; pos: LatLng; headingDeg: number; state: string };
+type Glide = { from: [number, number]; to: [number, number]; at: number; heading: number; aim: number; state: string };
+export type Motion = { t: number; vehicles: Mover[]; ambulance: Ambulance | null };
+
+function pushMotion(cars: Glider, amb: Glider, m: Motion, now: number) {
+  cars.push(m.vehicles.filter((v) => v.state !== 'STAGED'), now);   // staged cars are shown as lot counts
+  amb.push(m.ambulance ? [{ id: 0, pos: m.ambulance.pos, headingDeg: m.ambulance.headingDeg, state: m.ambulance.status }] : [], now);
+}
+
+// Positions arrive in samples (every sim step when live, 4x/s in replay). Each car glides from where
+// it is drawn to its newest position over one sample interval, and turns smoothly toward the way it
+// is actually moving instead of snapping to the next lane's direction.
+class Glider {
+  items = new Map<number, Glide>();
+  private at = 0;
+  private interval = 250;
+  push(list: Mover[], now: number) {
+    if (this.at) this.interval += (Math.min(400, Math.max(30, now - this.at)) - this.interval) * 0.3;
+    this.at = now;
+    const seen = new Set<number>();
+    for (const v of list) {
+      seen.add(v.id);
+      const g = this.items.get(v.id);
+      const to: [number, number] = [v.pos.lng, v.pos.lat];
+      const drawn = g ? this.where(g, now) : to;
+      const dx = (to[0] - drawn[0]) * 111320 * Math.cos((to[1] * Math.PI) / 180), dy = (to[1] - drawn[1]) * 110540;
+      const jump = Math.hypot(dx, dy) > 800;   // a teleport (new trip) doesn't glide
+      const aim = !jump && Math.hypot(dx, dy) > 0.3 ? (Math.atan2(dx, dy) * 180) / Math.PI : g?.aim ?? v.headingDeg;
+      this.items.set(v.id, { from: jump ? to : drawn, to, at: now, heading: g && !jump ? g.heading : aim, aim, state: v.state });
+    }
+    for (const id of this.items.keys()) if (!seen.has(id)) this.items.delete(id);
+  }
+  where(g: Glide, now: number): [number, number] {
+    const f = Math.min(1, (now - g.at) / this.interval);
+    return [g.from[0] + (g.to[0] - g.from[0]) * f, g.from[1] + (g.to[1] - g.from[1]) * f];
+  }
+  turn(dt: number) {
+    const k = 1 - Math.exp(-dt * 9);
+    for (const g of this.items.values()) g.heading += ((((g.aim - g.heading) % 360) + 540) % 360 - 180) * k;
+  }
+}
 const HAZARD_LABEL_ALT_M = 220;
 
-export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire', follow = false, onFollowChange }: {
+export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire', motion, follow = false, onFollowChange }: {
   snapshot: SimSnapshot; graph: RoadGraph; fallback: ReactNode; hazardCenter?: LatLng; hazardLabel?: string;
+  motion?: () => Motion | null;              // live positions, read every frame (null while replaying)
   follow?: boolean;                          // chase camera behind the ambulance
   onFollowChange?: (on: boolean) => void;    // the user turned follow on or off (button, drag, camera button)
 }) {
@@ -146,13 +186,16 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const followRef = useRef(follow);
   const onFollowRef = useRef(onFollowChange);
   useEffect(() => { followRef.current = follow; onFollowRef.current = onFollowChange; }, [follow, onFollowChange]);
+  const motionRef = useRef(motion);
+  useEffect(() => { motionRef.current = motion; }, [motion]);
   const [failed, setFailed] = useState(false);
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
   const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
   const cameraRef = useRef<((cmd: 'left' | 'right' | 'home') => void) | null>(null);
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
-  const carsRef = useRef<{ list: Car[]; at: number }>({ list: [], at: 0 });
+  const carsRef = useRef(new Glider());
+  const ambRef = useRef(new Glider());
   const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
 
   useEffect(() => {
@@ -174,19 +217,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
     for (const id of trails.map.keys()) if (!seen.has(id)) trails.map.delete(id);
     trails.data = data;
 
-    // Each car glides from where it was drawn last to its new position over the next update.
-    const prev = new Map(carsRef.current.list.map((c) => [c.id, c]));
-    const f = Math.min(1, (performance.now() - carsRef.current.at) / UPDATE_MS);
-    carsRef.current = {
-      at: performance.now(),
-      list: snapshot.vehicles.filter((v) => v.state !== 'STAGED').map((v) => {
-        const p = prev.get(v.id);
-        const drawn: [number, number] = p ? [p.from[0] + (p.to[0] - p.from[0]) * f, p.from[1] + (p.to[1] - p.from[1]) * f] : [v.pos.lng, v.pos.lat];
-        const to: [number, number] = [v.pos.lng, v.pos.lat];
-        const jump = Math.abs(to[0] - drawn[0]) + Math.abs(to[1] - drawn[1]) > 0.01;   // a teleport (new trip) doesn't glide
-        return { id: v.id, from: jump ? to : drawn, to, heading: v.headingDeg, state: v.state, moving: v.state === 'DRIVING' };
-      }),
-    };
+    // Replay (no live positions): glide between the 4x/s snapshots instead.
+    if (!motionRef.current?.()) pushMotion(carsRef.current, ambRef.current, snapshot, performance.now());
   }, [snapshot]);
 
   useEffect(() => {
@@ -369,13 +401,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         const carScale = () => Math.max(1, CAR_MIN_PX / ((512 * 2 ** view.zoom) / (40075016.686 * Math.cos((view.latitude * Math.PI) / 180))));
 
         const carLayers = (layers: typeof L, now: number): Layer[] => {
-          const { list, at } = carsRef.current;
-          const f = Math.min(1, (now - at) / UPDATE_MS);
-          const cars = list.map((c) => {
-            const lng = c.from[0] + (c.to[0] - c.from[0]) * f, lat = c.from[1] + (c.to[1] - c.from[1]) * f;
-            return { ...c, head: [lng, lat, gz(lng, lat) + CAR_LIFT_M] as Pt };
+          const glider = carsRef.current;
+          const cars = [...glider.items.values()].map((g) => {
+            const [lng, lat] = glider.where(g, now);
+            return { heading: g.heading, state: g.state, head: [lng, lat, gz(lng, lat) + CAR_LIFT_M] as Pt };
           });
-          const flagged = cars.filter((c) => !c.moving);
+          const flagged = cars.filter((c) => c.state !== 'DRIVING');
           const help = flagged.filter((c) => c.state === 'REQUESTING_HELP');
           const pulse = 0.5 + 0.5 * Math.sin(now / 300);
           return [
@@ -401,12 +432,21 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         let streetLights: Pt[] = [];
 
         let last = performance.now();
+        let lastMotionT = -1;
         let lastHud = 0;
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (photo && autoFallback && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
           const dt = (now - last) / 1000; last = now;
-          const chase = followRef.current ? snapRef.current.ambulance : null;
+          const live = motionRef.current?.();
+          if (live && live.t !== lastMotionT) { lastMotionT = live.t; pushMotion(carsRef.current, ambRef.current, live, now); }
+          carsRef.current.turn(dt);
+          ambRef.current.turn(dt);
+          const ambGlide = ambRef.current.items.get(0);
+          const ambNow = snapRef.current.ambulance && ambGlide
+            ? { ...snapRef.current.ambulance, pos: (([lng, lat]) => ({ lng, lat }))(ambRef.current.where(ambGlide, now)), headingDeg: ambGlide.heading }
+            : snapRef.current.ambulance;
+          const chase = followRef.current ? ambNow : null;
           if (chase) {
             const next = followCamera(chase, { latitude: view.latitude, longitude: view.longitude, zoom: view.zoom, pitch: view.pitch ?? 0, bearing: view.bearing ?? 0 });
             // Keep the ambulance itself in the middle of the frame (the patient clock covers the top), closer in.
@@ -499,7 +539,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             }),
             ...carLayers(L, now),
           );
-          const amb = snap.ambulance;
+          const amb = ambNow;
           if (amb) {
             const flash = Math.floor(now / 250) % 2 === 0;   // red / white light bar washing over the street
             const ground: Pt = [amb.pos.lng, amb.pos.lat, gz(amb.pos.lng, amb.pos.lat) + 1];

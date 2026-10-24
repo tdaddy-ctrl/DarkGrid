@@ -728,8 +728,8 @@ function ambulanceView(sim: Sim): Ambulance | null {
   return { pos, headingDeg, status, tripS };
 }
 
-export function getSnapshot(sim: Sim): SimSnapshot {
-  const vehicles: Vehicle[] = sim.agents.map((a) => ({
+function vehicleView(sim: Sim, a: Agent): Vehicle {
+  return {
     id: a.id,
     pos: agentPos(sim, a),
     headingDeg: a.lane >= 0 ? sim.lanes[a.lane].headingDeg : 0,
@@ -737,7 +737,16 @@ export function getSnapshot(sim: Sim): SimSnapshot {
       : a.requestId ? 'REQUESTING_HELP'
       : a.place === 'ROAD' && a.speed < 0.1 ? 'QUEUED_BEHIND' : 'DRIVING',
     type: a.type === 'PASSENGER' ? 'PASSENGER' : 'EMPTY',
-  }));
+  };
+}
+
+/** Just where everything is: cheap enough for the 3D map to read on every animation frame. */
+export function getMotion(sim: Sim): { t: number; vehicles: Vehicle[]; ambulance: Ambulance | null } {
+  return { t: sim.t, vehicles: sim.agents.map((a) => vehicleView(sim, a)), ambulance: ambulanceView(sim) };
+}
+
+export function getSnapshot(sim: Sim): SimSnapshot {
+  const vehicles: Vehicle[] = sim.agents.map((a) => vehicleView(sim, a));
   const darkNodes: LatLng[] = [];
   for (const ns of sim.nodes.values()) if (ns.dark) darkNodes.push({ lat: ns.node.lat, lng: ns.node.lng });
   const corridor: LatLng[] = [];

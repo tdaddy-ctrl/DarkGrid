@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
-  answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, pickOutageCenter, setControl, step, type Sim,
+  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickOutageCenter, setControl, step, type Sim,
 } from '@/lib/sim';
 import { HISTORY_EVERY_S, REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
@@ -247,6 +247,14 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   }, [blackout]);
 
   // Demo director (B's bar): one button per act of the 3-minute demo, also on keys 0-5.
+  // The 3D map reads car positions straight from the sim every frame (smooth motion without
+  // re-rendering React); while replaying history it falls back to the published snapshots.
+  const motion = useCallback(() => {
+    const sims = simsRef.current;
+    if (!sims || playbackTRef.current !== null) return null;
+    return getMotion(mode === 'FIFO' ? sims.fifo : sims.darkgrid);
+  }, [mode]);
+
   const director = useMemo(() => [
     onReset,
     blackout,
@@ -396,7 +404,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
             </PanelHeader>
             <div className="relative min-h-0 flex-1">
               <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}
-                follow={follow} onFollowChange={setFollow}
+                motion={motion} follow={follow} onFollowChange={setFollow}
                 fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />} />
               <PatientClock snapshot={snap} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
               {/* ARRIVED / STUCK banner: replays when the status changes, then fades so the map stays visible */}
