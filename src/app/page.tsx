@@ -11,6 +11,7 @@ import {
   answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
 } from '@/lib/sim';
 import { SEED, SIM_SPEED } from '@/lib/config';
+import RequestQueuePanel from '@/components/RequestQueuePanel';
 
 const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
@@ -156,7 +157,7 @@ export default function Home() {
 
       <div className="grid flex-1 gap-4 lg:grid-cols-[1fr_340px]">
         <MapPlaceholder snapshot={snap} graph={graph} />
-        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />
+        <RequestQueuePanel snapshot={snap} onAnswer={onAnswer} />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[1fr_1fr_1.4fr]">
