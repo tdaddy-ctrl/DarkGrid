@@ -156,7 +156,7 @@ export default function Home() {
               <button key={m} onClick={() => setMode(m)} aria-pressed={mode === m}
                 className={`min-h-9 rounded-md px-3 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-colors ${
                   mode === m
-                    ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(34,211,238,.8)]'
+                    ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(0,240,255,.8)]'
                     : 'text-slate-300 hover:text-slate-50'}`}>
                 {cityShort(m)}
               </button>
@@ -208,9 +208,9 @@ const TONE_TEXT: Record<Tone, string> = {
 function btn(tone: 'amber' | 'red' | 'cyan' | 'ghost'): string {
   const base = 'min-h-9 rounded-lg px-3.5 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40';
   const tones = {
-    amber: 'bg-linear-to-b from-amber-300 to-amber-500 text-slate-950 shadow-[0_0_20px_-6px_rgba(251,191,36,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(251,191,36,.9)]',
-    red: 'bg-linear-to-b from-red-300 to-red-500 text-slate-950 shadow-[0_0_20px_-6px_rgba(248,113,113,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(248,113,113,.9)]',
-    cyan: 'bg-linear-to-b from-cyan-200 to-cyan-400 text-slate-950 shadow-[0_0_20px_-6px_rgba(34,211,238,.8)] enabled:hover:shadow-[0_0_28px_-4px_rgba(34,211,238,1)]',
+    amber: 'bg-linear-to-b from-[#ffd46b] to-dg-amber text-slate-950 shadow-[0_0_20px_-6px_rgba(255,184,0,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,184,0,.9)]',
+    red: 'bg-linear-to-b from-[#ff8ba0] to-dg-red text-slate-950 shadow-[0_0_20px_-6px_rgba(255,42,84,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,42,84,.9)]',
+    cyan: 'bg-linear-to-b from-[#8cfaff] to-dg-cyan text-slate-950 shadow-[0_0_20px_-6px_rgba(0,240,255,.8)] enabled:hover:shadow-[0_0_28px_-4px_rgba(0,240,255,1)]',
     ghost: 'border border-dg-line bg-white/[0.03] text-slate-200 enabled:hover:border-white/20 enabled:hover:bg-white/[0.07]',
   };
   return `${base} ${tones[tone]}`;
@@ -251,10 +251,10 @@ function PanelHeader({ title, tone, children }: { title: string; tone: Tone; chi
 function BrandMark() {
   return (
     <svg aria-hidden="true" viewBox="0 0 28 28" className="size-8">
-      <rect x="0.5" y="0.5" width="27" height="27" rx="6" fill="none" stroke="rgb(34 211 238 / 0.45)" />
+      <rect x="0.5" y="0.5" width="27" height="27" rx="6" fill="none" stroke="rgb(0 240 255 / 0.45)" />
       {[0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => (
         <rect key={`${r}${c}`} x={6 + c * 6} y={6 + r * 6} width="4" height="4" rx="1"
-          fill={r === 1 && c === 1 ? '#22d3ee' : 'rgb(148 163 184 / 0.35)'} />
+          fill={r === 1 && c === 1 ? '#00f0ff' : 'rgb(148 163 184 / 0.35)'} />
       )))}
     </svg>
   );
@@ -262,9 +262,9 @@ function BrandMark() {
 
 // ---------- placeholders (delete each one when the real component lands) ----------
 
-// Vehicle colors follow the team design (C's MapView uses the same ones).
+// Vehicle colors; C's MapView should use the same ones.
 const STATE_COLOR: Record<string, string> = {
-  DRIVING: '#34d399', REQUESTING_HELP: '#f87171', QUEUED_BEHIND: '#fb923c', STAGED: '#22d3ee', ARRIVED: '#94a3b8',
+  DRIVING: '#34d399', REQUESTING_HELP: '#ff2a54', QUEUED_BEHIND: '#fb923c', STAGED: '#00f0ff', ARRIVED: '#94a3b8',
 };
 const LEGEND: [string, string][] = [
   ['Driving', STATE_COLOR.DRIVING], ['Needs help', STATE_COLOR.REQUESTING_HELP],
@@ -309,7 +309,7 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
           </defs>
           <rect width={W} height={H} fill={`url(#${uid}grid)`} />
 
-          <g stroke="rgb(34 211 238 / 0.07)" strokeWidth={14} strokeLinecap="round">
+          <g stroke="rgb(0 240 255 / 0.07)" strokeWidth={14} strokeLinecap="round">
             {roads.map(({ id, ...r }) => <line key={id} {...r} />)}
           </g>
           <g stroke="#2a3a55" strokeWidth={3} strokeLinecap="round">
@@ -318,8 +318,8 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
 
           {snapshot.corridor.length > 1 && (
             <g>
-              <polyline points={corridor} fill="none" stroke="#fbbf24" strokeOpacity={0.18} strokeWidth={22} strokeLinejoin="round" />
-              <polyline points={corridor} fill="none" stroke="#fbbf24" strokeWidth={4} strokeLinejoin="round" filter={`url(#${uid}glow)`} />
+              <polyline points={corridor} fill="none" stroke="#ffb800" strokeOpacity={0.18} strokeWidth={22} strokeLinejoin="round" />
+              <polyline points={corridor} fill="none" stroke="#ffb800" strokeWidth={4} strokeLinejoin="round" filter={`url(#${uid}glow)`} />
               <polyline points={corridor} fill="none" stroke="#fff7d6" strokeWidth={2} strokeDasharray="10 22" strokeLinejoin="round">
                 <animate attributeName="stroke-dashoffset" from="64" to="0" dur="1.4s" repeatCount="indefinite" />
               </polyline>
@@ -328,22 +328,22 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
 
           {snapshot.darkNodes.map((p, i) => (
             <g key={i} transform={`translate(${px(p)} ${py(p)})`}>
-              <circle r={8} fill="none" stroke="#f87171" strokeWidth={1.5}>
+              <circle r={8} fill="none" stroke="#ff2a54" strokeWidth={1.5}>
                 <animate attributeName="r" values="8;26" dur="2.4s" begin={`${(i % 6) * 0.4}s`} repeatCount="indefinite" />
                 <animate attributeName="opacity" values="0.7;0" dur="2.4s" begin={`${(i % 6) * 0.4}s`} repeatCount="indefinite" />
               </circle>
-              <circle r={5} fill="#f87171" opacity={0.85} />
+              <circle r={5} fill="#ff2a54" opacity={0.85} />
             </g>
           ))}
 
           {snapshot.lots.map((l, i) => {
             const x = px(l.pos), y = py(l.pos), s = 26, k = 9;
             return (
-              <g key={i} stroke="#22d3ee" fill="none" strokeWidth={2}>
+              <g key={i} stroke="#00f0ff" fill="none" strokeWidth={2}>
                 <path d={`M${x - s},${y - s + k}V${y - s}H${x - s + k} M${x + s - k},${y - s}H${x + s}V${y - s + k} M${x + s},${y + s - k}V${y + s}H${x + s - k} M${x - s + k},${y + s}H${x - s}V${y + s - k}`} />
-                <rect x={x - s} y={y + s + 6} width={2 * s} height={4} fill="rgb(34 211 238 / 0.15)" stroke="none" />
-                <rect x={x - s} y={y + s + 6} width={(2 * s * l.used) / l.cap} height={4} fill="#22d3ee" stroke="none" />
-                <text x={x} y={y - s - 8} fill="#22d3ee" stroke="none" fontSize={18} textAnchor="middle"
+                <rect x={x - s} y={y + s + 6} width={2 * s} height={4} fill="rgb(0 240 255 / 0.15)" stroke="none" />
+                <rect x={x - s} y={y + s + 6} width={(2 * s * l.used) / l.cap} height={4} fill="#00f0ff" stroke="none" />
+                <text x={x} y={y - s - 8} fill="#00f0ff" stroke="none" fontSize={18} textAnchor="middle"
                   fontFamily="var(--font-jetbrains)">{l.used}/{l.cap}</text>
               </g>
             );
@@ -361,10 +361,10 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
 
           {amb && (
             <g transform={`translate(${px(amb.pos)} ${py(amb.pos)})`}>
-              <circle r={24} fill="#fbbf24" opacity={0.18}>
+              <circle r={24} fill="#ffb800" opacity={0.18}>
                 <animate attributeName="r" values="18;30;18" dur="1.6s" repeatCount="indefinite" />
               </circle>
-              <path transform={`rotate(${amb.headingDeg})`} d="M0,-16 L11,12 L0,6 L-11,12 Z" fill="#ffffff" stroke="#fbbf24" strokeWidth={3} />
+              <path transform={`rotate(${amb.headingDeg})`} d="M0,-16 L11,12 L0,6 L-11,12 Z" fill="#ffffff" stroke="#ffb800" strokeWidth={3} />
             </g>
           )}
         </svg>
@@ -444,7 +444,7 @@ function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAns
               <li key={op.id} className="flex items-center gap-2 rounded-lg border border-dg-line bg-white/[0.02] px-2 py-1.5">
                 <span className="w-12 shrink-0 font-mono text-[11px] uppercase text-slate-400">{op.id}</span>
                 <span className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${
-                  busy ? 'bg-dg-cyan/15 text-dg-cyan shadow-[0_0_10px_-2px_rgba(34,211,238,.6)]' : 'bg-white/[0.05] text-slate-500'}`}>
+                  busy ? 'bg-dg-cyan/15 text-dg-cyan shadow-[0_0_10px_-2px_rgba(0,240,255,.6)]' : 'bg-white/[0.05] text-slate-500'}`}>
                   {busy ? 'ACTIVE' : 'IDLE'}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-xs text-slate-300">{busy ? op.task : 'Standing by'}</span>
@@ -460,7 +460,7 @@ function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAns
       </div>
 
       {manual && (
-        <p className="flex items-center justify-between gap-2 border-b border-dg-red/30 bg-dg-red/10 px-4 py-2 text-sm text-red-200">
+        <p className="flex items-center justify-between gap-2 border-b border-dg-red/30 bg-dg-red/10 px-4 py-2 text-sm text-[#ffc2cd]">
           <span>{locked ? `Reviewing… ${snapshot.manual.lockRemainingS.toFixed(1)} s` : 'You are the operator. Click a card.'}</span>
           <span className="font-mono text-xs tabular-nums">YOU {snapshot.manual.answered} · WAITING {snapshot.jobs.length}</span>
         </p>
@@ -469,8 +469,8 @@ function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAns
       {shown.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
           <svg aria-hidden="true" viewBox="0 0 80 80" className="size-20">
-            {[34, 24, 14].map((r) => <circle key={r} cx="40" cy="40" r={r} fill="none" stroke="rgb(34 211 238 / 0.25)" strokeDasharray="3 5" />)}
-            <circle cx="40" cy="40" r="3" fill="#22d3ee" />
+            {[34, 24, 14].map((r) => <circle key={r} cx="40" cy="40" r={r} fill="none" stroke="rgb(0 240 255 / 0.25)" strokeDasharray="3 5" />)}
+            <circle cx="40" cy="40" r="3" fill="#00f0ff" />
           </svg>
           <p className="dg-label">Queue clear</p>
           <p className="text-xs text-dg-label">No robotaxi is waiting for an operator.</p>
@@ -484,7 +484,7 @@ function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAns
                 <button disabled={locked || !(manual || zone)} onClick={() => onAnswer(j.id)}
                   className={`flex w-full items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-default ${
                     zone
-                      ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(34,211,238,.9)] enabled:hover:bg-dg-cyan/[0.12]'
+                      ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(0,240,255,.9)] enabled:hover:bg-dg-cyan/[0.12]'
                       : 'border-dg-line bg-white/[0.02] enabled:hover:border-white/20 enabled:hover:bg-white/[0.05]'}`}>
                   <span className="pt-0.5 font-mono text-[11px] tabular-nums text-slate-500">#{String(i + 1).padStart(2, '0')}</span>
                   <span className="min-w-0 flex-1">
@@ -585,7 +585,7 @@ function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
           <span aria-hidden="true" className="w-3 border-t border-dashed border-slate-400" />FIFO
         </span>
         <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-dg-cyan">
-          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-cyan shadow-[0_0_6px_#22d3ee]" />DARK GRID
+          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-cyan shadow-[0_0_6px_#00f0ff]" />DARK GRID
         </span>
       </PanelHeader>
       <div className="relative p-3">
@@ -593,8 +593,8 @@ function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
           aria-label={last ? `Requests waiting at ${formatT(last.t)}: FIFO ${last.fifo}, DARK GRID ${last.darkgrid}` : 'No data yet'}>
           <defs>
             <linearGradient id={`${uid}dg`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="#22d3ee" stopOpacity="0" />
+              <stop offset="0%" stopColor="#00f0ff" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#00f0ff" stopOpacity="0" />
             </linearGradient>
             <linearGradient id={`${uid}fifo`} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#94a3b8" stopOpacity="0.16" />
@@ -615,10 +615,10 @@ function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
               <path d={area('fifo')} fill={`url(#${uid}fifo)`} />
               <polyline points={pts('fifo')} fill="none" stroke="#94a3b8" strokeWidth={1.75} strokeDasharray="5 4" strokeLinejoin="round" />
               <path d={area('darkgrid')} fill={`url(#${uid}dg)`} />
-              <polyline points={pts('darkgrid')} fill="none" stroke="#22d3ee" strokeOpacity={0.3} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round" />
-              <polyline points={pts('darkgrid')} fill="none" stroke="#22d3ee" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+              <polyline points={pts('darkgrid')} fill="none" stroke="#00f0ff" strokeOpacity={0.3} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round" />
+              <polyline points={pts('darkgrid')} fill="none" stroke="#00f0ff" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
               <circle cx={x(last.t)} cy={y(last.fifo)} r={3} fill="#94a3b8" />
-              <circle cx={x(last.t)} cy={y(last.darkgrid)} r={3.5} fill="#22d3ee" />
+              <circle cx={x(last.t)} cy={y(last.darkgrid)} r={3.5} fill="#00f0ff" />
             </>
           )}
         </svg>

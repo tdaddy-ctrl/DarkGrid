@@ -82,7 +82,7 @@ export default function AskWhyBar({ jobs }: { jobs: Job[] }) {
         <button onClick={toggleMic} aria-label={listening ? 'Stop listening' : 'Ask by voice'} aria-pressed={listening}
           className={`grid size-11 shrink-0 place-items-center rounded-full border transition-colors ${
             listening
-              ? 'border-dg-cyan bg-dg-cyan/20 text-dg-cyan shadow-[0_0_24px_-4px_rgba(34,211,238,.9)]'
+              ? 'border-dg-cyan bg-dg-cyan/20 text-dg-cyan shadow-[0_0_24px_-4px_rgba(0,240,255,.9)]'
               : 'border-dg-line bg-white/[0.03] text-slate-200 hover:border-white/25 hover:bg-white/[0.07]'}`}>
           <svg aria-hidden="true" viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
             <rect x="9" y="3" width="6" height="11" rx="3" />
@@ -109,9 +109,9 @@ export default function AskWhyBar({ jobs }: { jobs: Job[] }) {
         </label>
         <div className="flex gap-2">
           <input id="ask-why" value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Why is #1 first?"
-            className="min-h-11 min-w-0 flex-1 rounded-xl border border-dg-line bg-black/40 px-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-dg-cyan/70 focus:shadow-[0_0_0_3px_rgba(34,211,238,.15)]" />
+            className="min-h-11 min-w-0 flex-1 rounded-xl border border-dg-line bg-black/40 px-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-dg-cyan/70 focus:shadow-[0_0_0_3px_rgba(0,240,255,.15)]" />
           <button type="submit"
-            className="min-h-11 rounded-xl border border-dg-cyan/60 bg-linear-to-b from-dg-cyan/20 to-dg-cyan/5 px-5 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-dg-cyan transition-all duration-200 hover:-translate-y-px hover:border-dg-cyan hover:shadow-[0_0_24px_-6px_rgba(34,211,238,.9)]">
+            className="min-h-11 rounded-xl border border-dg-cyan/60 bg-linear-to-b from-dg-cyan/20 to-dg-cyan/5 px-5 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-dg-cyan transition-all duration-200 hover:-translate-y-px hover:border-dg-cyan hover:shadow-[0_0_24px_-6px_rgba(0,240,255,.9)]">
             Ask
           </button>
         </div>

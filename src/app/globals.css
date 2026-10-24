@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
-/* DARK GRID tactical theme. Palette follows the team design: cyan = DARK GRID,
-   red = danger, amber = blackout / ambulance corridor. */
+/* DARK GRID tactical theme. Cyber cyan = DARK GRID / normal, amber = blackout / warning /
+   ambulance corridor, tactical red = emergency / judge. */
 @theme inline {
   --font-display: var(--font-chakra);
   --font-sans: var(--font-plex);
@@ -11,9 +11,9 @@
   --color-dg-bg-2: #0b0f17;
   --color-dg-line: rgb(255 255 255 / 0.08);
   --color-dg-label: #a9b6cc;
-  --color-dg-cyan: #22d3ee;
-  --color-dg-amber: #fbbf24;
-  --color-dg-red: #f87171;
+  --color-dg-cyan: #00f0ff;
+  --color-dg-amber: #ffb800;
+  --color-dg-red: #ff2a54;
   --color-dg-green: #34d399;
   --color-dg-orange: #fb923c;
 }
@@ -26,8 +26,8 @@ body {
   color: #e2e8f0;
   background-color: var(--color-dg-bg);
   background-image:
-    radial-gradient(1200px 600px at 15% -10%, rgb(34 211 238 / 0.07), transparent 60%),
-    radial-gradient(900px 500px at 110% 10%, rgb(248 113 113 / 0.05), transparent 60%),
+    radial-gradient(1200px 600px at 15% -10%, rgb(0 240 255 / 0.07), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, rgb(255 42 84 / 0.05), transparent 60%),
     linear-gradient(180deg, #050811 0%, #0b0f17 100%);
   background-attachment: fixed;
   font-family: var(--font-plex), ui-sans-serif, system-ui, sans-serif;
@@ -64,7 +64,7 @@ body::before {
     right: 1.25rem;
     top: -1px;
     height: 1px;
-    background: linear-gradient(90deg, transparent, rgb(34 211 238 / 0.55), transparent);
+    background: linear-gradient(90deg, transparent, rgb(0 240 255 / 0.55), transparent);
     pointer-events: none;
   }
 }
