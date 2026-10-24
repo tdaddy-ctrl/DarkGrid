@@ -72,14 +72,18 @@ export default function AskWhyBar({ jobs }: { jobs: Job[] }) {
   };
 
   return (
-    <section className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-slate-900/60 p-4 backdrop-blur-xl">
-      <style>{'@keyframes dg-wave{0%,100%{transform:scaleY(.25)}50%{transform:scaleY(1)}}'}</style>
-      <h2 className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#a9b6cc]">Ask why</h2>
+    <section className="dg-panel flex flex-col gap-3 p-4">
+      <h2 className="dg-label flex items-center gap-2">
+        <span aria-hidden="true" className={`size-1.5 rounded-full bg-current ${listening ? 'text-dg-cyan [animation:dg-breathe_1.2s_ease-in-out_infinite]' : 'text-slate-500'}`} />
+        Ask why
+      </h2>
 
       <div className="flex items-center gap-3">
         <button onClick={toggleMic} aria-label={listening ? 'Stop listening' : 'Ask by voice'} aria-pressed={listening}
           className={`grid size-11 shrink-0 place-items-center rounded-full border transition-colors ${
-            listening ? 'border-cyan-400 bg-cyan-400/20 text-cyan-300' : 'border-white/15 text-slate-200 hover:border-white/30'}`}>
+            listening
+              ? 'border-dg-cyan bg-dg-cyan/20 text-dg-cyan shadow-[0_0_24px_-4px_rgba(34,211,238,.9)]'
+              : 'border-dg-line bg-white/[0.03] text-slate-200 hover:border-white/25 hover:bg-white/[0.07]'}`}>
           <svg aria-hidden="true" viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
             <rect x="9" y="3" width="6" height="11" rx="3" />
             <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
@@ -87,10 +91,12 @@ export default function AskWhyBar({ jobs }: { jobs: Job[] }) {
         </button>
         <div aria-hidden="true" className="flex h-8 flex-1 items-center gap-[3px]">
           {Array.from({ length: BARS }, (_, i) => (
-            <span key={i}
-              className={`h-full flex-1 origin-center rounded-full motion-reduce:[animation:none] ${listening ? 'bg-cyan-400' : 'bg-slate-600'}`}
+            <span key={i} className="h-full flex-1 origin-center rounded-full transition-opacity duration-300"
               style={{
-                transform: 'scaleY(.25)',
+                // A cyan-to-violet spectrum; at rest the bars hold a low, uneven profile.
+                background: `linear-gradient(180deg, hsl(${187 + (i / (BARS - 1)) * 70} 90% 70%), hsl(${187 + (i / (BARS - 1)) * 70} 85% 45%))`,
+                opacity: listening ? 1 : 0.35,
+                transform: `scaleY(${(0.18 + 0.14 * Math.abs(Math.sin(i * 1.7))).toFixed(2)})`,
                 animation: listening ? `dg-wave ${0.7 + (i % 5) * 0.12}s ease-in-out ${(i * 0.05).toFixed(2)}s infinite` : undefined,
               }} />
           ))}
@@ -98,20 +104,20 @@ export default function AskWhyBar({ jobs }: { jobs: Job[] }) {
       </div>
 
       <form className="flex flex-col gap-2" onSubmit={(e) => { e.preventDefault(); ask(question); }}>
-        <label htmlFor="ask-why" className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#a9b6cc]">
+        <label htmlFor="ask-why" className="dg-label">
           Your question
         </label>
         <div className="flex gap-2">
           <input id="ask-why" value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Why is #1 first?"
-            className="min-h-11 flex-1 rounded-xl border border-white/10 bg-slate-950/60 px-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-400" />
+            className="min-h-11 min-w-0 flex-1 rounded-xl border border-dg-line bg-black/40 px-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-dg-cyan/70 focus:shadow-[0_0_0_3px_rgba(34,211,238,.15)]" />
           <button type="submit"
-            className="min-h-11 rounded-xl border border-cyan-400/60 px-4 font-mono text-xs font-semibold uppercase tracking-widest text-cyan-300 hover:bg-cyan-400/10">
+            className="min-h-11 rounded-xl border border-dg-cyan/60 bg-linear-to-b from-dg-cyan/20 to-dg-cyan/5 px-5 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-dg-cyan transition-all duration-200 hover:-translate-y-px hover:border-dg-cyan hover:shadow-[0_0_24px_-6px_rgba(34,211,238,.9)]">
             Ask
           </button>
         </div>
       </form>
 
-      {answer && <p aria-live="polite" className="rounded-xl border border-white/10 bg-slate-950/60 p-3 font-mono text-sm leading-relaxed text-slate-200">{answer}</p>}
+      {answer && <p key={answer} aria-live="polite" className="rounded-xl border border-dg-line bg-black/40 p-3 font-mono text-sm leading-relaxed text-slate-200 [animation:dg-rise_.3s_ease-out]">{answer}</p>}
     </section>
   );
 }

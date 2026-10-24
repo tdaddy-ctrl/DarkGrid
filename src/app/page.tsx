@@ -5,12 +5,12 @@
 // 4 times per second, so 250 cars never cause 60 re-renders a second.
 // The *Placeholder components below stand in for C's and D's real components.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ChartPoint, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import type { ChartPoint, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
   answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
 } from '@/lib/sim';
-import { SEED, SIM_SPEED } from '@/lib/config';
+import { REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
 import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
@@ -120,58 +120,65 @@ export default function Home() {
   const togglePause = () => { pausedRef.current = !pausedRef.current; setPaused(pausedRef.current); };
 
   if (!view) {
-    return <main className="flex flex-1 items-center justify-center text-zinc-500">Starting simulation…</main>;
+    return (
+      <main className="relative z-10 flex flex-1 flex-col items-center justify-center gap-3">
+        <span aria-hidden="true" className="size-2 rounded-full bg-current text-dg-cyan [animation:dg-breathe_1.6s_ease-in-out_infinite]" />
+        <p className="dg-label">Booting simulation</p>
+      </main>
+    );
   }
   const snap = mode === 'FIFO' ? view.fifo : view.darkgrid;
+  const outage = view.fifo.metrics.darkCount > 0;
+  const phase: { label: string; tone: Tone } = judge
+    ? { label: `Judge · ${cityShort(judge)}`, tone: 'red' }
+    : outage ? { label: 'Blackout', tone: 'amber' } : { label: 'Nominal', tone: 'cyan' };
 
   return (
-    <main className="flex flex-1 flex-col gap-4 p-4 lg:p-6">
-      <header className="flex flex-wrap items-center gap-3">
-        <h1 className="mr-auto text-lg font-semibold tracking-wide">DARK GRID</h1>
-        <span className="font-mono text-sm text-zinc-400">t = {formatT(snap.t)}</span>
-        <div className="flex overflow-hidden rounded-md border border-zinc-700">
-          {(['FIFO', 'DARKGRID'] as const).map((m) => (
-            <button key={m} onClick={() => setMode(m)}
-              className={`px-3 py-1.5 text-sm ${mode === m ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-300 hover:bg-zinc-800'}`}>
-              {m === 'FIFO' ? 'FIFO' : 'DARK GRID'}
-            </button>
-          ))}
+    <main className="relative z-10 mx-auto flex w-full max-w-[1680px] flex-1 flex-col gap-4 p-4 lg:p-6">
+      <header className="dg-panel flex flex-wrap items-center gap-x-6 gap-y-3 px-4 py-3">
+        <div className="mr-auto flex items-center gap-3">
+          <BrandMark />
+          <div>
+            <h1 className="font-display text-xl font-semibold tracking-[0.22em] text-slate-50">DARK GRID</h1>
+            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Remote ops · SoMa / Mission</p>
+          </div>
         </div>
-        <button onClick={blackout} disabled={view.fifo.metrics.darkCount > 0}
-          className="rounded-md bg-amber-500 px-3 py-1.5 text-sm font-medium text-zinc-950 disabled:opacity-40">
-          Blackout
-        </button>
-        {judge === null && (
-          <button onClick={() => takeOver('FIFO')} className="rounded-md bg-rose-500 px-3 py-1.5 text-sm font-medium text-zinc-950">
-            Judge takes over
-          </button>
-        )}
-        {judge === 'FIFO' && (
-          <button onClick={() => takeOver('DARKGRID')} className="rounded-md bg-emerald-400 px-3 py-1.5 text-sm font-medium text-zinc-950">
-            Dark Grid on
-          </button>
-        )}
-        {judge !== null && (
-          <button onClick={() => takeOver(null)} className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800">
-            Auto operators
-          </button>
-        )}
-        <button onClick={togglePause} className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800">
-          {paused ? 'Resume' : 'Pause'}
-        </button>
-        <button onClick={reset} className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800">
-          Reset
-        </button>
+        <div className="flex items-center gap-5">
+          <StatusPill tone={phase.tone} label={phase.label} />
+          <div className="text-right">
+            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Sim clock</p>
+            <p className="font-mono text-lg leading-tight tabular-nums text-slate-50">T+{formatT(snap.t)}</p>
+          </div>
+        </div>
+        <nav aria-label="Demo controls" className="flex flex-wrap items-center gap-2">
+          <div className="flex rounded-lg border border-dg-line bg-black/30 p-0.5" role="group" aria-label="City on screen">
+            {(['FIFO', 'DARKGRID'] as const).map((m) => (
+              <button key={m} onClick={() => setMode(m)} aria-pressed={mode === m}
+                className={`min-h-9 rounded-md px-3 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-colors ${
+                  mode === m
+                    ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(34,211,238,.8)]'
+                    : 'text-slate-300 hover:text-slate-50'}`}>
+                {cityShort(m)}
+              </button>
+            ))}
+          </div>
+          <button onClick={blackout} disabled={outage} className={btn('amber')}>Blackout</button>
+          {judge === null && <button onClick={() => takeOver('FIFO')} className={btn('red')}>Judge takes over</button>}
+          {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
+          {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
+          <button onClick={togglePause} className={btn('ghost')}>{paused ? 'Resume' : 'Pause'}</button>
+          <button onClick={reset} className={btn('ghost')}>Reset</button>
+        </nav>
       </header>
 
-      <div className="grid flex-1 gap-4 lg:grid-cols-[1fr_340px]">
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
         <MapPlaceholder snapshot={snap} graph={graph} />
         <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_1fr_1.4fr]">
-        <MetricsPlaceholder snapshot={view.fifo} />
-        <MetricsPlaceholder snapshot={view.darkgrid} />
+      <div className="grid gap-4 xl:grid-cols-[1fr_1fr_1.25fr]">
+        <KpiPanel snapshot={view.fifo} other={view.darkgrid} />
+        <KpiPanel snapshot={view.darkgrid} other={view.fifo} />
         <ChartPlaceholder data={view.chart} />
       </div>
 
@@ -188,137 +195,437 @@ function formatT(t: number): string {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// ---------- placeholders (delete each one when the real component lands) ----------
+const cityShort = (m: Mode) => (m === 'FIFO' ? 'FIFO' : 'DARK GRID');
 
-const STATE_COLOR: Record<string, string> = {
-  DRIVING: '#a1a1aa', REQUESTING_HELP: '#f43f5e', QUEUED_BEHIND: '#f59e0b', STAGED: '#38bdf8', ARRIVED: '#22c55e',
+// ---------- shared HUD pieces ----------
+
+type Tone = 'cyan' | 'amber' | 'red' | 'green' | 'idle';
+
+const TONE_TEXT: Record<Tone, string> = {
+  cyan: 'text-dg-cyan', amber: 'text-dg-amber', red: 'text-dg-red', green: 'text-dg-green', idle: 'text-slate-500',
 };
 
-// Stand-in for MapView: a flat SVG of the road graph.
+function btn(tone: 'amber' | 'red' | 'cyan' | 'ghost'): string {
+  const base = 'min-h-9 rounded-lg px-3.5 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40';
+  const tones = {
+    amber: 'bg-linear-to-b from-amber-300 to-amber-500 text-slate-950 shadow-[0_0_20px_-6px_rgba(251,191,36,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(251,191,36,.9)]',
+    red: 'bg-linear-to-b from-red-300 to-red-500 text-slate-950 shadow-[0_0_20px_-6px_rgba(248,113,113,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(248,113,113,.9)]',
+    cyan: 'bg-linear-to-b from-cyan-200 to-cyan-400 text-slate-950 shadow-[0_0_20px_-6px_rgba(34,211,238,.8)] enabled:hover:shadow-[0_0_28px_-4px_rgba(34,211,238,1)]',
+    ghost: 'border border-dg-line bg-white/[0.03] text-slate-200 enabled:hover:border-white/20 enabled:hover:bg-white/[0.07]',
+  };
+  return `${base} ${tones[tone]}`;
+}
+
+function Dot({ tone, pulse = true }: { tone: Tone; pulse?: boolean }) {
+  return (
+    <span aria-hidden="true"
+      className={`inline-block size-1.5 shrink-0 rounded-full bg-current ${TONE_TEXT[tone]} ${pulse && tone !== 'idle' ? '[animation:dg-breathe_2s_ease-in-out_infinite]' : ''}`} />
+  );
+}
+
+function StatusPill({ tone, label }: { tone: Tone; label: string }) {
+  return (
+    <span className={`inline-flex items-center gap-2 rounded-full border border-current/30 bg-current/[0.06] px-3 py-1 font-mono text-[11px] font-semibold uppercase tracking-[0.18em] ${TONE_TEXT[tone]}`}>
+      <Dot tone={tone} />{label}
+    </span>
+  );
+}
+
+function Badge({ children, tone = 'idle' }: { children: ReactNode; tone?: Tone }) {
+  return (
+    <span className={`rounded-md border border-dg-line bg-black/30 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-[0.12em] tabular-nums ${tone === 'idle' ? 'text-slate-300' : TONE_TEXT[tone]}`}>
+      {children}
+    </span>
+  );
+}
+
+function PanelHeader({ title, tone, children }: { title: string; tone: Tone; children?: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-dg-line px-4 py-3">
+      <h2 className="dg-label flex items-center gap-2"><Dot tone={tone} />{title}</h2>
+      {children && <div className="flex shrink-0 items-center gap-1.5">{children}</div>}
+    </div>
+  );
+}
+
+function BrandMark() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 28 28" className="size-8">
+      <rect x="0.5" y="0.5" width="27" height="27" rx="6" fill="none" stroke="rgb(34 211 238 / 0.45)" />
+      {[0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => (
+        <rect key={`${r}${c}`} x={6 + c * 6} y={6 + r * 6} width="4" height="4" rx="1"
+          fill={r === 1 && c === 1 ? '#22d3ee' : 'rgb(148 163 184 / 0.35)'} />
+      )))}
+    </svg>
+  );
+}
+
+// ---------- placeholders (delete each one when the real component lands) ----------
+
+// Vehicle colors follow the team design (C's MapView uses the same ones).
+const STATE_COLOR: Record<string, string> = {
+  DRIVING: '#34d399', REQUESTING_HELP: '#f87171', QUEUED_BEHIND: '#fb923c', STAGED: '#22d3ee', ARRIVED: '#94a3b8',
+};
+const LEGEND: [string, string][] = [
+  ['Driving', STATE_COLOR.DRIVING], ['Needs help', STATE_COLOR.REQUESTING_HELP],
+  ['Queued', STATE_COLOR.QUEUED_BEHIND], ['Staged', STATE_COLOR.STAGED],
+];
+
+// Stand-in for MapView: an SVG of the road graph.
 function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: RoadGraph }) {
+  const uid = useId().replace(/:/g, '');
   const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
   const minLat = Math.min(...lats), maxLat = Math.max(...lats), minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
-  const W = 1000, H = 1000, pad = 40;
+  const W = 1000, H = 1000, pad = 60;
   const px = (p: LatLng) => pad + ((p.lng - minLng) / (maxLng - minLng || 1)) * (W - 2 * pad);
   const py = (p: LatLng) => H - pad - ((p.lat - minLat) / (maxLat - minLat || 1)) * (H - 2 * pad);
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  const roads = graph.edges.map((e) => {
+    const a = byId.get(e.from)!, b = byId.get(e.to)!;
+    return { id: e.id, x1: px(a), y1: py(a), x2: px(b), y2: py(b) };
+  });
   const amb = snapshot.ambulance;
+  const outage = snapshot.darkNodes.length > 0;
+  const corridor = snapshot.corridor.map((p) => `${px(p)},${py(p)}`).join(' ');
 
   return (
-    <section className="relative min-h-[360px] rounded-lg border border-zinc-800 bg-zinc-900/60">
-      <span className="absolute left-3 top-2 text-xs uppercase tracking-wider text-zinc-500">MapView placeholder · {snapshot.mode}</span>
-      <svg viewBox={`0 0 ${W} ${H}`} className="h-full max-h-[70vh] w-full" role="img" aria-label="Simulated city">
-        {graph.edges.map((e) => {
-          const a = byId.get(e.from)!, b = byId.get(e.to)!;
-          return <line key={e.id} x1={px(a)} y1={py(a)} x2={px(b)} y2={py(b)} stroke="#3f3f46" strokeWidth={6} />;
-        })}
-        {snapshot.corridor.length > 1 && (
-          <polyline points={snapshot.corridor.map((p) => `${px(p)},${py(p)}`).join(' ')}
-            fill="none" stroke="#22c55e" strokeOpacity={0.5} strokeWidth={14} />
-        )}
-        {snapshot.darkNodes.map((p, i) => (
-          <circle key={i} cx={px(p)} cy={py(p)} r={14} fill="none" stroke="#f59e0b" strokeDasharray="4 4" strokeWidth={2} />
-        ))}
-        {snapshot.lots.map((l, i) => (
-          <g key={i}>
-            <rect x={px(l.pos) - 22} y={py(l.pos) - 22} width={44} height={44} fill="none" stroke="#38bdf8" strokeWidth={2} />
-            <text x={px(l.pos)} y={py(l.pos) - 28} fill="#38bdf8" fontSize={18} textAnchor="middle">{l.used}/{l.cap}</text>
+    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-[600px]">
+      <PanelHeader title={`Tactical map · ${cityShort(snapshot.mode)}`} tone={outage ? 'amber' : 'cyan'}>
+        <Badge>{snapshot.vehicles.length} units</Badge>
+        {outage && <Badge tone="amber">{snapshot.darkNodes.length} dark</Badge>}
+      </PanelHeader>
+      <div className="relative flex-1">
+        <Brackets />
+        <svg viewBox={`0 0 ${W} ${H}`} className="absolute inset-0 h-full w-full" role="img"
+          aria-label={`${cityShort(snapshot.mode)} city: ${snapshot.vehicles.length} vehicles, ${snapshot.darkNodes.length} dark intersections`}>
+          <defs>
+            <pattern id={`${uid}grid`} width="25" height="25" patternUnits="userSpaceOnUse">
+              <path d="M25 0H0V25" fill="none" stroke="rgb(148 163 184 / 0.07)" strokeWidth="1" />
+            </pattern>
+            <filter id={`${uid}glow`} x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="5" result="b" />
+              <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+          </defs>
+          <rect width={W} height={H} fill={`url(#${uid}grid)`} />
+
+          <g stroke="rgb(34 211 238 / 0.07)" strokeWidth={14} strokeLinecap="round">
+            {roads.map(({ id, ...r }) => <line key={id} {...r} />)}
           </g>
-        ))}
-        {snapshot.vehicles.map((v) => (
-          <circle key={v.id} cx={px(v.pos)} cy={py(v.pos)} r={5} fill={STATE_COLOR[v.state]} />
-        ))}
-        {amb && (
-          <g transform={`translate(${px(amb.pos)} ${py(amb.pos)}) rotate(${amb.headingDeg})`}>
-            <path d="M0,-16 L11,12 L0,6 L-11,12 Z" fill="#ffffff" stroke="#ef4444" strokeWidth={3} />
+          <g stroke="#2a3a55" strokeWidth={3} strokeLinecap="round">
+            {roads.map(({ id, ...r }) => <line key={id} {...r} />)}
           </g>
-        )}
-      </svg>
+
+          {snapshot.corridor.length > 1 && (
+            <g>
+              <polyline points={corridor} fill="none" stroke="#fbbf24" strokeOpacity={0.18} strokeWidth={22} strokeLinejoin="round" />
+              <polyline points={corridor} fill="none" stroke="#fbbf24" strokeWidth={4} strokeLinejoin="round" filter={`url(#${uid}glow)`} />
+              <polyline points={corridor} fill="none" stroke="#fff7d6" strokeWidth={2} strokeDasharray="10 22" strokeLinejoin="round">
+                <animate attributeName="stroke-dashoffset" from="64" to="0" dur="1.4s" repeatCount="indefinite" />
+              </polyline>
+            </g>
+          )}
+
+          {snapshot.darkNodes.map((p, i) => (
+            <g key={i} transform={`translate(${px(p)} ${py(p)})`}>
+              <circle r={8} fill="none" stroke="#f87171" strokeWidth={1.5}>
+                <animate attributeName="r" values="8;26" dur="2.4s" begin={`${(i % 6) * 0.4}s`} repeatCount="indefinite" />
+                <animate attributeName="opacity" values="0.7;0" dur="2.4s" begin={`${(i % 6) * 0.4}s`} repeatCount="indefinite" />
+              </circle>
+              <circle r={5} fill="#f87171" opacity={0.85} />
+            </g>
+          ))}
+
+          {snapshot.lots.map((l, i) => {
+            const x = px(l.pos), y = py(l.pos), s = 26, k = 9;
+            return (
+              <g key={i} stroke="#22d3ee" fill="none" strokeWidth={2}>
+                <path d={`M${x - s},${y - s + k}V${y - s}H${x - s + k} M${x + s - k},${y - s}H${x + s}V${y - s + k} M${x + s},${y + s - k}V${y + s}H${x + s - k} M${x - s + k},${y + s}H${x - s}V${y + s - k}`} />
+                <rect x={x - s} y={y + s + 6} width={2 * s} height={4} fill="rgb(34 211 238 / 0.15)" stroke="none" />
+                <rect x={x - s} y={y + s + 6} width={(2 * s * l.used) / l.cap} height={4} fill="#22d3ee" stroke="none" />
+                <text x={x} y={y - s - 8} fill="#22d3ee" stroke="none" fontSize={18} textAnchor="middle"
+                  fontFamily="var(--font-jetbrains)">{l.used}/{l.cap}</text>
+              </g>
+            );
+          })}
+
+          {snapshot.vehicles.map((v) => {
+            const help = v.state === 'REQUESTING_HELP';
+            return (
+              <g key={v.id} transform={`translate(${px(v.pos)} ${py(v.pos)})`}>
+                {help && <circle r={11} fill={STATE_COLOR[v.state]} opacity={0.22} />}
+                <circle r={help ? 6 : 4.5} fill={STATE_COLOR[v.state]} />
+              </g>
+            );
+          })}
+
+          {amb && (
+            <g transform={`translate(${px(amb.pos)} ${py(amb.pos)})`}>
+              <circle r={24} fill="#fbbf24" opacity={0.18}>
+                <animate attributeName="r" values="18;30;18" dur="1.6s" repeatCount="indefinite" />
+              </circle>
+              <path transform={`rotate(${amb.headingDeg})`} d="M0,-16 L11,12 L0,6 L-11,12 Z" fill="#ffffff" stroke="#fbbf24" strokeWidth={3} />
+            </g>
+          )}
+        </svg>
+
+        <ul className="absolute bottom-3 left-3 flex flex-wrap gap-x-3 gap-y-1 rounded-lg border border-dg-line bg-black/50 px-2.5 py-1.5 backdrop-blur">
+          {LEGEND.map(([label, color]) => (
+            <li key={label} className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label">
+              <span aria-hidden="true" className="size-2 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
+              {label}
+            </li>
+          ))}
+          <li className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label">
+            <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-amber" />Corridor
+          </li>
+        </ul>
+      </div>
     </section>
   );
 }
 
-// Stand-in for RequestQueuePanel: top of the job queue. In MANUAL the cards are clickable.
+function Brackets() {
+  const c = 'pointer-events-none absolute size-4 border-dg-cyan/50';
+  return (
+    <>
+      <span aria-hidden="true" className={`${c} left-3 top-3 border-l border-t`} />
+      <span aria-hidden="true" className={`${c} right-3 top-3 border-r border-t`} />
+      <span aria-hidden="true" className={`${c} bottom-3 right-3 border-b border-r`} />
+      <span aria-hidden="true" className={`${c} bottom-3 left-3 border-b border-l`} />
+    </>
+  );
+}
+
+const KIND_PILL: Record<Job['kind'], string> = {
+  ZONE_POLICY: 'bg-dg-cyan text-slate-950',
+  BATCH: 'border border-dg-cyan/50 text-dg-cyan',
+  CORRIDOR: 'border border-dg-amber/50 text-dg-amber',
+  STUCK: 'border border-dg-orange/50 text-dg-orange',
+  SINGLE: 'border border-white/15 text-slate-300',
+  FIFO: 'border border-white/15 text-slate-300',
+};
+
+// Stand-in for RequestQueuePanel. In MANUAL the cards are clickable; the zone-policy card
+// is clickable for whoever is presenting, judge or not.
 function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAnswer: (jobId: string) => void }) {
   const manual = snapshot.control === 'MANUAL';
   const locked = snapshot.manual.lockRemainingS > 0;
+  const m = snapshot.metrics;
+  const util = Math.min(m.rho / 6.5, 1);
+  const rhoTone: Tone = m.rho > 1 ? 'red' : m.rho > 0.7 ? 'amber' : 'cyan';
+  const shown = snapshot.jobs.slice(0, 12);
+
   return (
-    <section className="flex min-h-[360px] flex-col rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-      <h2 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
-        RequestQueuePanel placeholder · {snapshot.jobs.length} jobs
-      </h2>
+    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:h-[600px]">
+      <PanelHeader title="Request queue" tone={snapshot.jobs.length ? (manual ? 'red' : 'cyan') : 'idle'}>
+        <Badge>REQ {m.requests}</Badge>
+        <Badge>JOBS {snapshot.jobs.length}</Badge>
+      </PanelHeader>
+
+      <div className="space-y-3 border-b border-dg-line px-4 py-3">
+        <div>
+          <div className="flex items-baseline justify-between">
+            <span className="dg-label">Operator load ρ</span>
+            <span className={`font-mono text-2xl font-semibold tabular-nums ${TONE_TEXT[rhoTone]}`}>{m.rho.toFixed(2)}</span>
+          </div>
+          <div className="relative mt-1.5 h-1.5 rounded-full bg-white/[0.06]">
+            <div className={`h-full rounded-full bg-current transition-[width] duration-500 ${TONE_TEXT[rhoTone]}`} style={{ width: `${util * 100}%` }} />
+            <span aria-hidden="true" className="absolute -top-1 h-3.5 w-px bg-white/80" style={{ left: `${100 / 6.5}%` }} />
+          </div>
+          <p className="mt-1 text-[11px] text-dg-label">ρ above 1 means requests arrive faster than operators can answer.</p>
+        </div>
+
+        <ul className="space-y-1">
+          {snapshot.operators.map((op) => {
+            const busy = op.task !== 'idle';
+            const reviewing = manual && locked;
+            return (
+              <li key={op.id} className="flex items-center gap-2 rounded-lg border border-dg-line bg-white/[0.02] px-2 py-1.5">
+                <span className="w-12 shrink-0 font-mono text-[11px] uppercase text-slate-400">{op.id}</span>
+                <span className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${
+                  busy ? 'bg-dg-cyan/15 text-dg-cyan shadow-[0_0_10px_-2px_rgba(34,211,238,.6)]' : 'bg-white/[0.05] text-slate-500'}`}>
+                  {busy ? 'ACTIVE' : 'IDLE'}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-xs text-slate-300">{busy ? op.task : 'Standing by'}</span>
+                {reviewing && (
+                  <span className="h-1 w-12 shrink-0 overflow-hidden rounded-full bg-white/10">
+                    <span className="block h-full bg-dg-red" style={{ width: `${(1 - snapshot.manual.lockRemainingS / REVIEW_LOCK_REAL_S) * 100}%` }} />
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+
       {manual && (
-        <p className="mb-2 rounded bg-rose-500/15 px-2 py-1.5 text-sm text-rose-200">
-          {locked ? `Reviewing… ${snapshot.manual.lockRemainingS.toFixed(1)} s` : 'You are the operator. Click a card.'}
-          <span className="float-right font-mono">answered {snapshot.manual.answered}</span>
+        <p className="flex items-center justify-between gap-2 border-b border-dg-red/30 bg-dg-red/10 px-4 py-2 text-sm text-red-200">
+          <span>{locked ? `Reviewing… ${snapshot.manual.lockRemainingS.toFixed(1)} s` : 'You are the operator. Click a card.'}</span>
+          <span className="font-mono text-xs tabular-nums">YOU {snapshot.manual.answered} · WAITING {snapshot.jobs.length}</span>
         </p>
       )}
-      <ul className="mb-3 space-y-1 text-xs text-zinc-400">
-        {snapshot.operators.map((op) => (
-          <li key={op.id} className="flex justify-between gap-2">
-            <span className="font-mono">{op.id}</span><span className="truncate">{op.task}</span>
-          </li>
-        ))}
-      </ul>
-      <ol className="flex-1 space-y-1.5 overflow-y-auto">
-        {snapshot.jobs.slice(0, 12).map((j) => (
-          <li key={j.id}>
-            <button disabled={locked || !(manual || j.kind === 'ZONE_POLICY')} onClick={() => onAnswer(j.id)}
-              className={`w-full rounded border px-2 py-1.5 text-left enabled:hover:border-zinc-500 enabled:hover:bg-zinc-800 disabled:cursor-default ${j.kind === 'ZONE_POLICY' ? 'border-amber-400/70 bg-amber-400/10' : 'border-zinc-800'}`}>
-              <div className="flex justify-between text-sm"><span>{j.title}</span><span className="font-mono text-zinc-500">{j.kind}</span></div>
-              <div className="text-xs text-zinc-500">{j.sub}</div>
-            </button>
-          </li>
-        ))}
-      </ol>
+
+      {shown.length === 0 ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+          <svg aria-hidden="true" viewBox="0 0 80 80" className="size-20">
+            {[34, 24, 14].map((r) => <circle key={r} cx="40" cy="40" r={r} fill="none" stroke="rgb(34 211 238 / 0.25)" strokeDasharray="3 5" />)}
+            <circle cx="40" cy="40" r="3" fill="#22d3ee" />
+          </svg>
+          <p className="dg-label">Queue clear</p>
+          <p className="text-xs text-dg-label">No robotaxi is waiting for an operator.</p>
+        </div>
+      ) : (
+        <ol className="flex-1 space-y-2 overflow-y-auto px-4 py-3">
+          {shown.map((j, i) => {
+            const zone = j.kind === 'ZONE_POLICY';
+            return (
+              <li key={j.id} className="[animation:dg-rise_.25s_ease-out]">
+                <button disabled={locked || !(manual || zone)} onClick={() => onAnswer(j.id)}
+                  className={`flex w-full items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-default ${
+                    zone
+                      ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(34,211,238,.9)] enabled:hover:bg-dg-cyan/[0.12]'
+                      : 'border-dg-line bg-white/[0.02] enabled:hover:border-white/20 enabled:hover:bg-white/[0.05]'}`}>
+                  <span className="pt-0.5 font-mono text-[11px] tabular-nums text-slate-500">#{String(i + 1).padStart(2, '0')}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm text-slate-100">{j.title}</span>
+                    <span className="block truncate text-xs text-dg-label">{j.sub}</span>
+                  </span>
+                  <span className="flex shrink-0 flex-col items-end gap-1">
+                    <span className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${KIND_PILL[j.kind]}`}>
+                      {zone ? 'ZONE POLICY' : j.kind}
+                    </span>
+                    {!zone && <span className="font-mono text-[10px] tabular-nums text-slate-500">w/p {(j.w / j.p).toFixed(2)}</span>}
+                    {zone && <span className="font-mono text-[10px] text-dg-cyan">Human approval</span>}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+          {snapshot.jobs.length > shown.length && (
+            <li className="pt-1 text-center font-mono text-[11px] text-slate-500">+{snapshot.jobs.length - shown.length} more waiting</li>
+          )}
+        </ol>
+      )}
     </section>
   );
 }
 
-// Stand-in for the metrics panel.
-function MetricsPlaceholder({ snapshot }: { snapshot: SimSnapshot }) {
-  const m = snapshot.metrics;
-  const amb = snapshot.ambulance;
-  const rows: [string, string][] = [
-    ['open requests', String(m.requests)],
-    ['λ / min', String(m.lambdaPerMin)],
-    ['ρ', m.rho.toFixed(2)],
-    ['stuck', String(m.stuck)],
-    ['blocking veh·min', m.blockingVehMin.toFixed(0)],
-    ['dark nodes', String(m.darkCount)],
-    ['ambulance', amb ? `${amb.status} · ${amb.tripS.toFixed(0)} s` : '—'],
+// Stand-in for the metrics panel: each number compared with the other city.
+function KpiPanel({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnapshot }) {
+  const m = snapshot.metrics, o = other.metrics;
+  const dg = snapshot.mode === 'DARKGRID';
+  const otherName = cityShort(other.mode);
+  const kpis: { label: string; v: number; o: number; digits?: number }[] = [
+    { label: 'Open requests', v: m.requests, o: o.requests },
+    { label: 'Arrivals / min', v: m.lambdaPerMin, o: o.lambdaPerMin },
+    { label: 'Load ρ', v: m.rho, o: o.rho, digits: 2 },
+    { label: 'Stuck vehicles', v: m.stuck, o: o.stuck },
+    { label: 'Blocking veh·min', v: m.blockingVehMin, o: o.blockingVehMin },
   ];
+  const amb = snapshot.ambulance;
+  const ambTone: Tone = !amb ? 'idle' : amb.status === 'ARRIVED' ? 'green' : amb.status === 'STUCK' ? 'red' : amb.status === 'EN_ROUTE' ? 'cyan' : 'idle';
+
   return (
-    <section className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-      <h2 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">{snapshot.mode === 'FIFO' ? 'FIFO' : 'DARK GRID'}</h2>
-      <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
-        {rows.map(([k, v]) => (
-          <div key={k} className="contents">
-            <dt className="text-zinc-500">{k}</dt><dd className="text-right font-mono tabular-nums">{v}</dd>
-          </div>
-        ))}
-      </dl>
+    <section className="dg-panel overflow-hidden">
+      <PanelHeader title={dg ? 'DARK GRID · triage' : 'FIFO · first come, first served'} tone={dg ? 'cyan' : m.rho > 1 ? 'red' : 'idle'} />
+      <div className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-3">
+        {kpis.map((k) => {
+          const max = Math.max(k.v, k.o, 1e-9);
+          const pct = k.o === 0 ? null : ((k.v - k.o) / k.o) * 100;
+          const better = k.v < k.o, worse = k.v > k.o;
+          return (
+            <div key={k.label} className="rounded-xl border border-dg-line bg-white/[0.02] p-3">
+              <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">{k.label}</p>
+              <p className="mt-1 font-mono text-2xl font-semibold tabular-nums text-slate-50">{k.v.toFixed(k.digits ?? 0)}</p>
+              <div className="mt-2 h-1 rounded-full bg-white/[0.06]">
+                <div className={`h-full rounded-full transition-[width] duration-500 ${dg ? 'bg-dg-cyan' : 'bg-slate-400'}`} style={{ width: `${(k.v / max) * 100}%` }} />
+              </div>
+              <p className={`mt-1.5 font-mono text-[10px] tabular-nums ${better ? 'text-dg-green' : worse ? 'text-dg-red' : 'text-slate-500'}`}>
+                {pct === null || (!better && !worse) ? `= ${otherName}` : `${better ? '▼' : '▲'} ${Math.abs(pct).toFixed(0)}% vs ${otherName}`}
+              </p>
+            </div>
+          );
+        })}
+        <div className="rounded-xl border border-dg-line bg-white/[0.02] p-3">
+          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Ambulance</p>
+          <p className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${amb ? 'text-slate-50' : 'text-slate-600'}`}>
+            {amb ? formatT(amb.tripS) : '--:--'}
+          </p>
+          <span className={`mt-2 inline-flex items-center gap-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] ${TONE_TEXT[ambTone]}`}>
+            <Dot tone={ambTone} pulse={amb?.status === 'STUCK'} />{amb ? amb.status.replace('_', ' ') : 'STANDBY'}
+          </span>
+        </div>
+      </div>
     </section>
   );
 }
 
 // Stand-in for MetricsChart: open requests over time, both cities.
 function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
-  const W = 600, H = 200;
+  const uid = useId().replace(/:/g, '');
+  const W = 600, H = 240, L = 38, R = 10, T = 12, B = 24;
   const maxT = Math.max(60, ...data.map((d) => d.t));
-  const maxY = Math.max(10, ...data.map((d) => Math.max(d.fifo, d.darkgrid)));
-  const line = (key: 'fifo' | 'darkgrid') =>
-    data.map((d) => `${(d.t / maxT) * W},${H - (d[key] / maxY) * H}`).join(' ');
+  const rawMax = Math.max(10, ...data.map((d) => Math.max(d.fifo, d.darkgrid)));
+  const step = rawMax > 200 ? 100 : rawMax > 80 ? 50 : rawMax > 40 ? 20 : 10;
+  const maxY = Math.ceil(rawMax / step) * step;
+  const x = (t: number) => L + (t / maxT) * (W - L - R);
+  const y = (v: number) => H - B - (v / maxY) * (H - T - B);
+  const pts = (key: 'fifo' | 'darkgrid') => data.map((d) => `${x(d.t).toFixed(1)},${y(d[key]).toFixed(1)}`).join(' ');
+  const area = (key: 'fifo' | 'darkgrid') =>
+    data.length > 1 ? `M${x(data[0].t)},${y(0)} L${pts(key).replace(/ /g, ' L')} L${x(data[data.length - 1].t)},${y(0)} Z` : '';
+  const yTicks = Array.from({ length: maxY / step + 1 }, (_, i) => i * step);
+  const xTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * maxT);
+  const last = data[data.length - 1];
+
   return (
-    <section className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-      <h2 className="mb-2 flex gap-4 text-xs uppercase tracking-wider text-zinc-500">
-        <span>MetricsChart placeholder · open requests</span>
-        <span className="text-rose-400">FIFO</span><span className="text-emerald-400">DARK GRID</span>
-      </h2>
-      <svg viewBox={`0 0 ${W} ${H}`} className="h-40 w-full" preserveAspectRatio="none" role="img" aria-label="Open requests over time">
-        <polyline points={line('fifo')} fill="none" stroke="#fb7185" strokeWidth={2} vectorEffect="non-scaling-stroke" />
-        <polyline points={line('darkgrid')} fill="none" stroke="#34d399" strokeWidth={2} vectorEffect="non-scaling-stroke" />
-      </svg>
+    <section className="dg-panel overflow-hidden">
+      <PanelHeader title="Requests waiting" tone={data.length > 1 ? 'cyan' : 'idle'}>
+        <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-slate-400">
+          <span aria-hidden="true" className="w-3 border-t border-dashed border-slate-400" />FIFO
+        </span>
+        <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-dg-cyan">
+          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-cyan shadow-[0_0_6px_#22d3ee]" />DARK GRID
+        </span>
+      </PanelHeader>
+      <div className="relative p-3">
+        <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img"
+          aria-label={last ? `Requests waiting at ${formatT(last.t)}: FIFO ${last.fifo}, DARK GRID ${last.darkgrid}` : 'No data yet'}>
+          <defs>
+            <linearGradient id={`${uid}dg`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#22d3ee" stopOpacity="0" />
+            </linearGradient>
+            <linearGradient id={`${uid}fifo`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#94a3b8" stopOpacity="0.16" />
+              <stop offset="100%" stopColor="#94a3b8" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {yTicks.map((v) => (
+            <g key={v}>
+              <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} stroke="rgb(148 163 184 / 0.12)" strokeDasharray="3 5" />
+              <text x={L - 8} y={y(v) + 4} fill="#a9b6cc" fontSize={10} textAnchor="end" fontFamily="var(--font-jetbrains)">{v}</text>
+            </g>
+          ))}
+          {xTicks.map((t) => (
+            <text key={t} x={x(t)} y={H - 6} fill="#a9b6cc" fontSize={10} textAnchor="middle" fontFamily="var(--font-jetbrains)">{formatT(t)}</text>
+          ))}
+          {data.length > 1 && (
+            <>
+              <path d={area('fifo')} fill={`url(#${uid}fifo)`} />
+              <polyline points={pts('fifo')} fill="none" stroke="#94a3b8" strokeWidth={1.75} strokeDasharray="5 4" strokeLinejoin="round" />
+              <path d={area('darkgrid')} fill={`url(#${uid}dg)`} />
+              <polyline points={pts('darkgrid')} fill="none" stroke="#22d3ee" strokeOpacity={0.3} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round" />
+              <polyline points={pts('darkgrid')} fill="none" stroke="#22d3ee" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+              <circle cx={x(last.t)} cy={y(last.fifo)} r={3} fill="#94a3b8" />
+              <circle cx={x(last.t)} cy={y(last.darkgrid)} r={3.5} fill="#22d3ee" />
+            </>
+          )}
+        </svg>
+        {data.length <= 1 && (
+          <p className="dg-label pointer-events-none absolute inset-0 flex items-center justify-center">Awaiting telemetry</p>
+        )}
+      </div>
     </section>
   );
 }

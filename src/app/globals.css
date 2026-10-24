@@ -1,26 +1,102 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
+/* DARK GRID tactical theme. Palette follows the team design: cyan = DARK GRID,
+   red = danger, amber = blackout / ambulance corridor. */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-display: var(--font-chakra);
+  --font-sans: var(--font-plex);
+  --font-mono: var(--font-jetbrains);
+
+  --color-dg-bg: #050811;
+  --color-dg-bg-2: #0b0f17;
+  --color-dg-line: rgb(255 255 255 / 0.08);
+  --color-dg-label: #a9b6cc;
+  --color-dg-cyan: #22d3ee;
+  --color-dg-amber: #fbbf24;
+  --color-dg-red: #f87171;
+  --color-dg-green: #34d399;
+  --color-dg-orange: #fb923c;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  color-scheme: dark;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  color: #e2e8f0;
+  background-color: var(--color-dg-bg);
+  background-image:
+    radial-gradient(1200px 600px at 15% -10%, rgb(34 211 238 / 0.07), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, rgb(248 113 113 / 0.05), transparent 60%),
+    linear-gradient(180deg, #050811 0%, #0b0f17 100%);
+  background-attachment: fixed;
+  font-family: var(--font-plex), ui-sans-serif, system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Faint tactical coordinate grid behind everything. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgb(148 163 184 / 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(148 163 184 / 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at 50% 30%, black 30%, transparent 80%);
+  z-index: 0;
+}
+
+/* Glass panel with a hairline border and a highlight along the top edge. */
+@utility dg-panel {
+  position: relative;
+  border-radius: 1rem;
+  border: 1px solid var(--color-dg-line);
+  background: linear-gradient(180deg, rgb(15 23 42 / 0.72), rgb(10 15 26 / 0.6));
+  backdrop-filter: blur(16px);
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 20px 40px -24px rgb(0 0 0 / 0.8);
+
+  &::before {
+    content: "";
+    position: absolute;
+    left: 1.25rem;
+    right: 1.25rem;
+    top: -1px;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgb(34 211 238 / 0.55), transparent);
+    pointer-events: none;
+  }
+}
+
+/* Small uppercase mono label used for panel titles and field names. */
+@utility dg-label {
+  font-family: var(--font-jetbrains), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--color-dg-label);
+}
+
+@keyframes dg-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 currentColor; }
+  50% { opacity: 0.55; box-shadow: 0 0 10px 1px currentColor; }
+}
+
+@keyframes dg-wave {
+  0%, 100% { transform: scaleY(0.25); }
+  50% { transform: scaleY(1); }
+}
+
+@keyframes dg-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
