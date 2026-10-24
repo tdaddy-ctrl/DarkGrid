@@ -99,6 +99,7 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
   const [paused, setPaused] = useState(false);
   const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
   const [split, setSplit] = useState(false);                // both cities side by side
+  const [proposal, setProposal] = useState<ChaosResult | null>(null);   // Claude's draft for the zone card
 
   const publish = useCallback(() => {
     const sims = simsRef.current;
@@ -140,8 +141,11 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
   }, [publish]);
 
   // Only OUTAGE drives the sim today; the other event types are shown but change nothing.
+  // Claude's analysis becomes the draft on the zone-policy card; a human still approves it.
   const onChaos = useCallback((r: ChaosResult) => {
-    if (r.event.type === 'OUTAGE') blackout();
+    if (r.event.type !== 'OUTAGE') return;
+    setProposal(r);
+    blackout();
   }, [blackout]);
 
   useEffect(() => {
@@ -241,12 +245,12 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
             <MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} />
             <MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} />
           </div>
-          {judge && <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />}
+          {judge && <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} proposal={proposal} />}
         </>
       ) : (
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-          <MapPlaceholder snapshot={snap} graph={graph} />
-          <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />
+          <MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
+          <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} proposal={proposal} />
         </div>
       )}
 
@@ -347,7 +351,9 @@ const LEGEND: [string, string][] = [
 
 // Stand-in for MapView: an SVG of the road graph. With `other`, it is one half of the split
 // view: the header names the policy and a strip under the map compares the two cities.
-function MapPlaceholder({ snapshot, graph, other }: { snapshot: SimSnapshot; graph: RoadGraph; other?: SimSnapshot }) {
+function MapPlaceholder({ snapshot, graph, other, rival = other }: {
+  snapshot: SimSnapshot; graph: RoadGraph; other?: SimSnapshot; rival?: SimSnapshot;
+}) {
   const uid = useId().replace(/:/g, '');
   const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
   const minLat = Math.min(...lats), maxLat = Math.max(...lats), minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
@@ -374,6 +380,7 @@ function MapPlaceholder({ snapshot, graph, other }: { snapshot: SimSnapshot; gra
       </PanelHeader>
       <div className="relative flex-1">
         <Brackets />
+        <PatientClock snapshot={snapshot} rival={rival} />
         <svg viewBox={`0 0 ${W} ${H}`} className="absolute inset-0 h-full w-full" role="img"
           aria-label={`${cityShort(snapshot.mode)} city: ${snapshot.vehicles.length} vehicles, ${snapshot.darkNodes.length} dark intersections`}>
           <defs>
@@ -497,6 +504,37 @@ function SplitStrip({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnap
   );
 }
 
+// Over each map: a patient clock that runs while the ambulance is on its way and stops on
+// arrival, plus how much sooner this city delivered the patient than the other one.
+function PatientClock({ snapshot, rival }: { snapshot: SimSnapshot; rival?: SimSnapshot }) {
+  const a = snapshot.ambulance;
+  if (!a || a.status === 'WAITING') return null;
+  const arrived = a.status === 'ARRIVED';
+  const r = rival?.ambulance;
+  const lead = arrived && r && r.status !== 'WAITING' ? r.tripS - a.tripS : 0;
+  return (
+    <div role="status" className="pointer-events-none absolute left-1/2 top-4 z-10 flex -translate-x-1/2 flex-col items-center gap-1.5">
+      <div className={`flex items-center gap-2 whitespace-nowrap rounded-full border px-3 py-1.5 font-mono text-[11px] font-semibold uppercase tracking-[0.16em] backdrop-blur ${
+        arrived ? 'border-dg-green/50 bg-dg-green/10 text-dg-green' : 'border-dg-red/60 bg-dg-red/15 text-dg-red shadow-[0_0_24px_-6px_rgba(255,42,84,.8)]'}`}>
+        {arrived ? (
+          <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8.5l3 3 7-7" /></svg>
+        ) : (
+          <svg aria-hidden="true" viewBox="0 0 40 16" className="h-3.5 w-9" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+            <polyline points="0,8 10,8 13,3 17,13 20,8 26,8 28,5 30,8 40,8" pathLength="100" className="[stroke-dasharray:100] [animation:dg-ecg_1.2s_linear_infinite]" />
+          </svg>
+        )}
+        <span>{arrived ? 'Patient delivered' : a.status === 'STUCK' ? 'Ambulance stuck' : 'Patient waiting'}</span>
+        <span className={`text-sm tabular-nums ${arrived ? '' : 'inline-block [animation:dg-heartbeat_1s_ease-in-out_infinite]'}`}>{formatT(a.tripS)}</span>
+      </div>
+      {lead >= 30 && rival && (
+        <div className="whitespace-nowrap rounded-full border border-dg-cyan/50 bg-dg-cyan/10 px-3 py-1 font-mono text-[11px] font-semibold tracking-[0.14em] text-dg-cyan backdrop-blur">
+          {r!.status === 'ARRIVED' ? '' : '≥ '}{formatT(lead)} faster than {cityShort(rival.mode)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Brackets() {
   const c = 'pointer-events-none absolute size-4 border-dg-cyan/50';
   return (
@@ -520,7 +558,9 @@ const KIND_PILL: Record<Job['kind'], string> = {
 
 // Stand-in for RequestQueuePanel. In MANUAL the cards are clickable; the zone-policy card
 // is clickable for whoever is presenting, judge or not.
-function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAnswer: (jobId: string) => void }) {
+function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
+  snapshot: SimSnapshot; onAnswer: (jobId: string) => void; proposal?: ChaosResult | null;
+}) {
   const manual = snapshot.control === 'MANUAL';
   const locked = snapshot.manual.lockRemainingS > 0;
   const m = snapshot.metrics;
@@ -602,6 +642,15 @@ function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAns
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-sm text-slate-100">{j.title}</span>
                     <span className="block truncate text-xs text-dg-label">{j.sub}</span>
+                    {zone && proposal && (
+                      <span className="mt-2 block rounded-lg border border-dg-cyan/25 bg-black/30 px-2.5 py-2">
+                        <span className="mb-1 flex items-center gap-1.5 font-mono text-[9px] font-semibold tracking-[0.16em] text-dg-cyan">
+                          <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3" fill="currentColor"><path d="M8 0l1.6 5.2L15 7l-5.4 1.8L8 14l-1.6-5.2L1 7l5.4-1.8z" /></svg>
+                          {proposal.source === 'CLAUDE' ? 'DRAFTED BY CLAUDE' : 'DRAFTED BY OFFLINE RULES'}
+                        </span>
+                        <span className="line-clamp-4 block text-xs leading-relaxed text-slate-200">{proposal.rationale}</span>
+                      </span>
+                    )}
                   </span>
                   <span className="flex shrink-0 flex-col items-end gap-1">
                     <span className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${KIND_PILL[j.kind]}`}>
