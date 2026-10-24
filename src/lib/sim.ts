@@ -54,7 +54,7 @@ export type Sim = {
   lanes: Lane[]; laneByStep: Map<string, Lane>; nodes: Map<number, NodeState>; nodeIds: number[];
   agents: Agent[]; amb: Agent; ambRoute: Lane[];
   dispatchT: number | null; arriveT: number | null;
-  outageT: number | null; zonePolicy: boolean; zoneJobTaken: boolean;
+  outageT: number | null; outageXY: { x: number; y: number } | null; zonePolicy: boolean; zoneJobTaken: boolean;
   corridorActive: boolean; corridorEdges: Set<number>; corridorNodes: Set<number>;
   lots: Lot[];
   requests: Map<string, Req>; reqSeq: number; arrivals: number[];
@@ -171,7 +171,7 @@ function stageEmptyCars(sim: Sim) {
   for (const n of from) {
     sim.lots
       .map((lot, i) => ({ i, d: nodeDist(sim, n, lot.node), room: lot.cap - lot.reserved }))
-      .filter((l) => l.room > 0)
+      .filter((l) => l.room > 0 && !lotInBlackout(sim, sim.lots[l.i]))
       .sort((p, q) => p.d - q.d || p.i - q.i)
       .slice(0, 3)
       .forEach(({ i }) => wanted.set(i, (wanted.get(i) ?? 0) + 1));
@@ -212,11 +212,18 @@ function stagingLots(graph: RoadGraph): LatLng[] {
 }
 
 // One empty car at a time, for cars that were busy (in a box, at the curb) during staging.
+// Empty cars never stage inside the blackout (it moves around, so lots can fall inside it).
+function lotInBlackout(sim: Sim, lot: Lot): boolean {
+  if (!sim.outageXY) return false;
+  const n = sim.nodes.get(lot.node)!.node;
+  return Math.hypot(n.x - sim.outageXY.x, n.y - sim.outageXY.y) <= C.OUTAGE_RADIUS_M;
+}
+
 function assignLot(sim: Sim, from: number): number {
   let best = -1;
   let bestD = Infinity;
   sim.lots.forEach((lot, i) => {
-    if (lot.reserved >= lot.cap) return;
+    if (lot.reserved >= lot.cap || lotInBlackout(sim, lot)) return;
     const d = nodeDist(sim, from, lot.node);
     if (d < bestD) { bestD = d; best = i; }
   });
@@ -261,7 +268,7 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
     graph, mode, rng: mulberry32(seed), t: 0, control: 'AUTO', policy: policyFor(mode),
     lanes, laneByStep, nodes, nodeIds: graph.nodes.map((n) => n.id),
     agents: [], amb: blankAgent(C.VEHICLES, 'AMBULANCE'), ambRoute: [],
-    dispatchT: null, arriveT: null, outageT: null, zonePolicy: false, zoneJobTaken: false,
+    dispatchT: null, arriveT: null, outageT: null, outageXY: null, zonePolicy: false, zoneJobTaken: false,
     corridorActive: false, corridorEdges: new Set(), corridorNodes: new Set(),
     lots: stagingLots(graph).map((pos) => ({ pos, node: nearestNode(graph, pos), cap: C.LOT_CAPACITY, used: 0, reserved: 0 })),
     requests: new Map(), reqSeq: 0, arrivals: [],
@@ -614,10 +621,24 @@ export function step(sim: Sim, dtS: number) {
   }
 }
 
+// A random blackout spot that still cuts the ambulance's path: a node from the middle 60% of the
+// ambulance route, moved up to 250 m in a random direction. u1, u2, u3 are uniform [0, 1) numbers
+// from the caller (the page), so the sim itself stays deterministic and both cities get the same spot.
+export function pickOutageCenter(sim: Sim, u1: number, u2: number, u3: number): LatLng {
+  const route = sim.ambRoute;
+  if (route.length < 3) return sim.graph.center;
+  const lane = route[Math.floor(route.length * (0.2 + 0.6 * u1))];
+  const n = sim.nodes.get(lane.to)!.node;
+  const r = 250 * Math.sqrt(u2), a = 2 * Math.PI * u3;
+  const mPerLng = 111320 * Math.cos((sim.graph.center.lat * Math.PI) / 180);
+  return { lat: n.lat + (r * Math.cos(a)) / 110540, lng: n.lng + (r * Math.sin(a)) / mPerLng };
+}
+
 export function injectEvent(sim: Sim, event: SimEvent) {
   if (event.type !== 'OUTAGE' || sim.outageT !== null) return;
   sim.outageT = sim.t;
   const c = toXY(sim.graph.center, event.center ?? sim.graph.center);
+  sim.outageXY = c;
   for (const ns of sim.nodes.values()) {
     if (Math.hypot(ns.node.x - c.x, ns.node.y - c.y) <= C.OUTAGE_RADIUS_M) {
       ns.dark = true; ns.nextPassT = sim.t;

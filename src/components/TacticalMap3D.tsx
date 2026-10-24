@@ -7,7 +7,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
-import type { RoadGraph, SimSnapshot } from '@/types/sim';
+import type { LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
 
 type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
@@ -36,6 +36,8 @@ const LEGEND: [string, string][] = [
 // Home view: from the SoMa blackout looking north-northeast at the downtown skyline
 // (Salesforce Tower), so the hazard sits in the lower middle and the towers fill the top.
 const HOME = { longitude: -122.4030, latitude: 37.7776, zoom: 13.75, pitch: 60, bearing: 15 };
+// Downtown map: from Market & 6th looking northeast over Union Square to the FiDi towers and the bay.
+const HOME_DOWNTOWN = { longitude: -122.4078, latitude: 37.7838, zoom: 14.35, pitch: 58, bearing: 38 };
 const SWAY_DEG = 10;              // idle camera sways ±10° instead of spinning away from the skyline
 const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
@@ -46,13 +48,15 @@ const STREAK_M = 14;              // a moving car draws as a light streak this l
 type Car = { id: number; from: [number, number]; to: [number, number]; heading: number; state: string; moving: boolean };
 const HAZARD_LABEL_ALT_M = 220;
 
-export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel = 'SoMa Substation Fire' }: {
-  snapshot: SimSnapshot; graph: RoadGraph; fallback: ReactNode; hazardLabel?: string;
+export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire' }: {
+  snapshot: SimSnapshot; graph: RoadGraph; fallback: ReactNode; hazardCenter?: LatLng; hazardLabel?: string;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelRef = useRef<HTMLDivElement>(null);
   const leaderRef = useRef<SVGLineElement>(null);
   const snapRef = useRef(snapshot);
+  const hazardRef = useRef<LatLng | undefined>(hazardCenter);
+  useEffect(() => { hazardRef.current = hazardCenter; }, [hazardCenter]);
   const [failed, setFailed] = useState(false);
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
@@ -219,7 +223,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
 
         // The home view is framed for the real San Francisco map; other maps (the test grid) center on themselves.
         const sf = Math.abs(graph.center.lat - 37.77) < 0.02 && Math.abs(graph.center.lng + 122.408) < 0.02;
-        let view: MapViewState = sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
+        const downtown = Math.abs(graph.center.lat - 37.788) < 0.01 && Math.abs(graph.center.lng + 122.406) < 0.01;
+        let view: MapViewState = downtown ? { ...HOME_DOWNTOWN, maxPitch: 70 } : sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
         let swayBase = view.bearing ?? 0;
         let swayT = 0;
         let lastTouch = 0;
@@ -282,7 +287,6 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
 
         let last = performance.now();
         let lastHud = 0;
-        const center: [number, number] = [graph.center.lng, graph.center.lat];
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (photo && autoFallback && maxDepth < PHOTO_MIN_DEPTH && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
@@ -295,6 +299,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
             swayT = 0;
           }
           const snap = snapRef.current;
+          const hz = hazardRef.current ?? graph.center;
+          const center: [number, number] = [hz.lng, hz.lat];
           const outage = snap.darkNodes.length > 0;
           const pulse = (now / 1000) % 2.4 / 2.4;
           const dyn: Layer[] = [];

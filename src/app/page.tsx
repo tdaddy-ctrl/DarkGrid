@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
-  answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
+  answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, pickOutageCenter, setControl, step, type Sim,
 } from '@/lib/sim';
 import { HISTORY_EVERY_S, REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
@@ -41,11 +41,28 @@ function liteFrame(s: SimSnapshot): FrameLite {
   return { t: s.t, vehicles: s.vehicles, ambulance: s.ambulance, corridor: s.corridor,
     lots: s.lots, metrics: s.metrics, jobs: s.jobs.slice(0, 8) };
 }
-type Environment = 'SF' | 'GRID';
-const ENVIRONMENT_LABELS = { SF: 'San Francisco', GRID: 'Test Grid' };
+type Environment = 'DOWNTOWN' | 'SF' | 'GRID';
+const ENVIRONMENT_LABELS = { DOWNTOWN: 'Downtown SF', SF: 'SoMa / Mission', GRID: 'Test Grid' };
+const ROAD_FILES: Record<Exclude<Environment, 'GRID'>, string> = {
+  DOWNTOWN: '/data/downtown_roads.json',   // A: FiDi, Union Square, Tenderloin, north SoMa (OSM)
+  SF: '/data/soma_roads.json',             // B: SoMa / Mission (osmnx)
+};
+
+// Names for wherever the random blackout lands (nearest neighborhood).
+const AREAS: [string, number, number][] = [
+  ['Financial District', 37.7946, -122.3999], ['Union Square', 37.7880, -122.4075], ['Chinatown', 37.7941, -122.4078],
+  ['Tenderloin', 37.7847, -122.4141], ['SoMa', 37.7785, -122.4056], ['Yerba Buena', 37.7850, -122.4020],
+  ['Rincon Hill', 37.7860, -122.3925], ['Civic Center', 37.7793, -122.4176], ['Nob Hill', 37.7930, -122.4161],
+  ['Embarcadero', 37.7955, -122.3937], ['Mission Bay', 37.7706, -122.3910], ['Mission', 37.7599, -122.4148],
+];
+function areaName(p: LatLng): string {
+  let best = AREAS[0], d = Infinity;
+  for (const a of AREAS) { const dd = (a[1] - p.lat) ** 2 + ((a[2] - p.lng) * 0.79) ** 2; if (dd < d) { d = dd; best = a; } }
+  return best[0];
+}
 
 export default function Home() {
-  const [environment, setEnvironment] = useState<Environment>('SF');
+  const [environment, setEnvironment] = useState<Environment>('DOWNTOWN');
   const [generation, setGeneration] = useState(0);
   const [loaded, setLoaded] = useState<{
     environment: Environment; generation: number; graph?: RoadGraph; error?: string;
@@ -59,7 +76,7 @@ export default function Home() {
         if (environment === 'GRID') {
           graph = makeGridGraph();
         } else {
-          const response = await fetch('/data/soma_roads.json', { signal: controller.signal });
+          const response = await fetch(ROAD_FILES[environment], { signal: controller.signal });
           if (!response.ok) throw new Error(`Road data request failed (HTTP ${response.status})`);
           graph = loadRoadGraph(await response.json());
           if (!graph.nodes.length || !graph.edges.length) throw new Error('Road data is empty');
@@ -82,7 +99,8 @@ export default function Home() {
       <select id="simulation-environment" value={environment}
         onChange={event => { setEnvironment(event.target.value as Environment); setGeneration(n => n + 1); }}
         className="min-h-9 rounded-md border border-dg-line bg-[#0c111a] px-2 font-mono text-xs uppercase tracking-[0.12em] text-slate-200">
-        <option value="SF">San Francisco</option>
+        <option value="DOWNTOWN">Downtown SF</option>
+        <option value="SF">SoMa / Mission</option>
         <option value="GRID">Test Grid</option>
       </select>
     </>
@@ -126,6 +144,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
   const [split, setSplit] = useState(false);                // both cities side by side
   const [proposal, setProposal] = useState<ChaosResult | null>(null);   // Claude's draft for the zone card
+  const [hazard, setHazard] = useState<{ center: LatLng; label: string } | null>(null);   // where this run's blackout hit
 
   const publish = useCallback(() => {
     const sims = simsRef.current;
@@ -205,8 +224,12 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     const sims = simsRef.current;
     if (!sims) return;
     playbackTRef.current = null;
-    injectEvent(sims.fifo, { type: 'OUTAGE' });
-    injectEvent(sims.darkgrid, { type: 'OUTAGE' });
+    if (sims.fifo.outageT !== null) return;
+    // A different spot every run (near the ambulance's path); both cities get the same one.
+    const center = pickOutageCenter(sims.fifo, Math.random(), Math.random(), Math.random());
+    injectEvent(sims.fifo, { type: 'OUTAGE', center });
+    injectEvent(sims.darkgrid, { type: 'OUTAGE', center });
+    setHazard({ center, label: `${areaName(center)} substation fire` });
     publish();
   }, [publish]);
 
@@ -280,7 +303,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
           <BrandMark />
           <div>
             <h1 className="font-display text-xl font-semibold tracking-[0.22em] text-slate-50">DARK GRID</h1>
-            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Remote ops · SoMa / Mission</p>
+            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Remote ops · San Francisco</p>
           </div>
         </div>
         <div className="flex items-center gap-5">
@@ -332,7 +355,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
               {outage && <Badge tone="amber">{snap.darkNodes.length} dark</Badge>}
             </PanelHeader>
             <div className="relative min-h-0 flex-1">
-              <TacticalMap3D snapshot={snap} graph={graph}
+              <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}
                 fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />} />
               <PatientClock snapshot={snap} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
             </div>
