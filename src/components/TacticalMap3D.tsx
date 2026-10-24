@@ -17,6 +17,10 @@ type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, ln
 const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 const GOOGLE_TILES_URL = 'https://tile.googleapis.com/v1/3dtiles/root.json';
 const NIGHT_TINT: [number, number, number, number] = [6, 11, 19, 150];   // grades the daytime photo city to night
+// On a slow network the photo city can stay blank or blurry. If it hasn't reached building-level
+// tiles by then, switch to the OSM blocks (instant, offline). The presenter can switch back.
+const PHOTO_TIMEOUT_MS = 15000;
+const PHOTO_MIN_DEPTH = 15;
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
 // Drawn over the buildings (tactical x-ray): the hazard, corridor and traffic must never hide behind towers.
@@ -52,6 +56,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
   const [failed, setFailed] = useState(false);
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
+  const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
   const carsRef = useRef<{ list: Car[]; at: number }>({ list: [], at: 0 });
   const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
@@ -154,11 +159,22 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
 
         let lastCredits = '';
         let tileErrors = 0;
+        let maxDepth = 0;
+        let photoSince = performance.now();
+        let autoFallback = true;   // off once the presenter picks a mode by hand
         const fallBackToOsm = () => {
           if (!photo) return;
           photo = false;
           staticLayers = osmLayers();
           setSource('osm');
+        };
+        switchRef.current = (to) => {
+          autoFallback = false;
+          if (to === 'osm') { fallBackToOsm(); return; }
+          if (!geo || photo) return;
+          photo = true; tileErrors = 0; photoSince = performance.now();
+          staticLayers = photoLayers();
+          setSource('google');
         };
         const tint = [[box.w - 0.05, box.s - 0.05], [box.e + 0.05, box.s - 0.05], [box.e + 0.05, box.n + 0.05], [box.w - 0.05, box.n + 0.05]] as Pt[];
         const photoLayers = (): Layer[] => [
@@ -184,7 +200,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
                 return selected;
               };
             },
-            onTileError: () => { if (++tileErrors > 5) fallBackToOsm(); },
+            onTileLoad: (tile) => { maxDepth = Math.max(maxDepth, tile.depth); },
+            onTileError: () => { if (autoFallback && ++tileErrors > 5) fallBackToOsm(); },
           }),
           new L.SolidPolygonLayer({
             id: 'night-tint', data: [tint], getPolygon: (d: Pt[]) => d, getFillColor: NIGHT_TINT, parameters: ON_TOP,
@@ -268,6 +285,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
         const center: [number, number] = [graph.center.lng, graph.center.lat];
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
+          if (photo && autoFallback && maxDepth < PHOTO_MIN_DEPTH && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
           const dt = (now - last) / 1000; last = now;
           if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
             swayT += dt;
@@ -377,7 +395,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
       }
     })();
 
-    return () => { cancelled = true; cancelAnimationFrame(raf); deck?.finalize(); };
+    return () => { cancelled = true; switchRef.current = null; cancelAnimationFrame(raf); deck?.finalize(); };
   }, [graph]);
 
   if (failed) return <>{fallback}</>;
@@ -408,6 +426,19 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
       </div>
 
       <ScaleRuler lat={hud.lat} zoom={hud.zoom} />
+
+      {/* city source: Google photoreal (needs a good network) or OSM blocks (instant, offline) */}
+      <div role="group" aria-label="City model" className="absolute left-7 top-[4.25rem] flex rounded-md border border-dg-line bg-black/55 p-0.5 backdrop-blur">
+        {([['google', 'Photo'], ['osm', 'Blocks']] as const).map(([value, label]) => (
+          <button key={value} type="button" aria-pressed={source === value}
+            disabled={value === 'google' && !GOOGLE_KEY}
+            onClick={() => switchRef.current?.(value)}
+            className={`min-h-7 rounded px-2 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] transition-colors disabled:opacity-40 ${
+              source === value ? 'bg-dg-cyan/20 text-dg-cyan' : 'text-dg-label hover:text-slate-100'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
 
       {/* corner brackets */}
       {['left-3 top-3 border-l border-t', 'right-3 top-3 border-r border-t', 'bottom-3 right-3 border-b border-r', 'bottom-3 left-3 border-b border-l'].map((c) => (
