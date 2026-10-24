@@ -21,8 +21,13 @@ const STATE_RGB: Record<string, Rgba> = {
 const LEGEND: [string, string][] = [
   ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'],
 ];
-const ORBIT_DEG_PER_S = 1.2;      // slow auto-orbit while nobody touches the map
+// Home view: from the SoMa blackout looking north-northeast at the downtown skyline
+// (Salesforce Tower), so the hazard sits in the lower middle and the towers fill the top.
+const HOME = { longitude: -122.4010, latitude: 37.7800, zoom: 13.3, pitch: 60, bearing: 18 };
+const SWAY_DEG = 10;              // idle camera sways ±10° instead of spinning away from the skyline
+const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
+const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
 const HAZARD_LABEL_ALT_M = 220;
 
 export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel = 'SoMa Substation Fire' }: {
@@ -33,9 +38,28 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
   const leaderRef = useRef<SVGLineElement>(null);
   const snapRef = useRef(snapshot);
   const [failed, setFailed] = useState(false);
-  const [hud, setHud] = useState({ pitch: 47, bearing: 9, lat: graph.center.lat, lng: graph.center.lng, zoom: 14.2 });
+  const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
+  const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
 
-  useEffect(() => { snapRef.current = snapshot; }, [snapshot]);
+  useEffect(() => {
+    snapRef.current = snapshot;
+    // Short light trails: each vehicle keeps its last few positions; staged cars drop theirs.
+    const trails = trailsRef.current;
+    const seen = new Set<number>();
+    const data: { path: Pt[]; state: string }[] = [];
+    for (const v of snapshot.vehicles) {
+      seen.add(v.id);
+      if (v.state === 'STAGED') { trails.map.delete(v.id); continue; }
+      const path = trails.map.get(v.id) ?? [];
+      const last = path[path.length - 1];
+      if (!last || last[0] !== v.pos.lng || last[1] !== v.pos.lat) path.push([v.pos.lng, v.pos.lat, 2]);
+      if (path.length > TRAIL_POINTS) path.shift();
+      trails.map.set(v.id, path);
+      if (path.length > 1) data.push({ path, state: v.state });
+    }
+    for (const id of trails.map.keys()) if (!seen.has(id)) trails.map.delete(id);
+    trails.data = data;
+  }, [snapshot]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -93,7 +117,11 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           }),
         ];
 
-        let view: MapViewState = { longitude: graph.center.lng + 0.004, latitude: graph.center.lat + 0.004, zoom: 14.2, pitch: 47, bearing: 9, maxPitch: 70 };
+        // The home view is framed for the real San Francisco map; other maps (the test grid) center on themselves.
+        const sf = Math.abs(graph.center.lat - 37.77) < 0.02 && Math.abs(graph.center.lng + 122.408) < 0.02;
+        let view: MapViewState = sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
+        let swayBase = view.bearing ?? 0;
+        let swayT = 0;
         let lastTouch = 0;
         let interacting = false;
 
@@ -112,8 +140,15 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
         let lastHud = 0;
         const center: [number, number] = [graph.center.lng, graph.center.lat];
         const frame = (now: number) => {
+          raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           const dt = (now - last) / 1000; last = now;
-          if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) view = { ...view, bearing: (view.bearing ?? 0) + ORBIT_DEG_PER_S * dt };
+          if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
+            swayT += dt;
+            view = { ...view, bearing: swayBase + SWAY_DEG * Math.sin((2 * Math.PI * swayT) / SWAY_PERIOD_S) };
+          } else {
+            swayBase = view.bearing ?? 0;   // after the user moves the camera, sway around where they left it
+            swayT = 0;
+          }
           const snap = snapRef.current;
           const outage = snap.darkNodes.length > 0;
           const pulse = (now / 1000) % 2.4 / 2.4;
@@ -161,6 +196,11 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
               getText: (l: SimSnapshot['lots'][number]) => `${l.used}/${l.cap}`, getSize: 11, getColor: [125, 211, 252, 255],
               getPixelOffset: [0, -16], fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, billboard: true,
             }),
+            new L.PathLayer({
+              id: 'trails', data: trailsRef.current.data, getPath: (d: { path: Pt[] }) => d.path,
+              getColor: (d: { state: string }) => { const c = STATE_RGB[d.state]; return [c[0], c[1], c[2], 90]; },
+              getWidth: 2, widthUnits: 'pixels', capRounded: true, jointRounded: true,
+            }),
             new L.ScatterplotLayer({
               id: 'vehicle-glow', data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
               getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 9 : 6), radiusUnits: 'pixels',
@@ -190,7 +230,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           deck!.setProps({ viewState: view, layers: [...staticLayers, ...dyn] });
 
           // Floating label over the blackout, with a dashed leader line down to the ground.
-          const vp = deck!.getViewports()[0];
+          // getViewports() asserts until deck.gl has finished initializing its first frame.
+          let vp: ReturnType<Deck['getViewports']>[number] | undefined;
+          try { vp = deck!.getViewports()[0]; } catch { vp = undefined; }
           const label = labelRef.current, leader = leaderRef.current;
           if (vp && label && leader) {
             if (outage) {
@@ -210,7 +252,6 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
             lastHud = now;
             setHud({ pitch: view.pitch ?? 0, bearing: (((view.bearing ?? 0) % 360) + 360) % 360, lat: view.latitude, lng: view.longitude, zoom: view.zoom });
           }
-          raf = requestAnimationFrame(frame);
         };
         raf = requestAnimationFrame(frame);
       } catch {
@@ -243,6 +284,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
         <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5 text-[#ff5a73]" fill="currentColor"><path d="M8 1c1 2.5 4 4 4 8a4 4 0 0 1-8 0c0-1.6.8-2.8 1.6-3.6C6 7 6.5 8 7.3 8.3 7 6 7.5 3.4 8 1z" /></svg>
         {hazardLabel}
       </div>
+
+      <ScaleRuler lat={hud.lat} zoom={hud.zoom} />
 
       {/* corner brackets */}
       {['left-3 top-3 border-l border-t', 'right-3 top-3 border-r border-t', 'bottom-3 right-3 border-b border-r', 'bottom-3 left-3 border-b border-l'].map((c) => (
@@ -285,6 +328,28 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
         <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Drag to rotate · scroll to zoom</p>
       )}
       <p className="pointer-events-none absolute bottom-1 left-1/2 -translate-x-1/2 font-mono text-[9px] text-slate-600">Buildings & roads © OpenStreetMap contributors</p>
+    </div>
+  );
+}
+
+// Scale bar for the map center: deck.gl's web-mercator tiles are 512 px at zoom 0.
+function ScaleRuler({ lat, zoom }: { lat: number; zoom: number }) {
+  const mPerPx = (40075016.686 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom);
+  const meters = [100, 200, 250, 500, 1000, 2000].find((m) => m / mPerPx >= 90) ?? 2000;
+  const px = meters / mPerPx;
+  const label = (m: number) => (m >= 1000 ? `${m / 1000} km` : `${m} m`);
+  return (
+    <div aria-label={`Scale: ${Math.round(px)} pixels is ${label(meters)} at the map center`} role="img"
+      className="pointer-events-none absolute left-7 top-7 font-mono text-[9px] tabular-nums text-dg-label">
+      <div className="relative h-2" style={{ width: px }}>
+        <span className="absolute inset-x-0 bottom-0 h-px bg-dg-label/70" />
+        {Array.from({ length: 11 }, (_, i) => (
+          <span key={i} className={`absolute bottom-0 w-px bg-dg-label/70 ${i % 5 === 0 ? 'h-2' : 'h-1'}`} style={{ left: `${i * 10}%` }} />
+        ))}
+      </div>
+      <div className="mt-0.5 flex justify-between" style={{ width: px }}>
+        <span>0</span><span>{label(meters / 2)}</span><span>{label(meters)}</span>
+      </div>
     </div>
   );
 }

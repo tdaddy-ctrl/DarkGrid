@@ -203,7 +203,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
 
   return (
     <main className="relative z-10 mx-auto flex w-full max-w-[1920px] flex-1 flex-col gap-3 p-3 lg:h-screen lg:max-h-screen lg:flex-none lg:overflow-hidden lg:p-4">
-      <header className="dg-panel flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 px-4 py-2.5">
+      <header className="dg-panel flex shrink-0 flex-wrap items-center gap-x-5 gap-y-3 px-4 py-2.5 xl:flex-nowrap">
         <div className="mr-auto flex items-center gap-3">
           <BrandMark />
           <div>
@@ -218,12 +218,12 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
             <p className="font-mono text-lg leading-tight tabular-nums text-slate-50">T+{formatT(snap.t)}</p>
           </div>
         </div>
-        <nav aria-label="Demo controls" className="flex flex-wrap items-center gap-2">
+        <nav aria-label="Demo controls" className="flex flex-wrap items-center gap-2 xl:flex-nowrap">
           {envSelect}
           <div className="flex rounded-lg border border-dg-line bg-black/30 p-0.5" role="group" aria-label="City on screen">
             {(['FIFO', 'DARKGRID'] as const).map((m) => (
               <button key={m} onClick={() => setMode(m)} aria-pressed={mode === m}
-                className={`min-h-9 rounded-md px-3 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-colors ${
+                className={`min-h-9 whitespace-nowrap rounded-md px-3 font-mono text-[11px] font-semibold uppercase tracking-[0.12em] transition-colors ${
                   mode === m
                     ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(56,189,248,.8)]'
                     : 'text-slate-300 hover:text-slate-50'}`}>
@@ -292,7 +292,7 @@ const TONE_TEXT: Record<Tone, string> = {
 };
 
 function btn(tone: 'amber' | 'red' | 'cyan' | 'ghost'): string {
-  const base = 'min-h-9 rounded-lg px-3.5 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40';
+  const base = 'min-h-9 whitespace-nowrap rounded-lg px-3 font-mono text-[11px] font-semibold uppercase tracking-[0.12em] transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40';
   const tones = {
     amber: 'bg-linear-to-b from-[#ffd46b] to-dg-amber text-slate-950 shadow-[0_0_20px_-6px_rgba(255,184,0,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,184,0,.9)]',
     red: 'bg-linear-to-b from-[#ff8ba0] to-dg-red text-slate-950 shadow-[0_0_20px_-6px_rgba(255,42,84,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,42,84,.9)]',
