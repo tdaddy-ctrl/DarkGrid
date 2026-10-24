@@ -6,16 +6,18 @@
 // The *Placeholder components below stand in for C's and D's real components.
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import type { ChartPoint, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
+import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
   answerJob, createSim, getSnapshot, injectEvent, makeGridGraph, setControl, step, type Sim,
 } from '@/lib/sim';
-import { REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
+import { HISTORY_EVERY_S, REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
+import { createHistory, push as pushHistory, frameAt, range as historyRange, type History } from '@/lib/history';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
 import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
 import TacticalMap3D from '@/components/TacticalMap3D';
+import TimelineScrubber from '@/components/TimelineScrubber';
 
 const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
@@ -23,7 +25,22 @@ const CHART_EVERY_S = 2;     // one ChartPoint every 2 sim-seconds
 const MAX_FRAME_S = 0.25;    // a stalled tab doesn't fast-forward minutes at once
 
 type Mode = SimSnapshot['mode'];
-type View = { fifo: SimSnapshot; darkgrid: SimSnapshot; chart: ChartPoint[] };
+type View = {
+  fifo: SimSnapshot; darkgrid: SimSnapshot; chart: ChartPoint[];
+  historyRange: ReturnType<typeof historyRange>; outageT: number | null; isLive: boolean;
+};
+
+// HistoryFrame stores drawing data; retain the remaining snapshot fields separately,
+// with the same eviction boundary, so queue/operator/policy displays rewind together.
+function historyContext(s: SimSnapshot): Omit<SimSnapshot, keyof FrameLite> {
+  return { mode: s.mode, control: s.control, manual: s.manual, darkNodes: s.darkNodes,
+    operators: s.operators, policy: s.policy };
+}
+
+function liteFrame(s: SimSnapshot): FrameLite {
+  return { t: s.t, vehicles: s.vehicles, ambulance: s.ambulance, corridor: s.corridor,
+    lots: s.lots, metrics: s.metrics, jobs: s.jobs.slice(0, 8) };
+}
 type Environment = 'SF' | 'GRID';
 const ENVIRONMENT_LABELS = { SF: 'San Francisco', GRID: 'Test Grid' };
 
@@ -97,6 +114,11 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const simsRef = useRef<{ fifo: Sim; darkgrid: Sim } | null>(null);
   const chartRef = useRef<ChartPoint[]>([]);
   const pausedRef = useRef(false);
+  const historyRef = useRef<History | null>(null);
+  const historyContextRef = useRef(new Map<number, {
+    fifo: ReturnType<typeof historyContext>; darkgrid: ReturnType<typeof historyContext>;
+  }>());
+  const playbackTRef = useRef<number | null>(null);
 
   const [view, setView] = useState<View | null>(null);
   const [mode, setMode] = useState<Mode>('DARKGRID');
@@ -108,18 +130,61 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const publish = useCallback(() => {
     const sims = simsRef.current;
     if (!sims) return;
-    setView({ fifo: getSnapshot(sims.fifo), darkgrid: getSnapshot(sims.darkgrid), chart: [...chartRef.current] });
+    const history = historyRef.current;
+    const bounds = history ? historyRange(history) : null;
+    const recorded = history && bounds && playbackTRef.current !== null
+      ? frameAt(history, Math.max(bounds.start, Math.min(bounds.end, playbackTRef.current))) : null;
+    const context = recorded ? historyContextRef.current.get(recorded.t) : null;
+    const isLive = !recorded || !context;
+    const fifo: SimSnapshot = recorded && context ? { ...context.fifo, ...recorded.fifo } : getSnapshot(sims.fifo);
+    const darkgrid: SimSnapshot = recorded && context ? { ...context.darkgrid, ...recorded.darkgrid } : getSnapshot(sims.darkgrid);
+    playbackTRef.current = isLive ? null : fifo.t;
+    setView({ fifo, darkgrid,
+      chart: isLive ? [...chartRef.current] : chartRef.current.filter(point => point.t <= fifo.t),
+      historyRange: bounds, outageT: sims.fifo.outageT, isLive });
+  }, []);
+
+  const recordHistory = useCallback(() => {
+    const sims = simsRef.current, history = historyRef.current;
+    if (!sims || !history) return;
+    const fifo = getSnapshot(sims.fifo), darkgrid = getSnapshot(sims.darkgrid);
+    pushHistory(history, { t: fifo.t, fifo: liteFrame(fifo), darkgrid: liteFrame(darkgrid) });
+    historyContextRef.current.set(fifo.t, structuredClone({ fifo: historyContext(fifo), darkgrid: historyContext(darkgrid) }));
+    const bounds = historyRange(history);
+    if (bounds) for (const t of historyContextRef.current.keys()) {
+      if (t < bounds.start) historyContextRef.current.delete(t);
+    }
   }, []);
 
   const freshSims = useCallback(() => {
     simsRef.current = { fifo: createSim(graph, SEED, 'FIFO'), darkgrid: createSim(graph, SEED, 'DARKGRID') };
     chartRef.current = [];
-  }, [graph]);
+    historyRef.current = createHistory();
+    historyContextRef.current.clear();
+    playbackTRef.current = null;
+    recordHistory(); // Keep t=0; subsequent records happen only at sim-time boundaries.
+  }, [graph, recordHistory]);
+
+  const onScrub = useCallback((t: number) => {
+    const history = historyRef.current;
+    const bounds = history ? historyRange(history) : null;
+    if (!history || !bounds || !Number.isFinite(t)) return;
+    const recorded = frameAt(history, Math.max(bounds.start, Math.min(bounds.end, t)));
+    if (!recorded) return;
+    playbackTRef.current = recorded.t;
+    publish();
+  }, [publish]);
+
+  const onGoLive = useCallback(() => {
+    playbackTRef.current = null;
+    publish();
+  }, [publish]);
 
   // The judge becomes the only operator of one city; the other city stays automatic.
   const takeOver = useCallback((m: Mode | null) => {
     const sims = simsRef.current;
     if (!sims) return;
+    playbackTRef.current = null;
     setControl(sims.fifo, m === 'FIFO' ? 'MANUAL' : 'AUTO');
     setControl(sims.darkgrid, m === 'DARKGRID' ? 'MANUAL' : 'AUTO');
     setJudge(m);
@@ -131,7 +196,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   // zone-policy card in the city on screen (automatic operators never approve policy).
   const onAnswer = useCallback((jobId: string) => {
     const sims = simsRef.current;
-    if (!sims) return;
+    if (!sims || playbackTRef.current !== null) return;
     answerJob((judge ?? mode) === 'FIFO' ? sims.fifo : sims.darkgrid, jobId);
     publish();
   }, [judge, mode, publish]);
@@ -139,6 +204,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const blackout = useCallback(() => {
     const sims = simsRef.current;
     if (!sims) return;
+    playbackTRef.current = null;
     injectEvent(sims.fifo, { type: 'OUTAGE' });
     injectEvent(sims.darkgrid, { type: 'OUTAGE' });
     publish();
@@ -176,6 +242,9 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
               darkgrid: sims.darkgrid.metrics.requests,
             });
           }
+          if (Math.floor(sims.fifo.t / HISTORY_EVERY_S) > Math.floor(before / HISTORY_EVERY_S)) {
+            recordHistory();
+          }
         }
       }
       if (now - lastUi >= UI_EVERY_MS) { publish(); lastUi = now; }
@@ -183,7 +252,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [freshSims, publish]);
+  }, [freshSims, publish, recordHistory]);
 
   const togglePause = () => { pausedRef.current = !pausedRef.current; setPaused(pausedRef.current); };
 
@@ -196,10 +265,13 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     );
   }
   const snap = mode === 'FIFO' ? view.fifo : view.darkgrid;
-  const outage = view.fifo.metrics.darkCount > 0;
-  const phase: { label: string; tone: Tone } = judge
+  const outage = view.fifo.darkNodes.length > 0;
+  const phase: { label: string; tone: Tone } = !view.isLive
+    ? { label: 'Replay', tone: 'cyan' } : judge
     ? { label: `Judge · ${cityShort(judge)}`, tone: 'red' }
     : outage ? { label: 'Blackout', tone: 'amber' } : { label: 'Nominal', tone: 'cyan' };
+  const timeline = <TimelineScrubber range={view.historyRange} t={snap.t} isLive={view.isLive}
+    outageT={view.outageT} onScrub={onScrub} onGoLive={onGoLive} />;
 
   return (
     <main className="relative z-10 mx-auto flex w-full max-w-[1920px] flex-1 flex-col gap-3 p-3 lg:h-screen lg:max-h-screen lg:flex-none lg:overflow-hidden lg:p-4">
@@ -231,7 +303,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
               </button>
             ))}
           </div>
-          <button onClick={blackout} disabled={outage} className={btn('amber')}>Blackout</button>
+          <button onClick={blackout} disabled={view.outageT !== null} className={btn('amber')}>Blackout</button>
           {judge === null && <button onClick={() => takeOver('FIFO')} className={btn('red')}>Judge takes over</button>}
           {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
           {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
@@ -246,9 +318,12 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
       <div className="grid min-h-0 gap-3 lg:flex-[62] lg:grid-cols-[minmax(0,7fr)_minmax(0,3fr)]">
         {split ? (
           /* Same seed, same blackout: the only difference between the two maps is the dispatch policy. */
-          <div className="grid min-h-0 gap-3 md:grid-cols-2">
-            <MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} />
-            <MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} />
+          <div className="flex min-h-0 flex-col gap-3">
+            <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-2">
+              <MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} />
+              <MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} />
+            </div>
+            {timeline}
           </div>
         ) : (
           <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
@@ -261,16 +336,18 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
                 fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />} />
               <PatientClock snapshot={snap} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
             </div>
+            {timeline}
           </section>
         )}
-        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} proposal={proposal} />
+        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer}
+          proposal={outage ? proposal : null} readOnly={!view.isLive} />
       </div>
 
       <div className="grid min-h-0 gap-3 md:grid-cols-2 lg:flex-[28] xl:grid-cols-4">
         <KpiPanel snapshot={mode === 'FIFO' ? view.darkgrid : view.fifo} other={snap} />
         <ChartPlaceholder data={view.chart} />
         <ChaosInjectorPanel onResult={onChaos} />
-        <AskWhyBar jobs={snap.jobs} />
+        <AskWhyBar key={view.isLive ? 'live' : snap.t} jobs={snap.jobs} />
       </div>
     </main>
   );
@@ -566,8 +643,8 @@ const KIND_PILL: Record<Job['kind'], string> = {
 
 // Stand-in for RequestQueuePanel. In MANUAL the cards are clickable; the zone-policy card
 // is clickable for whoever is presenting, judge or not.
-function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
-  snapshot: SimSnapshot; onAnswer: (jobId: string) => void; proposal?: ChaosResult | null;
+function QueuePlaceholder({ snapshot, onAnswer, proposal, readOnly = false }: {
+  snapshot: SimSnapshot; onAnswer: (jobId: string) => void; proposal?: ChaosResult | null; readOnly?: boolean;
 }) {
   const manual = snapshot.control === 'MANUAL';
   const locked = snapshot.manual.lockRemainingS > 0;
@@ -580,8 +657,12 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
     <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
       <PanelHeader title="Request queue" tone={snapshot.jobs.length ? (manual ? 'red' : 'cyan') : 'idle'}>
         <Badge>REQ {m.requests}</Badge>
-        <Badge>JOBS {snapshot.jobs.length}</Badge>
+        <Badge>JOBS {readOnly ? m.jobs : snapshot.jobs.length}</Badge>
       </PanelHeader>
+
+      {readOnly && <p className="border-b border-dg-line px-4 py-2 text-xs text-dg-label">
+        Recorded queue (up to 8 jobs). Go LIVE to answer requests.
+      </p>}
 
       <div className="space-y-3 border-b border-dg-line px-4 py-3">
         <div>
@@ -619,7 +700,7 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
         </ul>
       </div>
 
-      {manual && (
+      {manual && !readOnly && (
         <p className="flex items-center justify-between gap-2 border-b border-dg-red/30 bg-dg-red/10 px-4 py-2 text-sm text-[#ffc2cd]">
           <span>{locked ? `Reviewing… ${snapshot.manual.lockRemainingS.toFixed(1)} s` : 'You are the operator. Click a card.'}</span>
           <span className="font-mono text-xs tabular-nums">YOU {snapshot.manual.answered} · WAITING {snapshot.jobs.length}</span>
@@ -641,7 +722,7 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
             const zone = j.kind === 'ZONE_POLICY';
             return (
               <li key={j.id} className="[animation:dg-rise_.25s_ease-out]">
-                <button disabled={locked || !(manual || zone)} onClick={() => onAnswer(j.id)}
+                <button disabled={readOnly || locked || !(manual || zone)} onClick={() => onAnswer(j.id)}
                   className={`flex w-full items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-default ${
                     zone
                       ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(56,189,248,.9)] enabled:hover:bg-dg-cyan/[0.12]'
