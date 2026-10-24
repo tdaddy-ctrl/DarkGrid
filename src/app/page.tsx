@@ -98,6 +98,7 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
   const [mode, setMode] = useState<Mode>('DARKGRID');
   const [paused, setPaused] = useState(false);
   const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
+  const [split, setSplit] = useState(false);                // both cities side by side
 
   const publish = useCallback(() => {
     const sims = simsRef.current;
@@ -225,15 +226,29 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
           {judge === null && <button onClick={() => takeOver('FIFO')} className={btn('red')}>Judge takes over</button>}
           {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
           {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
+          <button onClick={() => setSplit((v) => !v)} aria-pressed={split} className={btn(split ? 'cyan' : 'ghost')}>
+            {split ? 'Single view' : 'Split view'}
+          </button>
           <button onClick={togglePause} className={btn('ghost')}>{paused ? 'Resume' : 'Pause'}</button>
           <button onClick={onReset} className={btn('ghost')}>Reset</button>
         </nav>
       </header>
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <MapPlaceholder snapshot={snap} graph={graph} />
-        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />
-      </div>
+      {split ? (
+        <>
+          {/* Same seed, same blackout: the only difference between the two maps is the dispatch policy. */}
+          <div className="grid gap-4 lg:grid-cols-2">
+            <MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} />
+            <MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} />
+          </div>
+          {judge && <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />}
+        </>
+      ) : (
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+          <MapPlaceholder snapshot={snap} graph={graph} />
+          <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} />
+        </div>
+      )}
 
       <div className="grid gap-4 xl:grid-cols-[1fr_1fr_1.25fr]">
         <KpiPanel snapshot={view.fifo} other={view.darkgrid} />
@@ -298,10 +313,10 @@ function Badge({ children, tone = 'idle' }: { children: ReactNode; tone?: Tone }
   );
 }
 
-function PanelHeader({ title, tone, children }: { title: string; tone: Tone; children?: ReactNode }) {
+function PanelHeader({ title, tone, titleClass = '', children }: { title: string; tone: Tone; titleClass?: string; children?: ReactNode }) {
   return (
     <div className="flex items-center justify-between gap-3 border-b border-dg-line px-4 py-3">
-      <h2 className="dg-label flex items-center gap-2"><Dot tone={tone} />{title}</h2>
+      <h2 className={`dg-label flex items-center gap-2 ${titleClass}`}><Dot tone={tone} />{title}</h2>
       {children && <div className="flex shrink-0 items-center gap-1.5">{children}</div>}
     </div>
   );
@@ -330,8 +345,9 @@ const LEGEND: [string, string][] = [
   ['Queued', STATE_COLOR.QUEUED_BEHIND], ['Staged', STATE_COLOR.STAGED],
 ];
 
-// Stand-in for MapView: an SVG of the road graph.
-function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: RoadGraph }) {
+// Stand-in for MapView: an SVG of the road graph. With `other`, it is one half of the split
+// view: the header names the policy and a strip under the map compares the two cities.
+function MapPlaceholder({ snapshot, graph, other }: { snapshot: SimSnapshot; graph: RoadGraph; other?: SimSnapshot }) {
   const uid = useId().replace(/:/g, '');
   const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
   const minLat = Math.min(...lats), maxLat = Math.max(...lats), minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
@@ -349,7 +365,10 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
 
   return (
     <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-[600px]">
-      <PanelHeader title={`Tactical map · ${cityShort(snapshot.mode)}`} tone={outage ? 'amber' : 'cyan'}>
+      <PanelHeader
+        title={other ? (snapshot.mode === 'FIFO' ? 'First come, first served' : 'DARK GRID') : `Tactical map · ${cityShort(snapshot.mode)}`}
+        tone={other ? (snapshot.mode === 'FIFO' ? 'red' : 'cyan') : outage ? 'amber' : 'cyan'}
+        titleClass={other ? `font-display text-[13px]! font-semibold ${snapshot.mode === 'FIFO' ? 'text-dg-red!' : 'text-dg-cyan!'}` : ''}>
         <Badge>{snapshot.vehicles.length} units</Badge>
         {outage && <Badge tone="amber">{snapshot.darkNodes.length} dark</Badge>}
       </PanelHeader>
@@ -440,7 +459,41 @@ function MapPlaceholder({ snapshot, graph }: { snapshot: SimSnapshot; graph: Roa
           </li>
         </ul>
       </div>
+      {other && <SplitStrip snapshot={snapshot} other={other} />}
     </section>
+  );
+}
+
+// Three numbers under each split-view map: requests waiting, load, ambulance.
+function SplitStrip({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnapshot }) {
+  const m = snapshot.metrics, o = other.metrics, a = snapshot.ambulance;
+  const dg = snapshot.mode === 'DARKGRID';
+  const accent = dg ? 'text-dg-cyan' : 'text-dg-red';
+  const ambTone: Tone = !a ? 'idle' : a.status === 'ARRIVED' ? 'green' : a.status === 'STUCK' ? 'red' : a.status === 'EN_ROUTE' ? 'cyan' : 'idle';
+  const cell = 'min-w-0 px-4 py-3';
+  return (
+    <div className="grid grid-cols-3 divide-x divide-dg-line border-t border-dg-line">
+      <div className={cell}>
+        <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Requests waiting</p>
+        <p className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${accent}`}>{m.requests}</p>
+        <div className="mt-2 h-1 rounded-full bg-white/[0.06]">
+          <div className={`h-full rounded-full bg-current transition-[width] duration-500 ${accent}`}
+            style={{ width: `${(m.requests / Math.max(m.requests, o.requests, 1)) * 100}%` }} />
+        </div>
+      </div>
+      <div className={cell}>
+        <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Load ρ</p>
+        <p className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${m.rho > 1 ? 'text-dg-red' : m.rho > 0.7 ? 'text-dg-amber' : 'text-dg-cyan'}`}>{m.rho.toFixed(2)}</p>
+        <p className="mt-1 font-mono text-[10px] text-slate-500">{m.rho > 1 ? 'over capacity' : 'within capacity'}</p>
+      </div>
+      <div className={cell}>
+        <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Ambulance</p>
+        <p className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${a ? 'text-slate-50' : 'text-slate-600'}`}>{a ? formatT(a.tripS) : '--:--'}</p>
+        <span className={`mt-1 inline-flex items-center gap-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] ${TONE_TEXT[ambTone]}`}>
+          <Dot tone={ambTone} pulse={a?.status === 'STUCK'} />{a ? a.status.replace('_', ' ') : 'STANDBY'}
+        </span>
+      </div>
+    </div>
   );
 }
 
