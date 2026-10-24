@@ -13,6 +13,8 @@ import { OUTAGE_RADIUS_M } from '@/lib/config';
 type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
+// Drawn over the buildings (tactical x-ray): the hazard, corridor and traffic must never hide behind towers.
+const ON_TOP = { depthCompare: 'always' as const };
 
 const STATE_RGB: Record<string, Rgba> = {
   DRIVING: [52, 211, 153, 235], REQUESTING_HELP: [255, 42, 84, 255], QUEUED_BEHIND: [251, 146, 60, 245],
@@ -23,7 +25,7 @@ const LEGEND: [string, string][] = [
 ];
 // Home view: from the SoMa blackout looking north-northeast at the downtown skyline
 // (Salesforce Tower), so the hazard sits in the lower middle and the towers fill the top.
-const HOME = { longitude: -122.4010, latitude: 37.7800, zoom: 13.3, pitch: 60, bearing: 18 };
+const HOME = { longitude: -122.4030, latitude: 37.7776, zoom: 13.75, pitch: 60, bearing: 15 };
 const SWAY_DEG = 10;              // idle camera sways ±10° instead of spinning away from the skyline
 const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
@@ -89,9 +91,11 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
         for (let lo = box.w; lo <= box.e; lo += 0.00285) grid.push([[lo, box.s], [lo, box.n]]);
 
         const lighting = new core.LightingEffect({
-          ambient: new core.AmbientLight({ color: [150, 180, 210], intensity: 0.9 }),
-          key: new core.DirectionalLight({ color: [170, 210, 255], intensity: 1.4, direction: [-1, -2.5, -3] }),
-          rim: new core.DirectionalLight({ color: [90, 60, 70], intensity: 0.6, direction: [2, 1, -1] }),
+          // Neutral key light from the camera side (south) so facades facing us are lit and side
+          // faces fall into shadow; a cool rim from behind separates towers from the dark ground.
+          ambient: new core.AmbientLight({ color: [205, 212, 222], intensity: 0.45 }),
+          key: new core.DirectionalLight({ color: [255, 248, 236], intensity: 1.6, direction: [0.5, 1, -1.6] }),
+          rim: new core.DirectionalLight({ color: [80, 140, 190], intensity: 0.7, direction: [-0.4, -1, -0.6] }),
         });
 
         const staticLayers: Layer[] = [
@@ -110,10 +114,11 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           new L.PolygonLayer<Building>({
             id: 'buildings', data: buildings, positionFormat: 'XY',
             getPolygon: (b) => b[1], getElevation: (b) => b[0],
-            extruded: true, wireframe: true, filled: true, stroked: false,
-            getFillColor: (b) => (b[0] > 120 ? [36, 48, 64, 245] : [22, 30, 42, 240]),
-            getLineColor: (b) => (b[0] > 120 ? [56, 189, 248, 95] : [56, 189, 248, 40]),
-            material: { ambient: 0.35, diffuse: 0.6, shininess: 24, specularColor: [50, 70, 90] },
+            extruded: true, wireframe: true, filled: true, stroked: false, elevationScale: 1.15,
+            // Graphite towers, a shade lighter the taller they are, so the skyline reads above the blocks.
+            getFillColor: (b) => (b[0] > 120 ? [58, 65, 76, 250] : b[0] > 40 ? [44, 50, 59, 248] : [32, 37, 44, 245]),
+            getLineColor: (b) => (b[0] > 120 ? [160, 200, 230, 80] : [120, 140, 160, 34]),
+            material: { ambient: 0.45, diffuse: 0.75, shininess: 40, specularColor: [90, 100, 112] },
           }),
         ];
 
@@ -156,23 +161,23 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           if (outage) {
             dyn.push(
               new L.ScatterplotLayer({
-                id: 'hazard-glow', data: [0.35, 0.65, 1], getPosition: () => center,
-                getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(26 * (1.2 - f))],
+                id: 'hazard-glow', parameters: ON_TOP, data: [0.35, 0.65, 1], getPosition: () => center,
+                getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(40 * (1.2 - f))],
                 stroked: false, filled: true, radiusUnits: 'meters',
               }),
               new L.ScatterplotLayer({
-                id: 'hazard-rings', data: [0, 1 / 3, 2 / 3], getPosition: () => center,
+                id: 'hazard-rings', parameters: ON_TOP, data: [0, 1 / 3, 2 / 3], getPosition: () => center,
                 getRadius: (o: number) => OUTAGE_RADIUS_M * (0.15 + 0.85 * ((pulse + o) % 1)),
                 getLineColor: (o: number) => [255, 42, 84, Math.round(200 * (1 - ((pulse + o) % 1)))],
                 stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 2, radiusUnits: 'meters',
                 updateTriggers: { getRadius: pulse, getLineColor: pulse },
               }),
               new L.ScatterplotLayer({
-                id: 'hazard-edge', data: [0], getPosition: () => center, getRadius: OUTAGE_RADIUS_M,
+                id: 'hazard-edge', parameters: ON_TOP, data: [0], getPosition: () => center, getRadius: OUTAGE_RADIUS_M,
                 getLineColor: [255, 42, 84, 150], stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 1.2, radiusUnits: 'meters',
               }),
               new L.ScatterplotLayer({
-                id: 'dark-nodes', data: snap.darkNodes, getPosition: (p: { lat: number; lng: number }) => [p.lng, p.lat, 1],
+                id: 'dark-nodes', parameters: ON_TOP, data: snap.darkNodes, getPosition: (p: { lat: number; lng: number }) => [p.lng, p.lat, 1],
                 getRadius: 2.6, radiusUnits: 'pixels', getFillColor: [255, 90, 115, 255],
                 opacity: 0.45 + 0.4 * Math.abs(Math.sin(now / 420)),
               }),
@@ -181,8 +186,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           if (snap.corridor.length > 1) {
             const path = snap.corridor.map((p) => [p.lng, p.lat, 3] as Pt);
             dyn.push(
-              new L.PathLayer({ id: 'corridor-glow', data: [path], getPath: (d: Pt[]) => d, getColor: [255, 184, 0, 55], getWidth: 12, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
-              new L.PathLayer({ id: 'corridor', data: [path], getPath: (d: Pt[]) => d, getColor: [255, 200, 60, 255], getWidth: 3, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+              new L.PathLayer({ id: 'corridor-glow', parameters: ON_TOP, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 184, 0, 55], getWidth: 12, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+              new L.PathLayer({ id: 'corridor', parameters: ON_TOP, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 200, 60, 255], getWidth: 3, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
             );
           }
           dyn.push(
@@ -197,17 +202,17 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
               getPixelOffset: [0, -16], fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, billboard: true,
             }),
             new L.PathLayer({
-              id: 'trails', data: trailsRef.current.data, getPath: (d: { path: Pt[] }) => d.path,
+              id: 'trails', parameters: ON_TOP, data: trailsRef.current.data, getPath: (d: { path: Pt[] }) => d.path,
               getColor: (d: { state: string }) => { const c = STATE_RGB[d.state]; return [c[0], c[1], c[2], 90]; },
               getWidth: 2, widthUnits: 'pixels', capRounded: true, jointRounded: true,
             }),
             new L.ScatterplotLayer({
-              id: 'vehicle-glow', data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
+              id: 'vehicle-glow', parameters: ON_TOP, data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
               getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 9 : 6), radiusUnits: 'pixels',
               getFillColor: (v: SimSnapshot['vehicles'][number]) => { const c = STATE_RGB[v.state]; return [c[0], c[1], c[2], 45]; },
             }),
             new L.ScatterplotLayer({
-              id: 'vehicles', data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
+              id: 'vehicles', parameters: ON_TOP, data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
               getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 3.6 : 2.4), radiusUnits: 'pixels',
               getFillColor: (v: SimSnapshot['vehicles'][number]) => STATE_RGB[v.state],
             }),
@@ -216,12 +221,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
           if (amb) {
             dyn.push(
               new L.ScatterplotLayer({
-                id: 'amb-halo', data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 4],
+                id: 'amb-halo', parameters: ON_TOP, data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 4],
                 getRadius: 12 + 6 * Math.abs(Math.sin(now / 260)), radiusUnits: 'pixels', getFillColor: [255, 184, 0, 70],
                 updateTriggers: { getRadius: Math.round(now / 50) },
               }),
               new L.ScatterplotLayer({
-                id: 'amb', data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 5],
+                id: 'amb', parameters: ON_TOP, data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 5],
                 getRadius: 5, radiusUnits: 'pixels', getFillColor: [255, 255, 255, 255], stroked: true,
                 getLineColor: [255, 184, 0, 255], lineWidthUnits: 'pixels', getLineWidth: 2,
               }),
@@ -268,6 +273,10 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel =
   return (
     <div className="relative h-full min-h-0 overflow-hidden bg-[#070a0f]">
       <div ref={hostRef} className="absolute inset-0" />
+
+      {/* depth: distance haze toward the horizon (top of the frame is farthest away) */}
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:linear-gradient(180deg,rgba(9,14,22,0.8)_0%,rgba(9,14,22,0.4)_12%,rgba(9,14,22,0.08)_30%,transparent_45%)]" />
+      <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-1/3 [background:radial-gradient(ellipse_at_50%_0%,rgba(56,189,248,0.10),transparent_70%)]" />
 
       {/* screen treatment: scanlines + vignette + faint crosshair */}
       <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:repeating-linear-gradient(0deg,rgba(255,255,255,0.025)_0px,rgba(255,255,255,0.025)_1px,transparent_1px,transparent_3px)]" />
