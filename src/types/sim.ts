@@ -27,8 +27,11 @@ export type HelpRequest = {
 };
 
 // Jobs are sorted by w / p, highest first (WSPT). In FIFO mode they are sorted by createdAt.
+// ZONE_POLICY: DARK GRID only, added by the sim (not orderJobs) at the top of the queue after
+// an outage. Only a human approves it (automatic operators skip it). Approving turns the dark
+// signals into four-way stops and clears every open DARK_SIGNAL_CONFIRM request. requestIds is empty.
 export type Job = {
-  id: string; kind: 'BATCH' | 'CORRIDOR' | 'STUCK' | 'SINGLE' | 'FIFO';
+  id: string; kind: 'BATCH' | 'CORRIDOR' | 'STUCK' | 'SINGLE' | 'FIFO' | 'ZONE_POLICY';
   requestIds: string[]; vehicleIds: number[];
   w: number;          // weight: how much answering this job helps (sum of triage weights)
   p: number;          // expected operator handling time, seconds

@@ -50,7 +50,7 @@ export type Sim = {
   lanes: Lane[]; nodes: Map<number, NodeState>; nodeIds: number[];
   agents: Agent[]; amb: Agent; ambRoute: Lane[];
   dispatchT: number | null; arriveT: number | null;
-  outageT: number | null; zonePolicy: boolean;
+  outageT: number | null; zonePolicy: boolean; zoneJobTaken: boolean;
   corridorActive: boolean; corridorEdges: Set<number>; corridorNodes: Set<number>;
   lots: Lot[];
   requests: Map<string, Req>; reqSeq: number; arrivals: number[];
@@ -252,7 +252,7 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
     graph, mode, rng: mulberry32(seed), t: 0, control: 'AUTO', policy: policyFor(mode),
     lanes, nodes, nodeIds: graph.nodes.map((n) => n.id),
     agents: [], amb: blankAgent(C.VEHICLES, 'AMBULANCE'), ambRoute: [],
-    dispatchT: null, arriveT: null, outageT: null, zonePolicy: false,
+    dispatchT: null, arriveT: null, outageT: null, zonePolicy: false, zoneJobTaken: false,
     corridorActive: false, corridorEdges: new Set(), corridorNodes: new Set(),
     lots: graph.pois.lots.map((pos) => ({ pos, node: nearestNode(graph, pos), cap: C.LOT_CAPACITY, used: 0, reserved: 0 })),
     requests: new Map(), reqSeq: 0, arrivals: [],
@@ -333,7 +333,45 @@ function resolveRequest(sim: Sim, id: string) {
 }
 
 function resolveJob(sim: Sim, job: Job) {
+  if (job.kind === 'ZONE_POLICY') approveZonePolicy(sim);
   for (const id of job.requestIds) resolveRequest(sim, id);
+}
+
+// ---------- zone policy ----------
+
+const ZONE_JOB_ID = 'job-zone-policy';
+
+function darkNodeIds(sim: Sim): number[] {
+  const ids: number[] = [];
+  for (const ns of sim.nodes.values()) if (ns.dark) ids.push(ns.node.id);
+  return ids;
+}
+
+// DARK GRID's first card after an outage. One approval covers every dark signal.
+function zoneJob(sim: Sim): Job | null {
+  if (sim.mode !== 'DARKGRID' || sim.outageT === null || sim.zonePolicy || sim.zoneJobTaken) return null;
+  const dark = darkNodeIds(sim).length;
+  let waiting = 0;
+  for (const r of sim.requests.values()) if (r.reason === 'DARK_SIGNAL_CONFIRM') waiting++;
+  const pct = (p: number) => `${Math.round(p * 100)}%`;
+  return {
+    id: ZONE_JOB_ID, kind: 'ZONE_POLICY', requestIds: [], vehicleIds: [],
+    w: 1000, p: C.SERVICE_SINGLE_S, createdAt: sim.outageT,
+    title: `Approve zone policy · ${dark} dark signals`,
+    sub: `Treat dark signals as 4-way stops · clears ${waiting} confirm requests · new asks ${pct(C.P_CONFIRM_DARK)} → ${pct(C.P_CONFIRM_DARK_ZONE_POLICY)}`,
+    breakdown: [
+      { label: 'dark signals', value: dark },
+      { label: 'confirm requests cleared', value: waiting },
+    ],
+  };
+}
+
+function approveZonePolicy(sim: Sim) {
+  sim.zonePolicy = true;
+  sim.zoneJobTaken = false;
+  sim.policy = { ...sim.policy, darkSignalsAsFourWayStop: darkNodeIds(sim) };
+  // Cars waiting for a dark-signal confirmation now have their answer: proceed as a 4-way stop.
+  for (const r of [...sim.requests.values()]) if (r.reason === 'DARK_SIGNAL_CONFIRM') resolveRequest(sim, r.id);
 }
 
 function queuedBehind(sim: Sim, a: Agent): number {
@@ -353,10 +391,13 @@ function currentJobs(sim: Sim): Job[] {
       onCorridor: r.onCorridor, insideBox: r.insideBox, queuedBehind: r.queuedBehind, passenger: r.passenger,
     });
   }
-  return orderJobs(open, sim.policy);
+  const jobs = orderJobs(open, sim.policy);
+  const zone = zoneJob(sim);
+  return zone ? [zone, ...jobs] : jobs;
 }
 
 function takeJob(sim: Sim, job: Job) {
+  if (job.kind === 'ZONE_POLICY') sim.zoneJobTaken = true;
   for (const id of job.requestIds) {
     const r = sim.requests.get(id);
     if (r) r.assigned = true;
@@ -498,7 +539,7 @@ function tick(sim: Sim, dt: number) {
   if (sim.control === 'AUTO') {
     for (const op of sim.operators) {
       if (op.job) continue;
-      const next = currentJobs(sim)[0];
+      const next = currentJobs(sim).find((j) => j.kind !== 'ZONE_POLICY');   // only a human approves policy
       if (!next) break;
       takeJob(sim, next);
       op.job = next; op.doneT = sim.t + next.p;
@@ -546,18 +587,16 @@ export function injectEvent(sim: Sim, event: SimEvent) {
   if (event.type !== 'OUTAGE' || sim.outageT !== null) return;
   sim.outageT = sim.t;
   const c = toXY(sim.graph.center, event.center ?? sim.graph.center);
-  const dark: number[] = [];
   for (const ns of sim.nodes.values()) {
     if (Math.hypot(ns.node.x - c.x, ns.node.y - c.y) <= C.OUTAGE_RADIUS_M) {
       ns.dark = true; ns.nextPassT = sim.t;
-      dark.push(ns.node.id);
     }
   }
   if (sim.mode !== 'DARKGRID') return;
 
-  // DARK GRID: approve the zone policy, open the ambulance corridor, stage empty cars.
-  sim.zonePolicy = true;
-  sim.policy = { ...sim.policy, darkSignalsAsFourWayStop: dark };
+  // DARK GRID: open the ambulance corridor and stage empty cars right away. The zone policy
+  // waits for a human to approve its card (answerJob); automatic operators skip it.
+  sim.jobs = currentJobs(sim);
   sim.corridorActive = true;
   for (const lane of sim.ambRoute) {
     sim.corridorEdges.add(lane.edgeId);

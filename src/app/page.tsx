@@ -59,12 +59,14 @@ export default function Home() {
     publish();
   }, [publish]);
 
+  // The judge answers in their city. Without a judge, the presenter can still approve the
+  // zone-policy card in the city on screen (automatic operators never approve policy).
   const onAnswer = useCallback((jobId: string) => {
     const sims = simsRef.current;
-    if (!sims || !judge) return;
-    answerJob(judge === 'FIFO' ? sims.fifo : sims.darkgrid, jobId);
+    if (!sims) return;
+    answerJob((judge ?? mode) === 'FIFO' ? sims.fifo : sims.darkgrid, jobId);
     publish();
-  }, [judge, publish]);
+  }, [judge, mode, publish]);
 
   const blackout = useCallback(() => {
     const sims = simsRef.current;
@@ -248,8 +250,8 @@ function QueuePlaceholder({ snapshot, onAnswer }: { snapshot: SimSnapshot; onAns
       <ol className="flex-1 space-y-1.5 overflow-y-auto">
         {snapshot.jobs.slice(0, 12).map((j) => (
           <li key={j.id}>
-            <button disabled={!manual || locked} onClick={() => onAnswer(j.id)}
-              className="w-full rounded border border-zinc-800 px-2 py-1.5 text-left enabled:hover:border-zinc-500 enabled:hover:bg-zinc-800 disabled:cursor-default">
+            <button disabled={locked || !(manual || j.kind === 'ZONE_POLICY')} onClick={() => onAnswer(j.id)}
+              className={`w-full rounded border px-2 py-1.5 text-left enabled:hover:border-zinc-500 enabled:hover:bg-zinc-800 disabled:cursor-default ${j.kind === 'ZONE_POLICY' ? 'border-amber-400/70 bg-amber-400/10' : 'border-zinc-800'}`}>
               <div className="flex justify-between text-sm"><span>{j.title}</span><span className="font-mono text-zinc-500">{j.kind}</span></div>
               <div className="text-xs text-zinc-500">{j.sub}</div>
             </button>
