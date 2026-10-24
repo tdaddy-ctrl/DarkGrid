@@ -11,6 +11,10 @@
     "check": "next typegen && tsc --noEmit && vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@deck.gl/core": "^9.4.0",
+    "@deck.gl/google-maps": "^9.4.0",
+    "@deck.gl/layers": "^9.4.0",
+    "@vis.gl/react-google-maps": "^1.10.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.61.0",
     "next": "16.4.3",

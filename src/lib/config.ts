@@ -25,6 +25,7 @@ export const OUTAGE_RADIUS_M = 700;
 export const AMBULANCE_DISPATCH_DELAY_S = 60;
 
 export const REVIEW_LOCK_REAL_S = SERVICE_SINGLE_S / SIM_SPEED; // = 3
-export const HISTORY_EVERY_S = 2;
+// 4 s x B's 450-frame buffer = 30 sim-minutes, enough to rewind past the outage after a 3-minute demo.
+export const HISTORY_EVERY_S = 4;
 
 export const DEFAULT_WEIGHTS = { onCorridor: 10, insideBox: 3, perQueuedBehind: 1, passenger: 0.5 };
