@@ -44,7 +44,58 @@ const IDLE_BEFORE_ORBIT_MS = 5000;
 const ROTATE_STEP_DEG = 45;       // one press of the on-map rotate buttons
 const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
 const UPDATE_MS = 250;            // the page sends a new snapshot 4x/s; cars glide between them
-const STREAK_M = 14;              // a moving car draws as a light streak this long, pointing where it drives
+// Vehicles are 3D models built by scripts/build-car-models.mjs at real size (meters). Far out they would be
+// a pixel or two, so a model never draws smaller than CAR_MIN_PX pixels per meter (about 4 px for a car).
+const WAYMO_GLB = '/models/waymo.glb';
+const AMBULANCE_GLB = '/models/ambulance.glb';
+const CAR_MIN_PX = 1.7;
+const CHASE_ZOOM = 19.8;          // follow mode: close enough to see the ambulance and the cars around it
+// Models face +X (east) at yaw 0; yaw turns them to the compass heading (clockwise from north).
+const orient = (headingDeg: number): [number, number, number] => [0, 90 - headingDeg, 0];
+// Painted parts take the scene lights like the buildings; lamps and beacons ignore lighting so they glow.
+const PAINT = { ambient: 0.5, diffuse: 0.75, shininess: 64, specularColor: [190, 195, 205] as [number, number, number] };
+const GLASS = { ambient: 0.3, diffuse: 0.4, shininess: 128, specularColor: [230, 235, 245] as [number, number, number] };
+
+type CarPart = {
+  name: string; color: Rgba; glow: boolean;
+  mesh: { attributes: { positions: { value: Float32Array; size: 3 }; normals: { value: Float32Array; size: 3 } }; indices: { value: Uint16Array | Uint32Array; size: 1 } };
+};
+// Reads one of our GLBs (a single mesh, one primitive per material, plain float accessors) into one mesh per
+// material, turned from glTF's Y-up (x forward, y up, z right) to deck's Z-up (x forward, y left, z up).
+async function loadCarParts(url: string): Promise<CarPart[]> {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const jsonLen = new DataView(buf).getUint32(12, true);
+  type Gltf = {
+    accessors: { bufferView: number; componentType: number; count: number; type: string }[];
+    bufferViews: { byteOffset: number }[];
+    materials: { name: string; emissiveFactor?: number[]; pbrMetallicRoughness: { baseColorFactor: number[] } }[];
+    meshes: { primitives: { attributes: { POSITION: number; NORMAL: number }; indices: number; material: number }[] }[];
+  };
+  const gltf = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, jsonLen))) as Gltf;
+  const bin = 20 + jsonLen + 8;
+  const read = (i: number) => {
+    const a = gltf.accessors[i], start = bin + gltf.bufferViews[a.bufferView].byteOffset;
+    const n = a.count * (a.type === 'VEC3' ? 3 : 1);
+    if (a.componentType === 5126) return new Float32Array(buf.slice(start, start + n * 4));
+    return a.componentType === 5125 ? new Uint32Array(buf.slice(start, start + n * 4)) : new Uint16Array(buf.slice(start, start + n * 2));
+  };
+  const zUp = (v: Float32Array) => {
+    const out = new Float32Array(v.length);
+    for (let i = 0; i < v.length; i += 3) { out[i] = v[i]; out[i + 1] = -v[i + 2]; out[i + 2] = v[i + 1]; }
+    return out;
+  };
+  const srgb = (c: number) => Math.round(255 * Math.min(1, c) ** (1 / 2.2));
+  return gltf.meshes[0].primitives.map((p) => {
+    const m = gltf.materials[p.material], c = m.pbrMetallicRoughness.baseColorFactor;
+    return {
+      name: m.name, glow: !!m.emissiveFactor, color: [srgb(c[0]), srgb(c[1]), srgb(c[2]), 255],
+      mesh: {
+        attributes: { positions: { value: zUp(read(p.attributes.POSITION) as Float32Array), size: 3 }, normals: { value: zUp(read(p.attributes.NORMAL) as Float32Array), size: 3 } },
+        indices: { value: read(p.indices) as Uint16Array | Uint32Array, size: 1 },
+      },
+    };
+  });
+}
 
 type Car = { id: number; from: [number, number]; to: [number, number]; heading: number; state: string; moving: boolean };
 const HAZARD_LABEL_ALT_M = 220;
@@ -117,6 +168,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
       try {
         const core = await import('@deck.gl/core');
         const L = await import('@deck.gl/layers');
+        const mesh = await import('@deck.gl/mesh-layers');
+        const [waymoParts, ambulanceParts] = await Promise.all([loadCarParts(WAYMO_GLB), loadCarParts(AMBULANCE_GLB)])
+          .catch((): [CarPart[], CarPart[]] => [[], []]);
         const geo = GOOGLE_KEY ? await import('@deck.gl/geo-layers').catch(() => null) : null;
         let photo = !!geo;
         if (!photo) setSource('osm');
@@ -261,44 +315,44 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           onError: () => { if (photo) fallBackToOsm(); else setFailed(true); },
         });
 
-        // Cars: moving ones are short light streaks along their heading (bright head, soft glow);
-        // stopped ones are dots, and cars asking for help pulse red.
-        const mPerDegLat = 110540;
-        const mPerDegLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
+        // Cars: white Waymo models gliding between updates (headlights and taillights glow). A car that is
+        // queued or waiting for help gets a colored ring on the ground; help requests also pulse red.
+        // One SimpleMeshLayer per material of a model, all sharing positions and headings.
+        const modelLayers = <T,>(id: string, parts: CarPart[], data: T[], pos: (d: T) => Pt, heading: (d: T) => number, scale: number, now: number): Layer[] => {
+          const strobe = Math.floor(now / 250) % 2 === 0;
+          return parts.map((p) => {
+            const color: Rgba = p.name === 'beaconR' ? (strobe ? p.color : [70, 8, 8, 255]) : p.name === 'beaconW' ? (strobe ? [60, 60, 60, 255] : p.color) : p.color;
+            return new mesh.SimpleMeshLayer({
+              id: `${id}-${p.name}`, data, mesh: p.mesh, getPosition: pos, getOrientation: (d: T) => orient(heading(d)),
+              getColor: color, sizeScale: scale, material: p.glow ? false : p.name === 'glass' ? GLASS : PAINT,
+              updateTriggers: { getColor: strobe },
+            });
+          });
+        };
+        // Real size up close; far out, scaled up so a car stays a few pixels long.
+        const carScale = () => Math.max(1, CAR_MIN_PX / ((512 * 2 ** view.zoom) / (40075016.686 * Math.cos((view.latitude * Math.PI) / 180))));
+
         const carLayers = (layers: typeof L, now: number): Layer[] => {
           const { list, at } = carsRef.current;
           const f = Math.min(1, (now - at) / UPDATE_MS);
           const cars = list.map((c) => {
             const lng = c.from[0] + (c.to[0] - c.from[0]) * f, lat = c.from[1] + (c.to[1] - c.from[1]) * f;
-            const h = (c.heading * Math.PI) / 180;
-            const tail: Pt = [lng - (Math.sin(h) * STREAK_M) / mPerDegLng, lat - (Math.cos(h) * STREAK_M) / mPerDegLat, 2];
-            return { ...c, head: [lng, lat, 2] as Pt, tail };
+            return { ...c, head: [lng, lat, 0] as Pt };
           });
-          const moving = cars.filter((c) => c.moving), stopped = cars.filter((c) => !c.moving);
-          const help = stopped.filter((c) => c.state === 'REQUESTING_HELP');
+          const flagged = cars.filter((c) => !c.moving);
+          const help = flagged.filter((c) => c.state === 'REQUESTING_HELP');
           const pulse = 0.5 + 0.5 * Math.sin(now / 300);
           return [
-            new layers.LineLayer({
-              id: 'car-streak-glow', parameters: ON_TOP, data: moving, getSourcePosition: (c: typeof moving[number]) => c.tail,
-              getTargetPosition: (c: typeof moving[number]) => c.head, getWidth: 6, widthUnits: 'pixels',
-              getColor: (c: typeof moving[number]) => { const k = STATE_RGB[c.state]; return [k[0], k[1], k[2], 45]; },
-            }),
-            new layers.LineLayer({
-              id: 'car-streak', parameters: ON_TOP, data: moving, getSourcePosition: (c: typeof moving[number]) => c.tail,
-              getTargetPosition: (c: typeof moving[number]) => c.head, getWidth: 2, widthUnits: 'pixels',
-              getColor: (c: typeof moving[number]) => STATE_RGB[c.state],
-            }),
             new layers.ScatterplotLayer({
-              id: 'car-heads', parameters: ON_TOP, data: moving, getPosition: (c: typeof moving[number]) => c.head,
-              getRadius: 1.6, radiusUnits: 'pixels', getFillColor: [235, 255, 245, 255],
+              id: 'car-rings', parameters: ON_TOP, data: flagged, getPosition: (c: typeof flagged[number]) => c.head,
+              getRadius: 5, radiusUnits: 'pixels', stroked: true, filled: true, lineWidthUnits: 'pixels', getLineWidth: 1.5,
+              getFillColor: (c: typeof flagged[number]) => { const k = STATE_RGB[c.state]; return [k[0], k[1], k[2], 50]; },
+              getLineColor: (c: typeof flagged[number]) => STATE_RGB[c.state],
             }),
-            new layers.ScatterplotLayer({
-              id: 'car-stopped', parameters: ON_TOP, data: stopped, getPosition: (c: typeof stopped[number]) => c.head,
-              getRadius: 2.2, radiusUnits: 'pixels', getFillColor: (c: typeof stopped[number]) => STATE_RGB[c.state],
-            }),
+            ...modelLayers('car', waymoParts, cars, (c) => c.head, (c) => c.heading, carScale(), now),
             new layers.ScatterplotLayer({
               id: 'car-help-pulse', parameters: ON_TOP, data: help, getPosition: (c: typeof help[number]) => c.head,
-              getRadius: 4 + 5 * pulse, radiusUnits: 'pixels', stroked: true, filled: false, lineWidthUnits: 'pixels',
+              getRadius: 6 + 6 * pulse, radiusUnits: 'pixels', stroked: true, filled: false, lineWidthUnits: 'pixels',
               getLineWidth: 1.2, getLineColor: [255, 42, 84, Math.round(200 * (1 - pulse))],
               updateTriggers: { getRadius: Math.round(now / 40), getLineColor: Math.round(now / 40) },
             }),
@@ -313,7 +367,10 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           const dt = (now - last) / 1000; last = now;
           const chase = followRef.current ? snapRef.current.ambulance : null;
           if (chase) {
-            view = { ...view, ...followCamera(chase, { latitude: view.latitude, longitude: view.longitude, zoom: view.zoom, pitch: view.pitch ?? 0, bearing: view.bearing ?? 0 }) };
+            const next = followCamera(chase, { latitude: view.latitude, longitude: view.longitude, zoom: view.zoom, pitch: view.pitch ?? 0, bearing: view.bearing ?? 0 });
+            // Keep the ambulance itself in the middle of the frame (the patient clock covers the top), closer in.
+            view = { ...view, ...next, zoom: view.zoom + (CHASE_ZOOM - view.zoom) * 0.1,
+              latitude: view.latitude + (chase.pos.lat - view.latitude) * 0.18, longitude: view.longitude + (chase.pos.lng - view.longitude) * 0.18 };
             target = null; lastTouch = now;
             swayBase = view.bearing ?? 0; swayT = 0;
           } else if (target) {
@@ -389,17 +446,15 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           );
           const amb = snap.ambulance;
           if (amb) {
+            const flash = Math.floor(now / 350) % 2 === 0;   // red light bar strobing on the ground around it
             dyn.push(
               new L.ScatterplotLayer({
-                id: 'amb-halo', parameters: ON_TOP, data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 4],
-                getRadius: 12 + 6 * Math.abs(Math.sin(now / 260)), radiusUnits: 'pixels', getFillColor: [255, 184, 0, 70],
-                updateTriggers: { getRadius: Math.round(now / 50) },
+                id: 'amb-halo', parameters: ON_TOP, data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 1],
+                getRadius: 14 + 6 * Math.abs(Math.sin(now / 260)), radiusUnits: 'pixels',
+                getFillColor: flash ? [255, 42, 84, 60] : [255, 184, 0, 60],
+                updateTriggers: { getRadius: Math.round(now / 50), getFillColor: flash },
               }),
-              new L.ScatterplotLayer({
-                id: 'amb', parameters: ON_TOP, data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 5],
-                getRadius: 5, radiusUnits: 'pixels', getFillColor: [255, 255, 255, 255], stroked: true,
-                getLineColor: [255, 184, 0, 255], lineWidthUnits: 'pixels', getLineWidth: 2,
-              }),
+              ...modelLayers('amb', ambulanceParts, [amb], (a) => [a.pos.lng, a.pos.lat, 0], (a) => a.headingDeg, carScale() > 1 ? carScale() * 1.3 : 1, now),
             );
           }
           deck!.setProps({ viewState: view, layers: [...staticLayers, ...dyn] });
