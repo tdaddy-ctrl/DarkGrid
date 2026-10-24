@@ -7,11 +7,12 @@
   --font-sans: var(--font-plex);
   --font-mono: var(--font-jetbrains);
 
-  --color-dg-bg: #050811;
-  --color-dg-bg-2: #0b0f17;
-  --color-dg-line: rgb(255 255 255 / 0.08);
+  --color-dg-bg: #070a0f;
+  --color-dg-bg-2: #0a0e15;
+  --color-dg-panel: #0c111a;
+  --color-dg-line: rgb(56 189 248 / 0.14);
   --color-dg-label: #a9b6cc;
-  --color-dg-cyan: #00f0ff;
+  --color-dg-cyan: #38bdf8;
   --color-dg-amber: #ffb800;
   --color-dg-red: #ff2a54;
   --color-dg-green: #34d399;
@@ -26,9 +27,8 @@ body {
   color: #e2e8f0;
   background-color: var(--color-dg-bg);
   background-image:
-    radial-gradient(1200px 600px at 15% -10%, rgb(0 240 255 / 0.07), transparent 60%),
-    radial-gradient(900px 500px at 110% 10%, rgb(255 42 84 / 0.05), transparent 60%),
-    linear-gradient(180deg, #050811 0%, #0b0f17 100%);
+    radial-gradient(1200px 600px at 15% -10%, rgb(56 189 248 / 0.05), transparent 60%),
+    linear-gradient(180deg, #070a0f 0%, #0a0e15 100%);
   background-attachment: fixed;
   font-family: var(--font-plex), ui-sans-serif, system-ui, sans-serif;
   font-variant-numeric: tabular-nums;
@@ -51,9 +51,9 @@ body::before {
 /* Glass panel with a hairline border and a highlight along the top edge. */
 @utility dg-panel {
   position: relative;
-  border-radius: 1rem;
+  border-radius: 0.5rem;
   border: 1px solid var(--color-dg-line);
-  background: linear-gradient(180deg, rgb(15 23 42 / 0.72), rgb(10 15 26 / 0.6));
+  background: rgb(12 17 26 / 0.92);
   backdrop-filter: blur(16px);
   box-shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 20px 40px -24px rgb(0 0 0 / 0.8);
 
@@ -64,7 +64,7 @@ body::before {
     right: 1.25rem;
     top: -1px;
     height: 1px;
-    background: linear-gradient(90deg, transparent, rgb(0 240 255 / 0.55), transparent);
+    background: linear-gradient(90deg, transparent, rgb(56 189 248 / 0.45), transparent);
     pointer-events: none;
   }
 }

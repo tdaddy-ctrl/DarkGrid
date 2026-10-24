@@ -1,0 +1,290 @@
+'use client';
+
+// 3D tactical map: real San Francisco buildings (OpenStreetMap footprints + heights) extruded
+// with deck.gl, the road graph, vehicles colored by state, the ambulance corridor and the
+// blackout zone. HUD (brackets, compass, camera readout, scanlines) is plain HTML on top.
+// deck.gl is loaded inside useEffect, so nothing WebGL runs during server rendering.
+
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import type { Deck, Layer, MapViewState } from '@deck.gl/core';
+import type { RoadGraph, SimSnapshot } from '@/types/sim';
+import { OUTAGE_RADIUS_M } from '@/lib/config';
+
+type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
+type Rgba = [number, number, number, number];
+type Pt = [number, number] | [number, number, number];
+
+const STATE_RGB: Record<string, Rgba> = {
+  DRIVING: [52, 211, 153, 235], REQUESTING_HELP: [255, 42, 84, 255], QUEUED_BEHIND: [251, 146, 60, 245],
+  STAGED: [56, 189, 248, 245], ARRIVED: [148, 163, 184, 200],
+};
+const LEGEND: [string, string][] = [
+  ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'],
+];
+const ORBIT_DEG_PER_S = 1.2;      // slow auto-orbit while nobody touches the map
+const IDLE_BEFORE_ORBIT_MS = 5000;
+const HAZARD_LABEL_ALT_M = 220;
+
+export default function TacticalMap3D({ snapshot, graph, fallback, hazardLabel = 'SoMa Substation Fire' }: {
+  snapshot: SimSnapshot; graph: RoadGraph; fallback: ReactNode; hazardLabel?: string;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const labelRef = useRef<HTMLDivElement>(null);
+  const leaderRef = useRef<SVGLineElement>(null);
+  const snapRef = useRef(snapshot);
+  const [failed, setFailed] = useState(false);
+  const [hud, setHud] = useState({ pitch: 47, bearing: 9, lat: graph.center.lat, lng: graph.center.lng, zoom: 14.2 });
+
+  useEffect(() => { snapRef.current = snapshot; }, [snapshot]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    let deck: Deck | null = null;
+    let raf = 0;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const core = await import('@deck.gl/core');
+        const L = await import('@deck.gl/layers');
+        const res = await fetch('/data/sf_buildings.json');
+        const buildings: Building[] = res.ok ? await res.json() : [];
+        if (cancelled) return;
+
+        const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
+        const roads = graph.edges.map((e) => {
+          const a = nodes.get(e.from)!, b = nodes.get(e.to)!;
+          return [[a.lng, a.lat], [b.lng, b.lat]] as Pt[];
+        });
+        // Faint ground grid every ~250 m around the road network.
+        const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
+        const box = { s: Math.min(...lats) - 0.012, n: Math.max(...lats) + 0.02, w: Math.min(...lngs) - 0.012, e: Math.max(...lngs) + 0.012 };
+        const grid: Pt[][] = [];
+        for (let la = box.s; la <= box.n; la += 0.00226) grid.push([[box.w, la], [box.e, la]]);
+        for (let lo = box.w; lo <= box.e; lo += 0.00285) grid.push([[lo, box.s], [lo, box.n]]);
+
+        const lighting = new core.LightingEffect({
+          ambient: new core.AmbientLight({ color: [150, 180, 210], intensity: 0.9 }),
+          key: new core.DirectionalLight({ color: [170, 210, 255], intensity: 1.4, direction: [-1, -2.5, -3] }),
+          rim: new core.DirectionalLight({ color: [90, 60, 70], intensity: 0.6, direction: [2, 1, -1] }),
+        });
+
+        const staticLayers: Layer[] = [
+          new L.PathLayer({
+            id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 14],
+            getWidth: 1, widthUnits: 'pixels',
+          }),
+          new L.PathLayer({
+            id: 'road-glow', data: roads, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 22],
+            getWidth: 7, widthUnits: 'pixels', capRounded: true,
+          }),
+          new L.PathLayer({
+            id: 'roads', data: roads, getPath: (d: Pt[]) => d, getColor: [70, 96, 122, 200],
+            getWidth: 1.4, widthUnits: 'pixels',
+          }),
+          new L.PolygonLayer<Building>({
+            id: 'buildings', data: buildings, positionFormat: 'XY',
+            getPolygon: (b) => b[1], getElevation: (b) => b[0],
+            extruded: true, wireframe: true, filled: true, stroked: false,
+            getFillColor: (b) => (b[0] > 120 ? [36, 48, 64, 245] : [22, 30, 42, 240]),
+            getLineColor: (b) => (b[0] > 120 ? [56, 189, 248, 95] : [56, 189, 248, 40]),
+            material: { ambient: 0.35, diffuse: 0.6, shininess: 24, specularColor: [50, 70, 90] },
+          }),
+        ];
+
+        let view: MapViewState = { longitude: graph.center.lng + 0.004, latitude: graph.center.lat + 0.004, zoom: 14.2, pitch: 47, bearing: 9, maxPitch: 70 };
+        let lastTouch = 0;
+        let interacting = false;
+
+        deck = new core.Deck({
+          parent: host,
+          width: '100%', height: '100%',
+          viewState: view,
+          controller: { inertia: 400, dragRotate: true, touchRotate: true },
+          effects: [lighting],
+          onViewStateChange: ({ viewState }) => { view = viewState as MapViewState; lastTouch = performance.now(); },
+          onInteractionStateChange: (s) => { interacting = !!(s.isDragging || s.isPanning || s.isRotating || s.isZooming); if (interacting) lastTouch = performance.now(); },
+          onError: () => setFailed(true),
+        });
+
+        let last = performance.now();
+        let lastHud = 0;
+        const center: [number, number] = [graph.center.lng, graph.center.lat];
+        const frame = (now: number) => {
+          const dt = (now - last) / 1000; last = now;
+          if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) view = { ...view, bearing: (view.bearing ?? 0) + ORBIT_DEG_PER_S * dt };
+          const snap = snapRef.current;
+          const outage = snap.darkNodes.length > 0;
+          const pulse = (now / 1000) % 2.4 / 2.4;
+          const dyn: Layer[] = [];
+          if (outage) {
+            dyn.push(
+              new L.ScatterplotLayer({
+                id: 'hazard-glow', data: [0.35, 0.65, 1], getPosition: () => center,
+                getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(26 * (1.2 - f))],
+                stroked: false, filled: true, radiusUnits: 'meters',
+              }),
+              new L.ScatterplotLayer({
+                id: 'hazard-rings', data: [0, 1 / 3, 2 / 3], getPosition: () => center,
+                getRadius: (o: number) => OUTAGE_RADIUS_M * (0.15 + 0.85 * ((pulse + o) % 1)),
+                getLineColor: (o: number) => [255, 42, 84, Math.round(200 * (1 - ((pulse + o) % 1)))],
+                stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 2, radiusUnits: 'meters',
+                updateTriggers: { getRadius: pulse, getLineColor: pulse },
+              }),
+              new L.ScatterplotLayer({
+                id: 'hazard-edge', data: [0], getPosition: () => center, getRadius: OUTAGE_RADIUS_M,
+                getLineColor: [255, 42, 84, 150], stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 1.2, radiusUnits: 'meters',
+              }),
+              new L.ScatterplotLayer({
+                id: 'dark-nodes', data: snap.darkNodes, getPosition: (p: { lat: number; lng: number }) => [p.lng, p.lat, 1],
+                getRadius: 2.6, radiusUnits: 'pixels', getFillColor: [255, 90, 115, 255],
+                opacity: 0.45 + 0.4 * Math.abs(Math.sin(now / 420)),
+              }),
+            );
+          }
+          if (snap.corridor.length > 1) {
+            const path = snap.corridor.map((p) => [p.lng, p.lat, 3] as Pt);
+            dyn.push(
+              new L.PathLayer({ id: 'corridor-glow', data: [path], getPath: (d: Pt[]) => d, getColor: [255, 184, 0, 55], getWidth: 12, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+              new L.PathLayer({ id: 'corridor', data: [path], getPath: (d: Pt[]) => d, getColor: [255, 200, 60, 255], getWidth: 3, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+            );
+          }
+          dyn.push(
+            new L.ScatterplotLayer({
+              id: 'lots', data: snap.lots, getPosition: (l: SimSnapshot['lots'][number]) => [l.pos.lng, l.pos.lat, 2],
+              getRadius: 7, radiusUnits: 'pixels', stroked: true, filled: true, lineWidthUnits: 'pixels', getLineWidth: 1.5,
+              getFillColor: [56, 189, 248, 40], getLineColor: [56, 189, 248, 220],
+            }),
+            new L.TextLayer({
+              id: 'lot-labels', data: snap.lots, getPosition: (l: SimSnapshot['lots'][number]) => [l.pos.lng, l.pos.lat, 2],
+              getText: (l: SimSnapshot['lots'][number]) => `${l.used}/${l.cap}`, getSize: 11, getColor: [125, 211, 252, 255],
+              getPixelOffset: [0, -16], fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, billboard: true,
+            }),
+            new L.ScatterplotLayer({
+              id: 'vehicle-glow', data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
+              getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 9 : 6), radiusUnits: 'pixels',
+              getFillColor: (v: SimSnapshot['vehicles'][number]) => { const c = STATE_RGB[v.state]; return [c[0], c[1], c[2], 45]; },
+            }),
+            new L.ScatterplotLayer({
+              id: 'vehicles', data: snap.vehicles, getPosition: (v: SimSnapshot['vehicles'][number]) => [v.pos.lng, v.pos.lat, 2],
+              getRadius: (v: SimSnapshot['vehicles'][number]) => (v.state === 'REQUESTING_HELP' ? 3.6 : 2.4), radiusUnits: 'pixels',
+              getFillColor: (v: SimSnapshot['vehicles'][number]) => STATE_RGB[v.state],
+            }),
+          );
+          const amb = snap.ambulance;
+          if (amb) {
+            dyn.push(
+              new L.ScatterplotLayer({
+                id: 'amb-halo', data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 4],
+                getRadius: 12 + 6 * Math.abs(Math.sin(now / 260)), radiusUnits: 'pixels', getFillColor: [255, 184, 0, 70],
+                updateTriggers: { getRadius: Math.round(now / 50) },
+              }),
+              new L.ScatterplotLayer({
+                id: 'amb', data: [amb], getPosition: (a: typeof amb) => [a.pos.lng, a.pos.lat, 5],
+                getRadius: 5, radiusUnits: 'pixels', getFillColor: [255, 255, 255, 255], stroked: true,
+                getLineColor: [255, 184, 0, 255], lineWidthUnits: 'pixels', getLineWidth: 2,
+              }),
+            );
+          }
+          deck!.setProps({ viewState: view, layers: [...staticLayers, ...dyn] });
+
+          // Floating label over the blackout, with a dashed leader line down to the ground.
+          const vp = deck!.getViewports()[0];
+          const label = labelRef.current, leader = leaderRef.current;
+          if (vp && label && leader) {
+            if (outage) {
+              const [gx, gy] = vp.project([center[0], center[1], 0]);
+              const [lx, ly] = vp.project([center[0], center[1], HAZARD_LABEL_ALT_M]);
+              label.style.display = 'flex';
+              label.style.transform = `translate(${lx}px, ${ly}px) translate(-50%, -100%)`;
+              leader.setAttribute('x1', String(lx)); leader.setAttribute('y1', String(ly));
+              leader.setAttribute('x2', String(gx)); leader.setAttribute('y2', String(gy));
+              leader.style.display = '';
+            } else {
+              label.style.display = 'none';
+              leader.style.display = 'none';
+            }
+          }
+          if (now - lastHud > 200) {
+            lastHud = now;
+            setHud({ pitch: view.pitch ?? 0, bearing: (((view.bearing ?? 0) % 360) + 360) % 360, lat: view.latitude, lng: view.longitude, zoom: view.zoom });
+          }
+          raf = requestAnimationFrame(frame);
+        };
+        raf = requestAnimationFrame(frame);
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
+
+    return () => { cancelled = true; cancelAnimationFrame(raf); deck?.finalize(); };
+  }, [graph]);
+
+  if (failed) return <>{fallback}</>;
+
+  const outage = snapshot.darkNodes.length > 0;
+  return (
+    <div className="relative h-full min-h-0 overflow-hidden bg-[#070a0f]">
+      <div ref={hostRef} className="absolute inset-0" />
+
+      {/* screen treatment: scanlines + vignette + faint crosshair */}
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:repeating-linear-gradient(0deg,rgba(255,255,255,0.025)_0px,rgba(255,255,255,0.025)_1px,transparent_1px,transparent_3px)]" />
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:radial-gradient(ellipse_at_center,transparent_55%,rgba(0,0,0,0.65)_100%)]" />
+      <svg aria-hidden="true" className="pointer-events-none absolute inset-0 h-full w-full">
+        <line ref={leaderRef} stroke="rgba(255,90,115,0.8)" strokeWidth="1" strokeDasharray="3 4" style={{ display: 'none' }} />
+      </svg>
+      <div aria-hidden="true" className="pointer-events-none absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 opacity-30">
+        <span className="absolute left-1/2 top-0 h-full w-px bg-dg-cyan" /><span className="absolute left-0 top-1/2 h-px w-full bg-dg-cyan" />
+      </div>
+
+      {/* floating hazard label (positioned every frame) */}
+      <div ref={labelRef} className="pointer-events-none absolute left-0 top-0 hidden items-center gap-2 rounded-full border border-[#ff2a54]/50 bg-[#2a0b12]/70 px-3 py-1.5 font-mono text-xs font-semibold text-[#ffd0d8] shadow-[0_0_30px_-6px_rgba(255,42,84,.9)] backdrop-blur" style={{ display: 'none' }}>
+        <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5 text-[#ff5a73]" fill="currentColor"><path d="M8 1c1 2.5 4 4 4 8a4 4 0 0 1-8 0c0-1.6.8-2.8 1.6-3.6C6 7 6.5 8 7.3 8.3 7 6 7.5 3.4 8 1z" /></svg>
+        {hazardLabel}
+      </div>
+
+      {/* corner brackets */}
+      {['left-3 top-3 border-l border-t', 'right-3 top-3 border-r border-t', 'bottom-3 right-3 border-b border-r', 'bottom-3 left-3 border-b border-l'].map((c) => (
+        <span key={c} aria-hidden="true" className={`pointer-events-none absolute size-5 border-dg-cyan/50 ${c}`} />
+      ))}
+
+      {/* compass */}
+      <div aria-label={`Heading ${Math.round(hud.bearing)} degrees`} role="img" className="pointer-events-none absolute right-6 top-6 grid size-20 place-items-center rounded-full border border-dg-line bg-black/30 backdrop-blur-sm">
+        <div className="relative size-full" style={{ transform: `rotate(${-hud.bearing}deg)` }}>
+          {(['N', 'E', 'S', 'W'] as const).map((d, i) => (
+            <span key={d} className={`absolute font-mono text-[9px] font-semibold ${d === 'N' ? 'text-dg-red' : 'text-dg-label'}`}
+              style={{ left: '50%', top: '50%', transform: `rotate(${i * 90}deg) translateY(-31px) rotate(${-i * 90}deg) translate(-50%, -50%)` }}>{d}</span>
+          ))}
+          <span className="absolute left-1/2 top-1/2 h-6 w-px -translate-x-1/2 -translate-y-full bg-dg-red" />
+        </div>
+        <span className="absolute size-1.5 rounded-full bg-dg-cyan" />
+      </div>
+
+      {/* legend */}
+      <ul className="absolute bottom-4 left-4 flex flex-wrap gap-x-3 gap-y-1 rounded-lg border border-dg-line bg-black/55 px-3 py-1.5 backdrop-blur">
+        {LEGEND.map(([label, color]) => (
+          <li key={label} className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label">
+            <span aria-hidden="true" className="size-2 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />{label}
+          </li>
+        ))}
+        <li className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label">
+          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-amber" />Corridor
+        </li>
+      </ul>
+
+      {/* camera readout */}
+      <dl className="absolute bottom-4 right-4 grid grid-cols-[auto_auto] gap-x-3 rounded-lg border border-dg-line bg-black/55 px-3 py-2 font-mono text-[10px] tabular-nums text-dg-label backdrop-blur">
+        <dt>PITCH</dt><dd className="text-right text-slate-200">{hud.pitch.toFixed(0)}°</dd>
+        <dt>YAW</dt><dd className="text-right text-slate-200">{hud.bearing.toFixed(1)}°</dd>
+        <dt>ZOOM</dt><dd className="text-right text-slate-200">{hud.zoom.toFixed(2)}</dd>
+        <dt>LAT/LON</dt><dd className="text-right text-slate-200">{hud.lat.toFixed(4)}, {hud.lng.toFixed(4)}</dd>
+      </dl>
+
+      {!outage && (
+        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Drag to rotate · scroll to zoom</p>
+      )}
+      <p className="pointer-events-none absolute bottom-1 left-1/2 -translate-x-1/2 font-mono text-[9px] text-slate-600">Buildings & roads © OpenStreetMap contributors</p>
+    </div>
+  );
+}

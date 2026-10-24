@@ -15,6 +15,7 @@ import { loadRoadGraph } from '@/lib/graph';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
 import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
+import TacticalMap3D from '@/components/TacticalMap3D';
 
 const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
@@ -58,22 +59,25 @@ export default function Home() {
 
   // A changed selection immediately unmounts the old run, before the next load completes.
   const current = loaded?.environment === environment && loaded.generation === generation ? loaded : null;
+  const envSelect = (
+    <>
+      <label htmlFor="simulation-environment" className="sr-only">Environment</label>
+      <select id="simulation-environment" value={environment}
+        onChange={event => { setEnvironment(event.target.value as Environment); setGeneration(n => n + 1); }}
+        className="min-h-9 rounded-md border border-dg-line bg-[#0c111a] px-2 font-mono text-xs uppercase tracking-[0.12em] text-slate-200">
+        <option value="SF">San Francisco</option>
+        <option value="GRID">Test Grid</option>
+      </select>
+    </>
+  );
   return (
     <>
-      <div className="relative z-10 mx-auto flex w-full max-w-[1680px] items-center gap-3 px-4 pt-4 lg:px-6">
-        <label htmlFor="simulation-environment" className="dg-label">Environment</label>
-        <select id="simulation-environment" value={environment}
-          onChange={event => { setEnvironment(event.target.value as Environment); setGeneration(n => n + 1); }}
-          className="rounded-md border border-dg-line bg-slate-950 px-3 py-2 text-sm text-slate-100">
-          <option value="SF">San Francisco</option>
-          <option value="GRID">Test Grid</option>
-        </select>
-      </div>
       {current?.graph ? (
         <Simulation key={`${environment}-${generation}`} graph={current.graph}
-          onReset={() => setGeneration(n => n + 1)} />
+          onReset={() => setGeneration(n => n + 1)} envSelect={envSelect} />
       ) : (
         <main className="relative z-10 flex flex-1 flex-col items-center justify-center gap-3 p-6">
+          <div className="flex items-center gap-2">{envSelect}</div>
           {current?.error ? (
             <>
               <p role="alert" className="text-dg-red">Unable to load {ENVIRONMENT_LABELS[environment]}: {current.error}</p>
@@ -89,7 +93,7 @@ export default function Home() {
 }
 
 // Each environment/run gets its own component instance: refs, clocks and controls reset together.
-function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void }) {
+function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: () => void; envSelect: ReactNode }) {
   const simsRef = useRef<{ fifo: Sim; darkgrid: Sim } | null>(null);
   const chartRef = useRef<ChartPoint[]>([]);
   const pausedRef = useRef(false);
@@ -198,8 +202,8 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
     : outage ? { label: 'Blackout', tone: 'amber' } : { label: 'Nominal', tone: 'cyan' };
 
   return (
-    <main className="relative z-10 mx-auto flex w-full max-w-[1680px] flex-1 flex-col gap-4 p-4 lg:p-6">
-      <header className="dg-panel flex flex-wrap items-center gap-x-6 gap-y-3 px-4 py-3">
+    <main className="relative z-10 mx-auto flex w-full max-w-[1920px] flex-1 flex-col gap-3 p-3 lg:h-screen lg:max-h-screen lg:flex-none lg:overflow-hidden lg:p-4">
+      <header className="dg-panel flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 px-4 py-2.5">
         <div className="mr-auto flex items-center gap-3">
           <BrandMark />
           <div>
@@ -215,12 +219,13 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
           </div>
         </div>
         <nav aria-label="Demo controls" className="flex flex-wrap items-center gap-2">
+          {envSelect}
           <div className="flex rounded-lg border border-dg-line bg-black/30 p-0.5" role="group" aria-label="City on screen">
             {(['FIFO', 'DARKGRID'] as const).map((m) => (
               <button key={m} onClick={() => setMode(m)} aria-pressed={mode === m}
                 className={`min-h-9 rounded-md px-3 font-mono text-xs font-semibold uppercase tracking-[0.14em] transition-colors ${
                   mode === m
-                    ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(0,240,255,.8)]'
+                    ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(56,189,248,.8)]'
                     : 'text-slate-300 hover:text-slate-50'}`}>
                 {cityShort(m)}
               </button>
@@ -238,29 +243,32 @@ function Simulation({ graph, onReset }: { graph: RoadGraph; onReset: () => void 
         </nav>
       </header>
 
-      {split ? (
-        <>
-          {/* Same seed, same blackout: the only difference between the two maps is the dispatch policy. */}
-          <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid min-h-0 gap-3 lg:flex-[62] lg:grid-cols-[minmax(0,7fr)_minmax(0,3fr)]">
+        {split ? (
+          /* Same seed, same blackout: the only difference between the two maps is the dispatch policy. */
+          <div className="grid min-h-0 gap-3 md:grid-cols-2">
             <MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} />
             <MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} />
           </div>
-          {judge && <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} proposal={proposal} />}
-        </>
-      ) : (
-        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-          <MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
-          <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} proposal={proposal} />
-        </div>
-      )}
-
-      <div className="grid gap-4 xl:grid-cols-[1fr_1fr_1.25fr]">
-        <KpiPanel snapshot={view.fifo} other={view.darkgrid} />
-        <KpiPanel snapshot={view.darkgrid} other={view.fifo} />
-        <ChartPlaceholder data={view.chart} />
+        ) : (
+          <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
+            <PanelHeader title={`Tactical map · ${cityShort(snap.mode)}`} tone={outage ? 'amber' : 'cyan'}>
+              <Badge>{snap.vehicles.length} units</Badge>
+              {outage && <Badge tone="amber">{snap.darkNodes.length} dark</Badge>}
+            </PanelHeader>
+            <div className="relative min-h-0 flex-1">
+              <TacticalMap3D snapshot={snap} graph={graph}
+                fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />} />
+              <PatientClock snapshot={snap} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
+            </div>
+          </section>
+        )}
+        <QueuePlaceholder snapshot={snap} onAnswer={onAnswer} proposal={proposal} />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid min-h-0 gap-3 md:grid-cols-2 lg:flex-[28] xl:grid-cols-4">
+        <KpiPanel snapshot={mode === 'FIFO' ? view.darkgrid : view.fifo} other={snap} />
+        <ChartPlaceholder data={view.chart} />
         <ChaosInjectorPanel onResult={onChaos} />
         <AskWhyBar jobs={snap.jobs} />
       </div>
@@ -288,7 +296,7 @@ function btn(tone: 'amber' | 'red' | 'cyan' | 'ghost'): string {
   const tones = {
     amber: 'bg-linear-to-b from-[#ffd46b] to-dg-amber text-slate-950 shadow-[0_0_20px_-6px_rgba(255,184,0,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,184,0,.9)]',
     red: 'bg-linear-to-b from-[#ff8ba0] to-dg-red text-slate-950 shadow-[0_0_20px_-6px_rgba(255,42,84,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,42,84,.9)]',
-    cyan: 'bg-linear-to-b from-[#8cfaff] to-dg-cyan text-slate-950 shadow-[0_0_20px_-6px_rgba(0,240,255,.8)] enabled:hover:shadow-[0_0_28px_-4px_rgba(0,240,255,1)]',
+    cyan: 'bg-linear-to-b from-[#7dd3fc] to-dg-cyan text-slate-950 shadow-[0_0_20px_-6px_rgba(56,189,248,.8)] enabled:hover:shadow-[0_0_28px_-4px_rgba(56,189,248,1)]',
     ghost: 'border border-dg-line bg-white/[0.03] text-slate-200 enabled:hover:border-white/20 enabled:hover:bg-white/[0.07]',
   };
   return `${base} ${tones[tone]}`;
@@ -329,10 +337,10 @@ function PanelHeader({ title, tone, titleClass = '', children }: { title: string
 function BrandMark() {
   return (
     <svg aria-hidden="true" viewBox="0 0 28 28" className="size-8">
-      <rect x="0.5" y="0.5" width="27" height="27" rx="6" fill="none" stroke="rgb(0 240 255 / 0.45)" />
+      <rect x="0.5" y="0.5" width="27" height="27" rx="6" fill="none" stroke="rgb(56 189 248 / 0.45)" />
       {[0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => (
         <rect key={`${r}${c}`} x={6 + c * 6} y={6 + r * 6} width="4" height="4" rx="1"
-          fill={r === 1 && c === 1 ? '#00f0ff' : 'rgb(148 163 184 / 0.35)'} />
+          fill={r === 1 && c === 1 ? '#38bdf8' : 'rgb(148 163 184 / 0.35)'} />
       )))}
     </svg>
   );
@@ -342,7 +350,7 @@ function BrandMark() {
 
 // Vehicle colors; C's MapView should use the same ones.
 const STATE_COLOR: Record<string, string> = {
-  DRIVING: '#34d399', REQUESTING_HELP: '#ff2a54', QUEUED_BEHIND: '#fb923c', STAGED: '#00f0ff', ARRIVED: '#94a3b8',
+  DRIVING: '#34d399', REQUESTING_HELP: '#ff2a54', QUEUED_BEHIND: '#fb923c', STAGED: '#38bdf8', ARRIVED: '#94a3b8',
 };
 const LEGEND: [string, string][] = [
   ['Driving', STATE_COLOR.DRIVING], ['Needs help', STATE_COLOR.REQUESTING_HELP],
@@ -370,7 +378,7 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
   const corridor = snapshot.corridor.map((p) => `${px(p)},${py(p)}`).join(' ');
 
   return (
-    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-[600px]">
+    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
       <PanelHeader
         title={other ? (snapshot.mode === 'FIFO' ? 'First come, first served' : 'DARK GRID') : `Tactical map · ${cityShort(snapshot.mode)}`}
         tone={other ? (snapshot.mode === 'FIFO' ? 'red' : 'cyan') : outage ? 'amber' : 'cyan'}
@@ -394,7 +402,7 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
           </defs>
           <rect width={W} height={H} fill={`url(#${uid}grid)`} />
 
-          <g stroke="rgb(0 240 255 / 0.07)" strokeWidth={14} strokeLinecap="round">
+          <g stroke="rgb(56 189 248 / 0.07)" strokeWidth={14} strokeLinecap="round">
             {roads.map(({ id, ...r }) => <line key={id} {...r} />)}
           </g>
           <g stroke="#2a3a55" strokeWidth={3} strokeLinecap="round">
@@ -424,11 +432,11 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
           {snapshot.lots.map((l, i) => {
             const x = px(l.pos), y = py(l.pos), s = 26, k = 9;
             return (
-              <g key={i} stroke="#00f0ff" fill="none" strokeWidth={2}>
+              <g key={i} stroke="#38bdf8" fill="none" strokeWidth={2}>
                 <path d={`M${x - s},${y - s + k}V${y - s}H${x - s + k} M${x + s - k},${y - s}H${x + s}V${y - s + k} M${x + s},${y + s - k}V${y + s}H${x + s - k} M${x - s + k},${y + s}H${x - s}V${y + s - k}`} />
-                <rect x={x - s} y={y + s + 6} width={2 * s} height={4} fill="rgb(0 240 255 / 0.15)" stroke="none" />
-                <rect x={x - s} y={y + s + 6} width={(2 * s * l.used) / l.cap} height={4} fill="#00f0ff" stroke="none" />
-                <text x={x} y={y - s - 8} fill="#00f0ff" stroke="none" fontSize={18} textAnchor="middle"
+                <rect x={x - s} y={y + s + 6} width={2 * s} height={4} fill="rgb(56 189 248 / 0.15)" stroke="none" />
+                <rect x={x - s} y={y + s + 6} width={(2 * s * l.used) / l.cap} height={4} fill="#38bdf8" stroke="none" />
+                <text x={x} y={y - s - 8} fill="#38bdf8" stroke="none" fontSize={18} textAnchor="middle"
                   fontFamily="var(--font-jetbrains)">{l.used}/{l.cap}</text>
               </g>
             );
@@ -569,7 +577,7 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
   const shown = snapshot.jobs.slice(0, 12);
 
   return (
-    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:h-[600px]">
+    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
       <PanelHeader title="Request queue" tone={snapshot.jobs.length ? (manual ? 'red' : 'cyan') : 'idle'}>
         <Badge>REQ {m.requests}</Badge>
         <Badge>JOBS {snapshot.jobs.length}</Badge>
@@ -596,7 +604,7 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
               <li key={op.id} className="flex items-center gap-2 rounded-lg border border-dg-line bg-white/[0.02] px-2 py-1.5">
                 <span className="w-12 shrink-0 font-mono text-[11px] uppercase text-slate-400">{op.id}</span>
                 <span className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${
-                  busy ? 'bg-dg-cyan/15 text-dg-cyan shadow-[0_0_10px_-2px_rgba(0,240,255,.6)]' : 'bg-white/[0.05] text-slate-500'}`}>
+                  busy ? 'bg-dg-cyan/15 text-dg-cyan shadow-[0_0_10px_-2px_rgba(56,189,248,.6)]' : 'bg-white/[0.05] text-slate-500'}`}>
                   {busy ? 'ACTIVE' : 'IDLE'}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-xs text-slate-300">{busy ? op.task : 'Standing by'}</span>
@@ -621,8 +629,8 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
       {shown.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
           <svg aria-hidden="true" viewBox="0 0 80 80" className="size-20">
-            {[34, 24, 14].map((r) => <circle key={r} cx="40" cy="40" r={r} fill="none" stroke="rgb(0 240 255 / 0.25)" strokeDasharray="3 5" />)}
-            <circle cx="40" cy="40" r="3" fill="#00f0ff" />
+            {[34, 24, 14].map((r) => <circle key={r} cx="40" cy="40" r={r} fill="none" stroke="rgb(56 189 248 / 0.25)" strokeDasharray="3 5" />)}
+            <circle cx="40" cy="40" r="3" fill="#38bdf8" />
           </svg>
           <p className="dg-label">Queue clear</p>
           <p className="text-xs text-dg-label">No robotaxi is waiting for an operator.</p>
@@ -636,7 +644,7 @@ function QueuePlaceholder({ snapshot, onAnswer, proposal }: {
                 <button disabled={locked || !(manual || zone)} onClick={() => onAnswer(j.id)}
                   className={`flex w-full items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-default ${
                     zone
-                      ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(0,240,255,.9)] enabled:hover:bg-dg-cyan/[0.12]'
+                      ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(56,189,248,.9)] enabled:hover:bg-dg-cyan/[0.12]'
                       : 'border-dg-line bg-white/[0.02] enabled:hover:border-white/20 enabled:hover:bg-white/[0.05]'}`}>
                   <span className="pt-0.5 font-mono text-[11px] tabular-nums text-slate-500">#{String(i + 1).padStart(2, '0')}</span>
                   <span className="min-w-0 flex-1">
@@ -688,32 +696,32 @@ function KpiPanel({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnapsh
   const ambTone: Tone = !amb ? 'idle' : amb.status === 'ARRIVED' ? 'green' : amb.status === 'STUCK' ? 'red' : amb.status === 'EN_ROUTE' ? 'cyan' : 'idle';
 
   return (
-    <section className="dg-panel overflow-hidden">
+    <section className="dg-panel flex min-h-0 flex-col overflow-hidden">
       <PanelHeader title={dg ? 'DARK GRID · triage' : 'FIFO · first come, first served'} tone={dg ? 'cyan' : m.rho > 1 ? 'red' : 'idle'} />
-      <div className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-3">
+      <div className="grid min-h-0 flex-1 grid-cols-2 gap-1.5 overflow-y-auto p-2 sm:grid-cols-3">
         {kpis.map((k) => {
           const max = Math.max(k.v, k.o, 1e-9);
           const pct = k.o === 0 ? null : ((k.v - k.o) / k.o) * 100;
           const better = k.v < k.o, worse = k.v > k.o;
           return (
-            <div key={k.label} className="rounded-xl border border-dg-line bg-white/[0.02] p-3">
+            <div key={k.label} className="rounded-lg border border-dg-line bg-white/[0.02] px-2.5 py-2">
               <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">{k.label}</p>
-              <p className="mt-1 font-mono text-2xl font-semibold tabular-nums text-slate-50">{k.v.toFixed(k.digits ?? 0)}</p>
-              <div className="mt-2 h-1 rounded-full bg-white/[0.06]">
+              <p className="mt-1 font-mono text-xl font-semibold tabular-nums text-slate-50">{k.v.toFixed(k.digits ?? 0)}</p>
+              <div className="mt-1.5 h-1 rounded-full bg-white/[0.06]">
                 <div className={`h-full rounded-full transition-[width] duration-500 ${dg ? 'bg-dg-cyan' : 'bg-slate-400'}`} style={{ width: `${(k.v / max) * 100}%` }} />
               </div>
-              <p className={`mt-1.5 font-mono text-[10px] tabular-nums ${better ? 'text-dg-green' : worse ? 'text-dg-red' : 'text-slate-500'}`}>
+              <p className={`mt-1 font-mono text-[10px] tabular-nums ${better ? 'text-dg-green' : worse ? 'text-dg-red' : 'text-slate-500'}`}>
                 {pct === null || (!better && !worse) ? `= ${otherName}` : `${better ? '▼' : '▲'} ${Math.abs(pct).toFixed(0)}% vs ${otherName}`}
               </p>
             </div>
           );
         })}
-        <div className="rounded-xl border border-dg-line bg-white/[0.02] p-3">
+        <div className="rounded-lg border border-dg-line bg-white/[0.02] px-2.5 py-2">
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Ambulance</p>
-          <p className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${amb ? 'text-slate-50' : 'text-slate-600'}`}>
+          <p className={`mt-1 font-mono text-xl font-semibold tabular-nums ${amb ? 'text-slate-50' : 'text-slate-600'}`}>
             {amb ? formatT(amb.tripS) : '--:--'}
           </p>
-          <span className={`mt-2 inline-flex items-center gap-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] ${TONE_TEXT[ambTone]}`}>
+          <span className={`mt-1.5 inline-flex items-center gap-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] ${TONE_TEXT[ambTone]}`}>
             <Dot tone={ambTone} pulse={amb?.status === 'STUCK'} />{amb ? amb.status.replace('_', ' ') : 'STANDBY'}
           </span>
         </div>
@@ -740,22 +748,22 @@ function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
   const last = data[data.length - 1];
 
   return (
-    <section className="dg-panel overflow-hidden">
+    <section className="dg-panel flex min-h-0 flex-col overflow-hidden">
       <PanelHeader title="Requests waiting" tone={data.length > 1 ? 'cyan' : 'idle'}>
         <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-slate-400">
           <span aria-hidden="true" className="w-3 border-t border-dashed border-slate-400" />FIFO
         </span>
         <span className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.12em] text-dg-cyan">
-          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-cyan shadow-[0_0_6px_#00f0ff]" />DARK GRID
+          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-cyan shadow-[0_0_6px_#38bdf8]" />DARK GRID
         </span>
       </PanelHeader>
-      <div className="relative p-3">
-        <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img"
+      <div className="relative min-h-0 flex-1 p-2">
+        <svg viewBox={`0 0 ${W} ${H}`} className="h-full w-full" role="img"
           aria-label={last ? `Requests waiting at ${formatT(last.t)}: FIFO ${last.fifo}, DARK GRID ${last.darkgrid}` : 'No data yet'}>
           <defs>
             <linearGradient id={`${uid}dg`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#00f0ff" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="#00f0ff" stopOpacity="0" />
+              <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
             </linearGradient>
             <linearGradient id={`${uid}fifo`} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#94a3b8" stopOpacity="0.16" />
@@ -776,10 +784,10 @@ function ChartPlaceholder({ data }: { data: ChartPoint[] }) {
               <path d={area('fifo')} fill={`url(#${uid}fifo)`} />
               <polyline points={pts('fifo')} fill="none" stroke="#94a3b8" strokeWidth={1.75} strokeDasharray="5 4" strokeLinejoin="round" />
               <path d={area('darkgrid')} fill={`url(#${uid}dg)`} />
-              <polyline points={pts('darkgrid')} fill="none" stroke="#00f0ff" strokeOpacity={0.3} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round" />
-              <polyline points={pts('darkgrid')} fill="none" stroke="#00f0ff" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+              <polyline points={pts('darkgrid')} fill="none" stroke="#38bdf8" strokeOpacity={0.3} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round" />
+              <polyline points={pts('darkgrid')} fill="none" stroke="#38bdf8" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
               <circle cx={x(last.t)} cy={y(last.fifo)} r={3} fill="#94a3b8" />
-              <circle cx={x(last.t)} cy={y(last.darkgrid)} r={3.5} fill="#00f0ff" />
+              <circle cx={x(last.t)} cy={y(last.darkgrid)} r={3.5} fill="#38bdf8" />
             </>
           )}
         </svg>
