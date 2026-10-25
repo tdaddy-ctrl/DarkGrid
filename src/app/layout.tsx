@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import { Chakra_Petch, IBM_Plex_Sans, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
+import { Analytics } from '@vercel/analytics/next';
 
-// Display: Chakra Petch (squared, tactical). Body: IBM Plex Sans. Data: JetBrains Mono.
 const display = Chakra_Petch({
   variable: "--font-chakra",
   subsets: ["latin"],
@@ -31,7 +31,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${display.variable} ${sans.variable} ${mono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        {children}
+        <Analytics />
+      </body>
     </html>
   );
 }
