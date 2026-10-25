@@ -6,7 +6,7 @@
 // deck.gl is loaded inside useEffect, so nothing WebGL runs during server rendering.
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Ambulance as AmbulanceIcon, ChevronLeft, ChevronRight, Cross, Crosshair, House, Info, Layers3 } from 'lucide-react';
+import { Ambulance as AmbulanceIcon, ChevronLeft, ChevronRight, Cross, Crosshair, House, Info, Layers3, TriangleAlert } from 'lucide-react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
 import type { Ambulance, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
@@ -32,7 +32,7 @@ const GLOW = { ...SURFACE_DEPTH, blend: true, blendColorOperation: 'add' as cons
 
 const STATE_RGB: Record<string, Rgba> = {
   DRIVING: [52, 211, 153, 235], REQUESTING_HELP: [255, 42, 84, 255], QUEUED_BEHIND: [251, 146, 60, 245],
-  STAGED: [56, 189, 248, 245], ARRIVED: [148, 163, 184, 200],
+  STAGED: [56, 189, 248, 245], ARRIVED: [148, 163, 184, 200], YIELDING: [250, 204, 21, 255], YIELDED: [45, 212, 191, 245],
 };
 const LEGEND: [string, string][] = [
   ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'], ['Civilian cars', '#9ca3af'],
@@ -207,7 +207,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
   const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
-  const cameraRef = useRef<((cmd: 'left' | 'right' | 'home' | 'in' | 'out') => void) | null>(null);
+  const cameraRef = useRef<((cmd: 'left' | 'right' | 'home' | 'in' | 'out' | 'incident') => void) | null>(null);
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
   const carsRef = useRef(new Glider());
   const ambRef = useRef(new Glider());
@@ -389,17 +389,22 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         let settlePitch = true;
         // On-map buttons ease the camera toward a target instead of jumping.
         let target: MapViewState | null = null;
+        let incidentCamera = 0;
         cameraRef.current = (cmd) => {
           if (followRef.current) {
             if (cmd === 'left' || cmd === 'right') alignHeading = false;
             if (cmd === 'in' || cmd === 'out') settleZoom = false;
           }
-          if (cmd === 'home' && followRef.current) {
+          if ((cmd === 'home' || cmd === 'incident') && followRef.current) {
             followRef.current = false;
             onFollowRef.current?.(false);
           }
           const from = target ?? view;
-          const next = cmd === 'home' ? home : cmd === 'in' || cmd === 'out'
+          const incidents = (snapRef.current.incidents ?? []).filter(i => i.status !== 'CLEARED');
+          const incident = cmd === 'incident' && incidents.length ? incidents[incidentCamera++ % incidents.length] : null;
+          const next = incident ? { ...from, longitude: incident.pos.lng, latitude: incident.pos.lat,
+            zoom: 18.1, pitch: 52, bearing: incident.headingDeg + 20 }
+            : cmd === 'home' ? home : cmd === 'in' || cmd === 'out'
             ? { ...from, zoom: Math.max(0, Math.min(20, from.zoom + (cmd === 'in' ? 0.5 : -0.5))) }
             : { ...from, bearing: (from.bearing ?? 0) + (cmd === 'left' ? -ROTATE_STEP_DEG : ROTATE_STEP_DEG) };
           if (followRef.current) { view = next; target = null; }
@@ -549,7 +554,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           }
           if (!chase) chasing = false;
           const snap = snapRef.current;
-          const hz = hazardRef.current ?? graph.center;
+          const hz = snap.outage?.center ?? hazardRef.current ?? graph.center;
+          const outageRadius = snap.outage?.radiusM ?? OUTAGE_RADIUS_M;
           const center: [number, number, number] = [hz.lng, hz.lat, gz(hz.lng, hz.lat)];
           const outage = snap.darkNodes.length > 0;
           const pulse = (now / 1000) % 2.4 / 2.4;
@@ -566,7 +572,8 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           // Civilian cars advance with sim time (frozen while paused or replaying).
           const simDt = live ? (trafficSimT < 0 ? 0 : Math.max(0, live.t - trafficSimT)) : 0;
           if (live) trafficSimT = live.t;
-          updateTraffic(traffic, simDt, dt, ambNow, darkIds, snap.corridor);
+          updateTraffic(traffic, simDt, dt, ambNow, darkIds, snap.corridor,
+            new Set((snap.incidents ?? []).filter(i => i.status !== 'CLEARED').map(i => i.edgeId)));
           // Positions once per frame; every part layer of the model reads the same array.
           const civilians = traffic.cars.map((c) => {
             const p = civilianPos(traffic, c);
@@ -580,23 +587,23 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             // Power is out: the whole zone drops into shadow, buildings included.
             dyn.push(new L.ScatterplotLayer({
               id: 'blackout-shade', visible: !isPresenting, parameters: SURFACE_DEPTH, data: [0], getPosition: () => center,
-              getRadius: OUTAGE_RADIUS_M, radiusUnits: 'meters', getFillColor: [2, 4, 10, photo ? 120 : 90],
+              getRadius: outageRadius, radiusUnits: 'meters', getFillColor: [2, 4, 10, photo ? 120 : 90],
             }));
             dyn.push(
               new L.ScatterplotLayer({
                 id: 'hazard-glow', visible: !isPresenting, parameters: SURFACE_DEPTH, data: [0.35, 0.65, 1], getPosition: () => center,
-                getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(40 * (1.2 - f) * hazardFade)],
+                getRadius: (f: number) => outageRadius * f, getFillColor: (f: number) => [255, 42, 84, Math.round(40 * (1.2 - f) * hazardFade)],
                 stroked: false, filled: true, radiusUnits: 'meters', updateTriggers: { getFillColor: hazardFade },
               }),
               new L.ScatterplotLayer({
                 id: 'hazard-rings', visible: !isPresenting, parameters: SURFACE_DEPTH, data: [0, 1 / 3, 2 / 3], getPosition: () => center,
-                getRadius: (o: number) => OUTAGE_RADIUS_M * (0.15 + 0.85 * ((pulse + o) % 1)),
+                getRadius: (o: number) => outageRadius * (0.15 + 0.85 * ((pulse + o) % 1)),
                 getLineColor: (o: number) => [255, 42, 84, Math.round(200 * (1 - ((pulse + o) % 1)))],
                 stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 2, radiusUnits: 'meters',
                 updateTriggers: { getRadius: pulse, getLineColor: pulse },
               }),
               new L.ScatterplotLayer({
-                id: 'hazard-edge', parameters: SURFACE_DEPTH, data: [0], getPosition: () => center, getRadius: OUTAGE_RADIUS_M,
+                id: 'hazard-edge', parameters: SURFACE_DEPTH, data: [0], getPosition: () => center, getRadius: outageRadius,
                 getLineColor: isPresenting ? [185, 204, 216, 170] : [255, 42, 84, 150], stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 1.2, radiusUnits: 'meters',
               }),
               new L.ScatterplotLayer({
@@ -611,6 +618,31 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             dyn.push(
               new L.PathLayer({ id: 'corridor-glow', parameters: GLOW, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 170, 48, 95], getWidth: 10, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
               new L.PathLayer({ id: 'corridor', parameters: SURFACE_DEPTH, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 208, 109, 255], getWidth: 3.5, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+            );
+          }
+          const segments = snap.corridorStatus?.segments ?? [];
+          if (segments.length) dyn.push(new L.PathLayer({
+            id: 'corridor-verification', parameters: SURFACE_DEPTH, data: segments,
+            getPath: (s: typeof segments[number]) => [s.from, s.to].map(p => [p.lng, p.lat, gz(p.lng, p.lat) + 1.8] as Pt),
+            getColor: (s: typeof segments[number]) => s.state === 'CLEAR' ? [45, 212, 191, 255] : s.state === 'CLEARING' ? [255, 190, 60, 255] : [255, 95, 110, 255],
+            getWidth: 4, widthUnits: 'pixels', capRounded: true,
+          }));
+          const crashes = (snap.incidents ?? []).filter(i => i.status !== 'CLEARED');
+          if (crashes.length) {
+            const wrecks = crashes.flatMap(i => [-1, 1].map(side => ({
+              pos: { lng: i.pos.lng + side * 3 / mPerLng, lat: i.pos.lat + side * 2 / 110540 }, heading: i.headingDeg + side * 35,
+            })));
+            dyn.push(
+              ...modelLayers('collision-wrecks', civilianParts, wrecks, w => [w.pos.lng, w.pos.lat, gz(w.pos.lng, w.pos.lat) + CAR_LIFT_M], w => w.heading, carScale(), now, () => [140, 42, 45, 255]),
+              new L.ScatterplotLayer({ id: 'collision-marker', parameters: SURFACE_DEPTH, data: crashes,
+                getPosition: (i: typeof crashes[number]) => [i.pos.lng, i.pos.lat, gz(i.pos.lng, i.pos.lat) + 1],
+                getRadius: 14, radiusUnits: 'meters', radiusMinPixels: 9, stroked: true, filled: true,
+                getFillColor: [255, 66, 80, 65], getLineColor: [255, 110, 120, 255], getLineWidth: 2, lineWidthUnits: 'pixels' }),
+              new L.TextLayer({ id: 'collision-label', parameters: SURFACE_DEPTH, data: crashes,
+                getPosition: (i: typeof crashes[number]) => [i.pos.lng, i.pos.lat, gz(i.pos.lng, i.pos.lat) + 7],
+                getText: (i: typeof crashes[number]) => i.status === 'RESPONDING' ? 'COLLISION · RECOVERY ON SCENE' : 'COLLISION · ROAD CLOSED',
+                getSize: 11, getColor: [255, 204, 207, 255], getPixelOffset: [0, -23], billboard: true,
+                background: true, getBackgroundColor: [35, 16, 24, 235], backgroundPadding: [8, 5], fontFamily: 'sans-serif', fontWeight: 600 }),
             );
           }
           dyn.push(
@@ -716,6 +748,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         ))}
       </div>
       <div role="group" aria-label="Camera" className="map-camera-controls">
+        {(snapshot.incidents ?? []).some(i => i.status !== 'CLEARED') && <button type="button" aria-label="View collision" title="Cycle through active collisions" onClick={() => cameraRef.current?.('incident')}><TriangleAlert /></button>}
         {([['left', 'Rotate left', ChevronLeft], ['home', 'Reset view', House], ['right', 'Rotate right', ChevronRight]] as const).map(([cmd, label, Icon]) => (
           <button key={cmd} type="button" aria-label={label} title={label} onClick={() => cameraRef.current?.(cmd)}><Icon /></button>
         ))}

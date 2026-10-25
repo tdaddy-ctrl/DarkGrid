@@ -14,7 +14,7 @@ export type RoadGraph = {
   pois: { fireStation: LatLng; hospital: LatLng; lots: LatLng[] };
 };
 
-export type VehicleState = 'DRIVING' | 'REQUESTING_HELP' | 'QUEUED_BEHIND' | 'STAGED' | 'ARRIVED';
+export type VehicleState = 'DRIVING' | 'REQUESTING_HELP' | 'QUEUED_BEHIND' | 'STAGED' | 'ARRIVED' | 'YIELDING' | 'YIELDED';
 // The ambulance is NOT in vehicles[]; it lives only in SimSnapshot.ambulance.
 export type Vehicle = { id: number; pos: LatLng; headingDeg: number; state: VehicleState;
                         type: 'PASSENGER' | 'EMPTY' };
@@ -31,7 +31,8 @@ export type HelpRequest = {
 // an outage. Only a human approves it (automatic operators skip it). Approving turns the dark
 // signals into four-way stops and clears every open DARK_SIGNAL_CONFIRM request. requestIds is empty.
 export type Job = {
-  id: string; kind: 'BATCH' | 'CORRIDOR' | 'STUCK' | 'SINGLE' | 'FIFO' | 'ZONE_POLICY';
+  id: string; kind: 'BATCH' | 'CORRIDOR' | 'STUCK' | 'SINGLE' | 'FIFO' | 'ZONE_POLICY' | 'COLLISION';
+  incidentId?: string;
   requestIds: string[]; vehicleIds: number[];
   w: number;          // weight: how much answering this job helps (sum of triage weights)
   p: number;          // expected operator handling time, seconds
@@ -64,6 +65,25 @@ export type Ambulance = {
 
 export type LotState = { pos: LatLng; used: number; cap: number };
 
+// Injected scenario incidents, separate from both the robotaxi fleet and visual civilian cars.
+export type CollisionIncident = {
+  id: string; edgeId: number; pos: LatLng; headingDeg: number; createdAt: number;
+  status: 'BLOCKED' | 'RESPONDING' | 'CLEARED'; clearanceS: number; clearAt: number | null;
+};
+export type YieldCommand = {
+  vehicleId: number; edgeId: number; issuedAt: number;
+  state: 'SENT' | 'ACKNOWLEDGED' | 'CLEARING' | 'CLEARED' | 'BLOCKED';
+  reason: string;
+};
+export type CorridorStatus = {
+  active: boolean; commands: YieldCommand[];
+  segments: { edgeId: number; from: LatLng; to: LatLng; state: 'RESERVED' | 'CLEARING' | 'CLEAR' }[];
+};
+export type OutageState = {
+  center: LatLng; radiusM: number; startedAt: number; restoreAt: number | null; restoredAt: number | null;
+  status: 'ACTIVE' | 'RESTORING' | 'RESTORED';
+};
+
 export type SimSnapshot = {
   t: number; mode: 'FIFO' | 'DARKGRID';
   control: ControlMode;
@@ -74,6 +94,10 @@ export type SimSnapshot = {
   jobs: Job[];                      // already sorted, first = answered next
   operators: { id: string; task: string }[];
   metrics: Metrics; policy: Policy;
+  incidents?: CollisionIncident[];
+  corridorStatus?: CorridorStatus;
+  outage?: OutageState | null;
+  scenario?: { seed: number; automatic: boolean; outageAt: number; collisionCount: number };
 };
 
 // Everything the UI can ask the sim to do. The UI never changes a snapshot directly.

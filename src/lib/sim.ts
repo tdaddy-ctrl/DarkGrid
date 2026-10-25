@@ -5,7 +5,7 @@
 
 import type {
   Ambulance, ControlMode, HelpRequest, Job, LatLng, Metrics, Policy, RoadEdge, RoadGraph,
-  RoadNode, SimSnapshot, Vehicle,
+  RoadNode, SimSnapshot, Vehicle, CollisionIncident, YieldCommand, OutageState, CorridorStatus,
 } from '@/types/sim';
 import * as C from './config';
 import { orderJobs } from './dispatch';
@@ -14,12 +14,15 @@ import { hungarian } from './hungarian';
 
 export type SimMode = 'FIFO' | 'DARKGRID';
 // center defaults to graph.center (the substation point).
-export type SimEvent = { type: 'OUTAGE'; center?: LatLng };
+export type SimEvent =
+  | { type: 'OUTAGE'; center?: LatLng; radiusM?: number; restoreAfterS?: number }
+  | { type: 'COLLISION'; edgeId?: number; clearanceS?: number };
 
 type Place = 'ROAD' | 'BOX' | 'CURB' | 'LOT' | 'OFF';
 
 type Lane = {
   id: number; edgeId: number; from: number; to: number; len: number; headingDeg: number;
+  obstacleS: number;
   cars: Agent[];                    // front (closest to `to`) first
 };
 
@@ -35,6 +38,7 @@ type Agent = {
   stoppedS: number;
   requestId: string | null;
   lot: number;                      // index into sim.lots, -1 = none
+  yieldStartT: number | null;
 };
 
 type NodeState = {
@@ -60,6 +64,13 @@ export type Sim = {
   requests: Map<string, Req>; reqSeq: number; arrivals: number[];
   operators: Operator[]; review: { job: Job; endT: number } | null; answered: number;
   jobs: Job[]; seenJobs: Map<string, Job>; metrics: Metrics; blockingVehMin: number;
+  seed: number; eventRng: () => number; randomEvents: boolean;
+  plannedOutage: { at: number; center: LatLng; radiusM: number; restoreAfterS: number };
+  plannedCollisions: { delayS: number; edgeId: number; clearanceS: number; fired: boolean }[];
+  outage: OutageState | null; restoreTimes: Map<number, number>;
+  incidents: (CollisionIncident & { assigned: boolean })[];
+  yieldCommands: Map<number, YieldCommand>;
+  routeCache: Map<string, Lane[] | null>;
 };
 
 const SUBSTEP_S = 0.5;
@@ -136,23 +147,27 @@ export function makeGridGraph(n = 9, spacingM = 250): RoadGraph {
   };
 }
 
-const CORRIDOR_PENALTY = 50;   // other vehicles stay off the ambulance corridor unless there's no other way
+function edgeBlocked(sim: Sim, edgeId: number): boolean {
+  return sim.incidents.some(i => i.edgeId === edgeId && i.status !== 'CLEARED');
+}
 
 // B's shortestPath returns node ids; the sim drives lanes, so map each step to its lane.
 function route(sim: Sim, from: number, to: number, avoidCorridor: boolean): Lane[] | null {
   if (from === to) return [];
-  const cost = avoidCorridor
-    ? (e: RoadEdge) => e.lengthM * (sim.corridorEdges.has(e.id) ? CORRIDOR_PENALTY : 1)
-    : (e: RoadEdge) => e.lengthM;
+  const key = `${from}:${to}:${avoidCorridor}`;
+  if (sim.routeCache.has(key)) return sim.routeCache.get(key)?.slice() ?? null;
+  const cost = (e: RoadEdge) => edgeBlocked(sim, e.id) || (avoidCorridor && sim.corridorEdges.has(e.id)) ? Infinity : e.lengthM;
   const path = shortestPath(sim.graph, from, to, cost);
-  if (!path) return null;
+  if (!path) { sim.routeCache.set(key, null); return null; }
   const lanes: Lane[] = [];
   for (let i = 1; i < path.length; i++) {
     const lane = sim.laneByStep.get(`${path[i - 1]}>${path[i]}`);
     if (!lane) return null;
     lanes.push(lane);
   }
-  return lanes;
+  if (sim.routeCache.size > 2000) sim.routeCache.clear();
+  sim.routeCache.set(key, lanes);
+  return lanes.slice();
 }
 
 function nodeDist(sim: Sim, a: number, b: number): number {
@@ -216,7 +231,7 @@ function stagingLots(graph: RoadGraph): LatLng[] {
 function lotInBlackout(sim: Sim, lot: Lot): boolean {
   if (!sim.outageXY) return false;
   const n = sim.nodes.get(lot.node)!.node;
-  return Math.hypot(n.x - sim.outageXY.x, n.y - sim.outageXY.y) <= C.OUTAGE_RADIUS_M;
+  return Math.hypot(n.x - sim.outageXY.x, n.y - sim.outageXY.y) <= (sim.outage?.radiusM ?? C.OUTAGE_RADIUS_M);
 }
 
 function assignLot(sim: Sim, from: number): number {
@@ -238,15 +253,15 @@ function policyFor(mode: SimMode): Policy {
     : { dispatch: 'WSPT_TRIAGE', batchMax: 40, darkSignalsAsFourWayStop: [], triageWeights: { ...C.DEFAULT_WEIGHTS } };
 }
 
-export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
+export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options: { randomEvents?: boolean } = {}): Sim {
   const nodes = new Map<number, NodeState>();
   for (const node of graph.nodes) nodes.set(node.id, { node, out: [], in: [], dark: false, nextPassT: 0, box: [], curb: [] });
 
   const lanes: Lane[] = [];
   const laneByStep = new Map<string, Lane>();
-  const addLane = (edgeId: number, from: number, to: number, len: number) => {
+  const addLane = (edgeId: number, from: number, to: number, len: number, fraction = 0.55) => {
     const a = nodes.get(from)!.node, b = nodes.get(to)!.node;
-    const lane: Lane = { id: lanes.length, edgeId, from, to, len: Math.max(1, len), headingDeg: bearingDeg(b.x - a.x, b.y - a.y), cars: [] };
+    const lane: Lane = { id: lanes.length, edgeId, from, to, len: Math.max(1, len), obstacleS: Math.max(1, len) * fraction, headingDeg: bearingDeg(b.x - a.x, b.y - a.y), cars: [] };
     lanes.push(lane);
     const key = `${from}>${to}`;
     const prev = laneByStep.get(key);
@@ -256,12 +271,12 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
   };
   for (const e of graph.edges) {
     addLane(e.id, e.from, e.to, e.lengthM);
-    if (!e.oneway) addLane(e.id, e.to, e.from, e.lengthM);
+    if (!e.oneway) addLane(e.id, e.to, e.from, e.lengthM, 0.45);
   }
 
   const blankAgent = (id: number, type: Agent['type']): Agent => ({
     id, type, place: 'OFF', lane: -1, s: 0, speed: 0, route: [], dest: -1, boxNode: -1,
-    decided: false, held: false, override: false, stoppedS: 0, requestId: null, lot: -1,
+    decided: false, held: false, override: false, stoppedS: 0, requestId: null, lot: -1, yieldStartT: null,
   });
 
   const sim: Sim = {
@@ -276,6 +291,9 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
     review: null, answered: 0, jobs: [], seenJobs: new Map(),
     metrics: { requests: 0, jobs: 0, lambdaPerMin: 0, rho: 0, blockingVehMin: 0, stuck: 0, darkCount: 0, ambulanceTripS: null },
     blockingVehMin: 0,
+    seed: seed >>> 0, eventRng: mulberry32(seed ^ 0x5a17c0de), randomEvents: options.randomEvents ?? false,
+    plannedOutage: { at: Infinity, center: graph.center, radiusM: C.OUTAGE_RADIUS_M, restoreAfterS: 300 },
+    plannedCollisions: [], outage: null, restoreTimes: new Map(), incidents: [], yieldCommands: new Map(), routeCache: new Map(),
   };
 
   // Ambulance route: fire station -> hospital. Same in both modes.
@@ -283,6 +301,23 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode): Sim {
   const hosp = nearestNode(graph, graph.pois.hospital);
   sim.ambRoute = route(sim, fire, hosp, false) ?? [];
   sim.amb.dest = hosp;
+
+  // A separate event RNG means traffic/policy decisions cannot change the world's incident schedule.
+  const between = (range: readonly [number, number]) => Math.round(range[0] + sim.eventRng() * (range[1] - range[0]));
+  sim.plannedOutage = {
+    at: between(C.RANDOM_OUTAGE_START_S),
+    center: graph.nodes[Math.floor(sim.eventRng() * graph.nodes.length)],
+    radiusM: between(C.RANDOM_OUTAGE_RADIUS_M), restoreAfterS: between(C.RANDOM_RESTORATION_DELAY_S),
+  };
+  if (sim.randomEvents) {
+    const primary = sim.ambRoute.length ? sim.ambRoute[Math.floor(sim.ambRoute.length * (0.3 + sim.eventRng() * 0.4))].edgeId : graph.edges[0]?.id;
+    const others = graph.edges.filter(e => e.id !== primary);
+    const secondary = others[Math.floor(sim.eventRng() * others.length)]?.id;
+    for (const [index, edgeId] of [primary, secondary].entries()) if (edgeId !== undefined) {
+      sim.plannedCollisions.push({ delayS: index ? 90 + Math.floor(sim.eventRng() * 45) : 15 + Math.floor(sim.eventRng() * 20),
+        edgeId, clearanceS: between(C.COLLISION_CLEARANCE_S), fired: false });
+    }
+  }
 
   // Place vehicles on random lanes with room.
   for (let i = 0; i < C.VEHICLES; i++) {
@@ -350,6 +385,12 @@ function resolveRequest(sim: Sim, id: string) {
 
 function resolveJob(sim: Sim, job: Job) {
   if (job.kind === 'ZONE_POLICY') approveZonePolicy(sim);
+  if (job.kind === 'COLLISION') {
+    const incident = sim.incidents.find(i => i.id === job.incidentId);
+    if (incident?.status === 'BLOCKED') {
+      incident.status = 'RESPONDING'; incident.clearAt = sim.t + incident.clearanceS;
+    }
+  }
   for (const id of job.requestIds) resolveRequest(sim, id);
 }
 
@@ -367,6 +408,7 @@ function darkNodeIds(sim: Sim): number[] {
 function zoneJob(sim: Sim): Job | null {
   if (sim.mode !== 'DARKGRID' || sim.outageT === null || sim.zonePolicy || sim.zoneJobTaken) return null;
   const dark = darkNodeIds(sim).length;
+  if (!dark) return null;
   let waiting = 0;
   for (const r of sim.requests.values()) if (r.reason === 'DARK_SIGNAL_CONFIRM') waiting++;
   const pct = (p: number) => `${Math.round(p * 100)}%`;
@@ -402,12 +444,26 @@ function currentJobs(sim: Sim): Job[] {
   for (const r of sim.requests.values()) {
     if (r.assigned) continue;
     r.queuedBehind = queuedBehind(sim, sim.agents[r.vehicleId]);
+    r.onCorridor = sim.corridorActive && sim.corridorNodes.has(r.nodeId);
     open.push({
       id: r.id, vehicleId: r.vehicleId, nodeId: r.nodeId, reason: r.reason, createdAt: r.createdAt,
       onCorridor: r.onCorridor, insideBox: r.insideBox, queuedBehind: r.queuedBehind, passenger: r.passenger,
     });
   }
   const jobs = orderJobs(open, sim.policy);
+  for (const incident of sim.incidents) {
+    if (incident.status !== 'BLOCKED' || incident.assigned) continue;
+    const corridor = sim.corridorEdges.has(incident.edgeId);
+    const queued = sim.lanes.filter(l => l.edgeId === incident.edgeId).reduce((sum, l) => sum + l.cars.length, 0);
+    jobs.push({ id: `job-${incident.id}`, incidentId: incident.id, kind: 'COLLISION', requestIds: [], vehicleIds: [],
+      w: (corridor ? C.DEFAULT_WEIGHTS.onCorridor : 0) + C.DEFAULT_WEIGHTS.insideBox + queued,
+      p: C.SERVICE_SINGLE_S, createdAt: incident.createdAt, title: 'Dispatch collision recovery',
+      sub: `Road ${incident.edgeId} closed · dispatch recovery, then ${incident.clearanceS} sim s on scene`,
+      breakdown: [{ label: 'on corridor', value: corridor ? C.DEFAULT_WEIGHTS.onCorridor : 0 },
+        { label: 'inside box', value: 0 }, { label: 'queued behind', value: queued }, { label: 'road obstruction', value: C.DEFAULT_WEIGHTS.insideBox }] });
+  }
+  jobs.sort((a, b) => (sim.mode === 'DARKGRID' ? b.w / b.p - a.w / a.p : 0)
+    || a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const zone = zoneJob(sim);
   return zone ? [zone, ...jobs] : jobs;
 }
@@ -436,6 +492,10 @@ function successor(sim: Sim, jobId: string): Job | undefined {
 
 function takeJob(sim: Sim, job: Job) {
   if (job.kind === 'ZONE_POLICY') sim.zoneJobTaken = true;
+  if (job.incidentId) {
+    const incident = sim.incidents.find(i => i.id === job.incidentId);
+    if (incident) incident.assigned = true;
+  }
   for (const id of job.requestIds) {
     const r = sim.requests.get(id);
     if (r) r.assigned = true;
@@ -444,7 +504,115 @@ function takeJob(sim: Sim, job: Job) {
 
 // ---------- movement ----------
 
+function remainingAmbulanceLanes(sim: Sim): Lane[] {
+  return sim.amb.place === 'ROAD' ? [sim.lanes[sim.amb.lane], ...sim.amb.route] : sim.ambRoute;
+}
+
+function rerouteAmbulance(sim: Sim) {
+  if (sim.arriveT !== null) return;
+  const from = sim.amb.place === 'ROAD' ? sim.lanes[sim.amb.lane].to : sim.ambRoute[0]?.from;
+  if (from === undefined) return;
+  const path = route(sim, from, sim.amb.dest, false);
+  if (!path) return; // A disconnected route stays blocked until recovery; never teleport through it.
+  if (sim.amb.place === 'ROAD') { sim.amb.route = path; sim.ambRoute = [sim.lanes[sim.amb.lane], ...path]; }
+  else sim.ambRoute = path;
+}
+
+function updateCorridor(sim: Sim) {
+  if (sim.mode !== 'DARKGRID') return;
+  const active = sim.outageT !== null && sim.t >= sim.outageT + C.AMBULANCE_DISPATCH_DELAY_S - C.CORRIDOR_LEAD_S && sim.arriveT === null;
+  const reserved: Lane[] = [];
+  let distance = 0;
+  if (active) for (const lane of remainingAmbulanceLanes(sim)) {
+    reserved.push(lane); distance += lane.len;
+    if (distance >= C.CORRIDOR_LOOKAHEAD_M) break;
+  }
+  const edges = new Set(reserved.map(l => l.edgeId));
+  const changed = active !== sim.corridorActive || edges.size !== sim.corridorEdges.size || [...edges].some(id => !sim.corridorEdges.has(id));
+  sim.corridorActive = active;
+  if (!changed) return;
+  sim.corridorEdges = edges;
+  sim.corridorNodes = new Set(reserved.flatMap(l => [l.from, l.to]));
+  sim.routeCache.clear();
+  for (const a of sim.agents) {
+    if (a.place !== 'ROAD' && a.place !== 'BOX' && a.place !== 'CURB') continue;
+    if (a.route.some(l => edges.has(l.edgeId) || edgeBlocked(sim, l.edgeId))) {
+      newTripTo(sim, a, a.place === 'ROAD' ? sim.lanes[a.lane].to : a.boxNode, a.dest);
+    }
+  }
+  if (active) for (const a of sim.agents) {
+    const edgeId = a.lane >= 0 ? sim.lanes[a.lane].edgeId : -1;
+    sim.yieldCommands.set(a.id, { vehicleId: a.id, edgeId, issuedAt: sim.t, state: 'SENT',
+      reason: edges.has(edgeId) ? 'Yield instruction sent to a corridor occupant' : 'Route exclusion sent to the fleet' });
+  }
+}
+
+function locallyApproaching(sim: Sim, a: Agent): boolean {
+  if (sim.dispatchT === null || sim.arriveT !== null || sim.amb.place !== 'ROAD' || a.place !== 'ROAD') return false;
+  const lane = sim.lanes[a.lane];
+  if (!remainingAmbulanceLanes(sim).slice(0, 2).some(l => l.edgeId === lane.edgeId)) return false;
+  if (a.lane === sim.amb.lane && a.s < sim.amb.s) return false;
+  const p = agentPos(sim, a), q = agentPos(sim, sim.amb);
+  const d = toXY(p, q);
+  return Math.hypot(d.x, d.y) <= C.LOCAL_EMERGENCY_YIELD_M;
+}
+
+function yieldVehicles(sim: Sim) {
+  for (const a of sim.agents) {
+    if (a.place === 'ROAD' && a.yieldStartT !== null && sim.t >= a.yieldStartT + C.YIELD_MANEUVER_S) {
+      const lane = sim.lanes[a.lane];
+      lane.cars.splice(lane.cars.indexOf(a), 1);
+      a.place = 'CURB'; a.boxNode = lane.to; sim.nodes.get(lane.to)!.curb.push(a);
+    }
+    const lane = a.lane >= 0 ? sim.lanes[a.lane] : null;
+    const needsCommand = lane && sim.corridorActive && (sim.corridorEdges.has(lane.edgeId)
+      || (a.place === 'BOX' && sim.corridorNodes.has(a.boxNode)));
+    let command = sim.yieldCommands.get(a.id);
+    if (needsCommand && (a.place === 'ROAD' || a.place === 'BOX') && (!command || command.state === 'CLEARED')) {
+      command = { vehicleId: a.id, edgeId: lane.edgeId, issuedAt: sim.t, state: 'SENT', reason: 'Awaiting vehicle acknowledgement' };
+      sim.yieldCommands.set(a.id, command);
+    }
+    if (command && sim.t >= command.issuedAt + C.YIELD_ACK_S) {
+      if (a.place === 'CURB' || a.place === 'LOT' || a.place === 'OFF' || !needsCommand) {
+        command.state = 'CLEARED'; command.reason = 'Vehicle confirmed outside the reserved road';
+      } else if (a.yieldStartT !== null) {
+        command.state = 'CLEARING'; command.reason = 'Pulling into a reserved curb space';
+      } else if (a.place === 'BOX' || a.held || a.requestId && sim.requests.get(a.requestId)?.reason === 'DARK_SIGNAL_CONFIRM') {
+        command.state = 'BLOCKED'; command.reason = 'Safety confirmation required; escalated to an operator';
+      } else {
+        command.state = 'ACKNOWLEDGED'; command.reason = 'Looking for a safe curb space';
+      }
+    }
+    if (a.place !== 'ROAD' || a.yieldStartT !== null || a.held || a.requestId && sim.requests.get(a.requestId)?.reason === 'DARK_SIGNAL_CONFIRM') continue;
+    const coordinated = needsCommand && command && sim.t >= command.issuedAt + C.YIELD_ACK_S;
+    if (!coordinated && !locallyApproaching(sim, a)) continue;
+    const occupied = sim.agents.filter(other => other.lane === a.lane && other.yieldStartT !== null).length;
+    // No curb parking within the intersection/stop line, and no unlimited curb capacity.
+    if (occupied >= C.CURB_SLOTS_PER_LANE || lane!.len < 2 * C.GAP_M || a.s > lane!.len - C.GAP_M) {
+      if (command) { command.state = 'BLOCKED'; command.reason = 'No safe curb space; clearing via the next intersection'; }
+      continue;
+    }
+    if (a.requestId) resolveRequest(sim, a.requestId);
+    a.yieldStartT = sim.t; a.speed = 0;
+    if (command) { command.state = 'CLEARING'; command.reason = 'Pulling into a reserved curb space'; }
+  }
+}
+
+function corridorView(sim: Sim): CorridorStatus {
+  const commands = [...sim.yieldCommands.values()].map(c => ({ ...c }));
+  const segments: CorridorStatus['segments'] = [];
+  if (sim.corridorActive) for (const lane of remainingAmbulanceLanes(sim)) {
+    if (!sim.corridorEdges.has(lane.edgeId)) continue;
+    const blocked = edgeBlocked(sim, lane.edgeId) || sim.lanes.some(l => l.edgeId === lane.edgeId && l.cars.some(a => a.type !== 'AMBULANCE'))
+      || [lane.from, lane.to].some(id => sim.nodes.get(id)!.box.length > 0);
+    segments.push({ edgeId: lane.edgeId, from: sim.nodes.get(lane.from)!.node, to: sim.nodes.get(lane.to)!.node,
+      state: blocked ? commands.some(c => c.edgeId === lane.edgeId && c.state === 'CLEARING') ? 'CLEARING' : 'RESERVED' : 'CLEAR' });
+  }
+  return { active: sim.corridorActive, commands, segments };
+}
+
 function enterLane(sim: Sim, a: Agent, lane: Lane): boolean {
+  if (edgeBlocked(sim, lane.edgeId) || (a.type !== 'AMBULANCE' && sim.corridorActive && sim.corridorEdges.has(lane.edgeId))) return false;
   const back = lane.cars[lane.cars.length - 1];
   if (back && back.s < C.GAP_M) return false;
   lane.cars.push(a);
@@ -459,7 +627,23 @@ function enterLane(sim: Sim, a: Agent, lane: Lane): boolean {
 // The front car of `lane` is at the stop line. Returns nothing; moves it if allowed.
 function atStopLine(sim: Sim, a: Agent, lane: Lane) {
   const ns = sim.nodes.get(lane.to)!;
+  if (a.yieldStartT !== null) return;
 
+  if (a.route.length && (edgeBlocked(sim, a.route[0].edgeId) || a.type !== 'AMBULANCE' && sim.corridorEdges.has(a.route[0].edgeId))) {
+    const detour = route(sim, lane.to, a.dest, a.type !== 'AMBULANCE' && sim.corridorActive);
+    const exit = a.type === 'AMBULANCE' ? undefined : ns.out.find(l => !edgeBlocked(sim, l.edgeId) && !sim.corridorEdges.has(l.edgeId));
+    if (detour?.length) a.route = detour;
+    else if (exit) a.route = [exit]; // Leave the corridor; keep the original destination for later.
+    else return;
+  }
+
+  if (a.route.length === 0) {
+    if (a.dest !== lane.to) {
+      const path = route(sim, lane.to, a.dest, a.type !== 'AMBULANCE' && sim.corridorActive);
+      if (!path?.length) return;
+      a.route = path;
+    }
+  }
   if (a.route.length === 0) {
     if (a.type === 'AMBULANCE') {
       lane.cars.shift(); a.place = 'OFF'; sim.arriveT = sim.t;
@@ -508,7 +692,19 @@ function atStopLine(sim: Sim, a: Agent, lane: Lane) {
 
 // A released car leaves the box or the curb into its next lane.
 function leaveNode(sim: Sim, a: Agent, list: Agent[]) {
-  if (a.route.length === 0) newTrip(sim, a, a.boxNode);
+  if (a.yieldStartT !== null) {
+    const ambulanceAhead = sim.arriveT === null && remainingAmbulanceLanes(sim).some(l => l.edgeId === sim.lanes[a.lane].edgeId);
+    if (sim.dispatchT === null || ambulanceAhead) return;
+    a.yieldStartT = null;
+  }
+  if (!a.route.length || a.route.some(l => edgeBlocked(sim, l.edgeId) || sim.corridorActive && sim.corridorEdges.has(l.edgeId))) {
+    if (a.dest === a.boxNode) newTrip(sim, a, a.boxNode);
+    else {
+      const path = route(sim, a.boxNode, a.dest, sim.corridorActive);
+      if (!path) return;
+      a.route = path;
+    }
+  }
   if (a.route.length === 0 || !enterLane(sim, a, a.route[0])) return;
   list.splice(list.indexOf(a), 1);
   a.route.shift();
@@ -528,16 +724,45 @@ function tick(sim: Sim, dt: number) {
   const prevT = sim.t;
   sim.t += dt;
 
+  if (sim.randomEvents && sim.outageT === null && sim.t >= sim.plannedOutage.at) {
+    injectEvent(sim, { type: 'OUTAGE', center: sim.plannedOutage.center, radiusM: sim.plannedOutage.radiusM, restoreAfterS: sim.plannedOutage.restoreAfterS });
+  }
+  for (const incident of sim.plannedCollisions) {
+    if (!incident.fired && sim.outageT !== null && sim.t >= sim.outageT + incident.delayS) {
+      incident.fired = true;
+      injectEvent(sim, { type: 'COLLISION', edgeId: incident.edgeId, clearanceS: incident.clearanceS });
+    }
+  }
+  for (const incident of sim.incidents) {
+    if (incident.status === 'RESPONDING' && incident.clearAt !== null && sim.t >= incident.clearAt) {
+      incident.status = 'CLEARED'; sim.routeCache.clear();
+    }
+  }
+  if (sim.outage?.restoreAt !== null && sim.outage?.restoreAt !== undefined && sim.t >= sim.outage.restoreAt) {
+    sim.outage.status = 'RESTORING';
+    for (const [id, at] of sim.restoreTimes) if (sim.t >= at) sim.nodes.get(id)!.dark = false;
+    for (const r of [...sim.requests.values()]) if (r.reason === 'DARK_SIGNAL_CONFIRM' && !sim.nodes.get(r.nodeId)!.dark) resolveRequest(sim, r.id);
+    sim.policy.darkSignalsAsFourWayStop = sim.zonePolicy ? darkNodeIds(sim) : [];
+    if (sim.outage.restoredAt !== null && sim.t >= sim.outage.restoredAt) {
+      sim.outage.status = 'RESTORED';
+    }
+  }
+
   if (sim.outageT !== null && sim.dispatchT === null && sim.t >= sim.outageT + C.AMBULANCE_DISPATCH_DELAY_S) {
     sim.dispatchT = sim.outageT + C.AMBULANCE_DISPATCH_DELAY_S;
   }
+  updateCorridor(sim);
+  yieldVehicles(sim);
   placeAmbulance(sim);
 
   // Move: each car drives up to the car ahead (or the stop line).
   for (const lane of sim.lanes) {
     for (let i = 0; i < lane.cars.length; i++) {
       const a = lane.cars[i];
-      const limit = i === 0 ? lane.len : lane.cars[i - 1].s - C.GAP_M;
+      if (a.yieldStartT !== null) { a.speed = 0; continue; }
+      let limit = i === 0 ? lane.len : lane.cars[i - 1].s - C.GAP_M;
+      const obstacle = lane.obstacleS;
+      if (edgeBlocked(sim, lane.edgeId) && a.s < obstacle) limit = Math.min(limit, obstacle - C.GAP_M);
       const ns = Math.min(a.s + C.CRUISE_MPS * dt, Math.max(a.s, limit));
       a.speed = (ns - a.s) / dt;
       a.s = ns;
@@ -558,6 +783,7 @@ function tick(sim: Sim, dt: number) {
     if (a.place === 'BOX') blocking++;
     if (a.place !== 'ROAD') continue;
     if (a.speed < 0.1) { a.stoppedS += dt; blocking++; } else a.stoppedS = 0;
+    if (a.yieldStartT !== null) continue;
     if (a.stoppedS >= C.STUCK_TIMEOUT_S && !a.requestId) createRequest(sim, a, sim.lanes[a.lane].to, 'STUCK', false);
   }
   sim.blockingVehMin += (blocking * dt) / 60;
@@ -599,7 +825,7 @@ function updateMetrics(sim: Sim) {
   let darkCount = 0;
   for (const ns of sim.nodes.values()) if (ns.dark) darkCount++;
   sim.metrics = {
-    requests: sim.requests.size,
+    requests: sim.requests.size + sim.incidents.filter(i => i.status === 'BLOCKED').length,
     jobs: sim.jobs.length,
     lambdaPerMin,
     rho: lambdaPerMin / ((C.OPERATORS * 60) / C.SERVICE_SINGLE_S),
@@ -635,39 +861,52 @@ export function pickOutageCenter(sim: Sim, u1: number, u2: number, u3: number): 
 }
 
 export function injectEvent(sim: Sim, event: SimEvent) {
-  if (event.type !== 'OUTAGE' || sim.outageT !== null) return;
+  if (event.type === 'COLLISION') {
+    const road = sim.graph.edges.find(e => e.id === event.edgeId) ?? (event.edgeId === undefined ? sim.graph.edges.find(e => e.id === pickCollisionEdge(sim)) : undefined);
+    if (!road || sim.incidents.length >= C.MAX_COLLISION_INCIDENTS || edgeBlocked(sim, road.id)) return;
+    const a = sim.nodes.get(road.from)!.node, b = sim.nodes.get(road.to)!.node;
+    sim.incidents.push({ id: `collision-${sim.incidents.length + 1}`, edgeId: road.id, pos: lerp(a, b, 0.55),
+      headingDeg: bearingDeg(b.x - a.x, b.y - a.y), createdAt: sim.t, assigned: false,
+      status: 'BLOCKED', clearanceS: Number.isFinite(event.clearanceS) && event.clearanceS! > 0 ? event.clearanceS! : C.COLLISION_CLEARANCE_S[0], clearAt: null });
+    sim.arrivals.push(sim.t); sim.routeCache.clear();
+    if (sim.mode === 'DARKGRID') {
+      rerouteAmbulance(sim);
+      for (const car of sim.agents) if (car.place === 'ROAD' && car.route.some(l => l.edgeId === road.id)) newTripTo(sim, car, sim.lanes[car.lane].to, car.dest);
+    }
+    updateCorridor(sim); refreshJobs(sim); updateMetrics(sim);
+    return;
+  }
+  if (sim.outageT !== null) return;
   sim.outageT = sim.t;
   const c = toXY(sim.graph.center, event.center ?? sim.graph.center);
   sim.outageXY = c;
+  const radiusM = Number.isFinite(event.radiusM) && event.radiusM! > 0 ? event.radiusM! : C.OUTAGE_RADIUS_M;
+  const restoreAt = Number.isFinite(event.restoreAfterS) && event.restoreAfterS! > 0 ? sim.t + event.restoreAfterS! : null;
+  sim.outage = { center: { ...(event.center ?? sim.graph.center) }, radiusM, startedAt: sim.t, restoreAt,
+    restoredAt: restoreAt === null ? null : restoreAt + C.RESTORATION_SPREAD_S, status: 'ACTIVE' };
   for (const ns of sim.nodes.values()) {
-    if (Math.hypot(ns.node.x - c.x, ns.node.y - c.y) <= C.OUTAGE_RADIUS_M) {
+    if (Math.hypot(ns.node.x - c.x, ns.node.y - c.y) <= radiusM) {
       ns.dark = true; ns.nextPassT = sim.t;
+      if (restoreAt !== null) sim.restoreTimes.set(ns.node.id, restoreAt + sim.eventRng() * C.RESTORATION_SPREAD_S);
     }
   }
-  if (sim.mode !== 'DARKGRID') return;
+  if (sim.mode === 'DARKGRID') stageEmptyCars(sim);
+  refreshJobs(sim); updateMetrics(sim);
+}
 
-  // DARK GRID: open the ambulance corridor and stage empty cars right away. The zone policy
-  // waits for a human to approve its card (answerJob); automatic operators skip it.
-  refreshJobs(sim);
-  sim.corridorActive = true;
-  for (const lane of sim.ambRoute) {
-    sim.corridorEdges.add(lane.edgeId);
-    sim.corridorNodes.add(lane.from);
-    sim.corridorNodes.add(lane.to);
-  }
-  stageEmptyCars(sim);
-  for (const a of sim.agents) {
-    if (a.place !== 'ROAD' || a.lot >= 0) continue;
-    const from = sim.lanes[a.lane].to;
-    if (a.type === 'EMPTY' || a.route.some((l) => sim.corridorEdges.has(l.edgeId))) newTripTo(sim, a, from, a.dest);
-  }
+export function pickCollisionEdge(sim: Sim): number | undefined {
+  const ahead = remainingAmbulanceLanes(sim).filter(l => !edgeBlocked(sim, l.edgeId));
+  return ahead[Math.floor(ahead.length * 0.45)]?.edgeId ?? sim.graph.edges.find(e => !edgeBlocked(sim, e.id))?.id;
 }
 
 // Reroute keeping the same destination (EMPTY cars get a lot instead).
 function newTripTo(sim: Sim, a: Agent, from: number, dest: number) {
-  if (a.type === 'EMPTY') { newTrip(sim, a, from); return; }
-  const path = route(sim, from, dest, true);
+  const path = route(sim, from, dest, sim.corridorActive);
   if (path) a.route = path;
+  else {
+    const exit = sim.nodes.get(from)!.out.find(l => !edgeBlocked(sim, l.edgeId) && !sim.corridorEdges.has(l.edgeId));
+    if (exit) a.route = [exit];
+  }
 }
 
 export function setControl(sim: Sim, control: ControlMode) {
@@ -677,6 +916,10 @@ export function setControl(sim: Sim, control: ControlMode) {
     // The automatic operators stop; their unfinished jobs go back in the queue.
     for (const op of sim.operators) {
       if (!op.job) continue;
+      if (op.job.incidentId) {
+        const incident = sim.incidents.find(i => i.id === op.job!.incidentId);
+        if (incident) incident.assigned = false;
+      }
       for (const id of op.job.requestIds) {
         const r = sim.requests.get(id);
         if (r) r.assigned = false;
@@ -706,8 +949,15 @@ function agentPos(sim: Sim, a: Agent): LatLng {
     return { lat: n.lat, lng: n.lng };
   }
   const lane = sim.lanes[a.lane];
-  const f = a.place === 'CURB' ? 1 : a.s / lane.len;
-  return lerp(sim.nodes.get(lane.from)!.node, sim.nodes.get(lane.to)!.node, f);
+  const f = a.place === 'CURB' && a.yieldStartT === null ? 1 : a.s / lane.len;
+  const pos = lerp(sim.nodes.get(lane.from)!.node, sim.nodes.get(lane.to)!.node, f);
+  if (a.yieldStartT !== null) {
+    const offset = C.YIELD_OFFSET_M * Math.min(1, (sim.t - a.yieldStartT) / C.YIELD_MANEUVER_S);
+    const theta = lane.headingDeg * Math.PI / 180;
+    pos.lng += Math.cos(theta) * offset / (111320 * Math.cos(pos.lat * Math.PI / 180));
+    pos.lat -= Math.sin(theta) * offset / 110540;
+  }
+  return pos;
 }
 
 function ambulanceView(sim: Sim): Ambulance | null {
@@ -733,7 +983,8 @@ function vehicleView(sim: Sim, a: Agent): Vehicle {
     id: a.id,
     pos: agentPos(sim, a),
     headingDeg: a.lane >= 0 ? sim.lanes[a.lane].headingDeg : 0,
-    state: a.place === 'LOT' ? 'STAGED'
+    state: a.yieldStartT !== null ? a.place === 'CURB' ? 'YIELDED' : 'YIELDING'
+      : a.place === 'LOT' ? 'STAGED'
       : a.requestId ? 'REQUESTING_HELP'
       : a.place === 'ROAD' && a.speed < 0.1 ? 'QUEUED_BEHIND' : 'DRIVING',
     type: a.type === 'PASSENGER' ? 'PASSENGER' : 'EMPTY',
@@ -750,10 +1001,10 @@ export function getSnapshot(sim: Sim): SimSnapshot {
   const darkNodes: LatLng[] = [];
   for (const ns of sim.nodes.values()) if (ns.dark) darkNodes.push({ lat: ns.node.lat, lng: ns.node.lng });
   const corridor: LatLng[] = [];
-  if (sim.corridorActive && sim.ambRoute.length) {
-    const first = sim.nodes.get(sim.ambRoute[0].from)!.node;
-    corridor.push({ lat: first.lat, lng: first.lng });
-    for (const lane of sim.ambRoute) { const n = sim.nodes.get(lane.to)!.node; corridor.push({ lat: n.lat, lng: n.lng }); }
+  const protocol = corridorView(sim);
+  if (protocol.segments.length) {
+    corridor.push(protocol.segments[0].from);
+    for (const segment of protocol.segments) corridor.push(segment.to);
   }
   const operators = sim.control === 'MANUAL'
     ? [{ id: 'judge', task: sim.review ? sim.review.job.title : 'idle' }]
@@ -767,6 +1018,10 @@ export function getSnapshot(sim: Sim): SimSnapshot {
     },
     vehicles, ambulance: ambulanceView(sim),
     darkNodes, corridor,
+    incidents: sim.incidents.map(i => ({ id: i.id, edgeId: i.edgeId, pos: { ...i.pos }, headingDeg: i.headingDeg,
+      createdAt: i.createdAt, status: i.status, clearanceS: i.clearanceS, clearAt: i.clearAt })),
+    corridorStatus: protocol, outage: sim.outage ? structuredClone(sim.outage) : null,
+    scenario: { seed: sim.seed, automatic: sim.randomEvents, outageAt: sim.plannedOutage.at, collisionCount: sim.plannedCollisions.length },
     lots: sim.lots.map((l) => ({ pos: l.pos, used: l.used, cap: l.cap })),
     jobs: sim.jobs, operators, metrics: sim.metrics, policy: sim.policy,
   };

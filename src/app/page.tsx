@@ -6,12 +6,13 @@
 // Workspace navigation only changes presentation; the same simulation refs keep running.
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type CSSProperties } from 'react';
+import { Shuffle, TriangleAlert } from 'lucide-react';
 import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
 import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
-  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickOutageCenter, setControl, step, type Sim,
+  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, setControl, step, type Sim,
 } from '@/lib/sim';
-import { HISTORY_EVERY_S, SEED, SIM_SPEED } from '@/lib/config';
+import { HISTORY_EVERY_S, MAX_COLLISION_INCIDENTS, SEED, SIM_SPEED } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
 import { createHistory, push as pushHistory, frameAt, range as historyRange, type History } from '@/lib/history';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
@@ -39,7 +40,8 @@ type View = {
 // with the same eviction boundary, so queue/operator/policy displays rewind together.
 function historyContext(s: SimSnapshot): Omit<SimSnapshot, keyof FrameLite> {
   return { mode: s.mode, control: s.control, manual: s.manual, darkNodes: s.darkNodes,
-    operators: s.operators, policy: s.policy };
+    operators: s.operators, policy: s.policy, incidents: s.incidents, corridorStatus: s.corridorStatus,
+    outage: s.outage, scenario: s.scenario };
 }
 
 function liteFrame(s: SimSnapshot): FrameLite {
@@ -69,6 +71,7 @@ function areaName(p: LatLng): string {
 export default function Home() {
   const [environment, setEnvironment] = useState<Environment>('DOWNTOWN');
   const [generation, setGeneration] = useState(0);
+  const [seed, setSeed] = useState(SEED);
   const [loaded, setLoaded] = useState<{
     environment: Environment; generation: number; graph?: RoadGraph; error?: string;
   } | null>(null);
@@ -113,7 +116,11 @@ export default function Home() {
   return (
     <>
       {current?.graph ? (
-        <Simulation key={`${environment}-${generation}`} graph={current.graph}
+        <Simulation key={`${environment}-${generation}-${seed}`} graph={current.graph} seed={seed}
+          onNewScenario={() => setSeed(currentSeed => {
+            const next = crypto.getRandomValues(new Uint32Array(1))[0];
+            return next === currentSeed ? (currentSeed + 1) >>> 0 : next;
+          })}
           onReset={() => setGeneration(n => n + 1)} envSelect={envSelect} />
       ) : (
         <main className="relative z-10 flex flex-1 flex-col items-center justify-center gap-3 p-6">
@@ -133,7 +140,7 @@ export default function Home() {
 }
 
 // Each environment/run gets its own component instance: refs, clocks and controls reset together.
-function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: () => void; envSelect: ReactNode }) {
+function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph: RoadGraph; seed: number; onReset: () => void; onNewScenario: () => void; envSelect: ReactNode }) {
   const simsRef = useRef<{ fifo: Sim; darkgrid: Sim } | null>(null);
   const chartRef = useRef<ChartPoint[]>([]);
   const pausedRef = useRef(false);
@@ -160,7 +167,6 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const ambDriving = view ? (mode === 'FIFO' ? view.fifo : view.darkgrid).ambulance?.status === 'EN_ROUTE' : false;
   useEffect(() => { slowRef.current = follow && ambDriving; }, [follow, ambDriving]);
   const [proposal, setProposal] = useState<ChaosResult | null>(null);   // Claude's draft for the zone card
-  const [hazard, setHazard] = useState<{ center: LatLng; label: string } | null>(null);   // where this run's blackout hit
 
   const publish = useCallback(() => {
     const sims = simsRef.current;
@@ -192,13 +198,13 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   }, []);
 
   const freshSims = useCallback(() => {
-    simsRef.current = { fifo: createSim(graph, SEED, 'FIFO'), darkgrid: createSim(graph, SEED, 'DARKGRID') };
+    simsRef.current = { fifo: createSim(graph, seed, 'FIFO', { randomEvents: true }), darkgrid: createSim(graph, seed, 'DARKGRID', { randomEvents: true }) };
     chartRef.current = [];
     historyRef.current = createHistory();
     historyContextRef.current.clear();
     playbackTRef.current = null;
     recordHistory(); // Keep t=0; subsequent records happen only at sim-time boundaries.
-  }, [graph, recordHistory]);
+  }, [graph, seed, recordHistory]);
 
   const onScrub = useCallback((t: number) => {
     const history = historyRef.current;
@@ -238,26 +244,36 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     publish();
   }, [publish]);
 
-  const blackout = useCallback(() => {
+  const blackout = useCallback((radiusM?: number) => {
     const sims = simsRef.current;
     if (!sims) return;
     playbackTRef.current = null;
     if (sims.fifo.outageT !== null) return;
-    // A different spot every run (near the ambulance's path); both cities get the same one.
-    const center = pickOutageCenter(sims.fifo, Math.random(), Math.random(), Math.random());
-    injectEvent(sims.fifo, { type: 'OUTAGE', center });
-    injectEvent(sims.darkgrid, { type: 'OUTAGE', center });
-    setHazard({ center, label: `${areaName(center)} substation fire` });
+    const plan = sims.fifo.plannedOutage;
+    const event = { type: 'OUTAGE' as const, center: plan.center, radiusM: radiusM ?? plan.radiusM, restoreAfterS: plan.restoreAfterS };
+    injectEvent(sims.fifo, event);
+    injectEvent(sims.darkgrid, event);
     publish();
   }, [publish]);
 
-  // Only OUTAGE drives the sim today; the other event types are shown but change nothing.
+  const collision = useCallback(() => {
+    const sims = simsRef.current;
+    if (!sims || playbackTRef.current !== null) return;
+    const edgeId = pickCollisionEdge(sims.fifo);
+    if (edgeId === undefined) return;
+    injectEvent(sims.fifo, { type: 'COLLISION', edgeId });
+    injectEvent(sims.darkgrid, { type: 'COLLISION', edgeId });
+    publish();
+  }, [publish]);
+
   // Claude's analysis becomes the draft on the zone-policy card; a human still approves it.
   const onChaos = useCallback((r: ChaosResult) => {
+    if (playbackTRef.current !== null) return;
+    if (r.event.type === 'COLLISION') { collision(); return; }
     if (r.event.type !== 'OUTAGE') return;
     setProposal(r);
-    blackout();
-  }, [blackout]);
+    blackout(r.event.radius_m);
+  }, [blackout, collision]);
 
   // Demo director (B's bar): one button per act of the 3-minute demo, also on keys 0-5.
   // The 3D map reads car positions straight from the sim every frame (smooth motion without
@@ -350,6 +366,7 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
   const rival = mode === 'FIFO' ? view.darkgrid : view.fifo;
   const outage = snap.darkNodes.length > 0;
   const phase = !view.isLive ? 'Replaying history' : outage ? 'Blackout active' : 'City online';
+  const hazard = snap.outage ? { center: snap.outage.center, label: `${areaName(snap.outage.center)} · ${snap.outage.status === 'RESTORING' ? 'Power restoring' : 'Power outage'}` } : null;
   const pendingPolicy = snap.jobs.some(j => j.kind === 'ZONE_POLICY');
   const showLeft = !expanded && surface !== 'compare' && surface !== 'analyze' && leftOpen;
   const showRight = !expanded && surface === 'city' && rightOpen;
@@ -401,6 +418,8 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
             <summary className="icon-button" aria-label="Session controls"><MoreHorizontal /></summary>
             <div className="session-menu-content">
               <p>Simulation controls</p>
+              <button onClick={onNewScenario}><Shuffle />New random scenario</button>
+              <button disabled={!view.isLive || (snap.incidents?.length ?? 0) >= MAX_COLLISION_INCIDENTS} onClick={collision}><TriangleAlert />Inject collision</button>
               <button disabled={view.outageT !== null} onClick={director[1]}><Zap />Trigger blackout <kbd>1</kbd></button>
               <button onClick={director[2]}><UsersRound />Judge takes over FIFO <kbd>2</kbd></button>
               <button onClick={director[3]}><ShieldCheck />Operate DARK GRID <kbd>3</kbd></button>
@@ -446,8 +465,9 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
           {/* Keep these forms mounted so switching destinations never loses an analysis or voice session. */}
           <section className="analysis-workspace" hidden={surface !== 'analyze'} aria-label="Incident analysis">
             <div className="surface-heading"><div><h2>Understand the incident.</h2><p>Analyze an event, review the proposed response, and explain a dispatch decision.</p></div><Sparkles /></div>
+            <ScenarioControls snapshot={snap} readOnly={!view.isLive} onNew={onNewScenario} onCollision={collision} />
             <div className="analysis-columns"><ChaosInjectorPanel onResult={onChaos} /><AskWhyBar active={surface === 'analyze'} jobs={snap.jobs} contextKey={`${snap.mode}-${view.isLive ? 'live' : snap.t}`} /></div>
-            <p className="analysis-note"><ShieldCheck />Policies always need human approval. Only blackout events currently change the simulation.</p>
+            <p className="analysis-note"><ShieldCheck />Blackouts and collisions affect both cities. Zone policy requires human approval. Scenario timing and clearance durations are prototype assumptions.</p>
           </section>
 
           {contextualQueue && <div className={`presentation-queue ${pendingPolicy ? 'policy-only' : ''}`}>
@@ -474,7 +494,8 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
 
         <aside id="mission-panel" className="mission-panel" hidden={!showRight} aria-label="Mission overview">
           <MissionOverview snapshot={snap} rival={rival} graph={graph} follow={follow} onFollow={() => setFollow(v => !v)}
-            onCollapse={() => setRightOpen(false)} onCompare={() => changeSurface('compare')} />
+            onCollapse={() => setRightOpen(false)} onCompare={() => changeSurface('compare')}
+            scenarioControls={<ScenarioControls snapshot={snap} readOnly={!view.isLive} onNew={onNewScenario} onCollision={collision} />} />
         </aside>
       </div>
 
@@ -546,6 +567,7 @@ function BrandMark() {
 
 // Vehicle colors; C's MapView should use the same ones.
 const STATE_COLOR: Record<string, string> = {
+  YIELDING: '#facc15', YIELDED: '#2dd4bf',
   DRIVING: '#34d399', REQUESTING_HELP: '#ff2a54', QUEUED_BEHIND: '#fb923c', STAGED: '#38bdf8', ARRIVED: '#94a3b8',
 };
 const LEGEND: [string, string][] = [
@@ -647,6 +669,12 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
               </g>
             );
           })}
+
+          {(snapshot.incidents ?? []).filter(i => i.status !== 'CLEARED').map(incident => <g key={incident.id} transform={`translate(${px(incident.pos)} ${py(incident.pos)})`}>
+            <circle r={15} fill="#351d2b" stroke="#ff7d8d" strokeWidth={2} />
+            <path d="M-6,-6L6,6M6,-6L-6,6" stroke="#ffb4be" strokeWidth={3} />
+            <text x={0} y={-23} fill="#ffb4be" textAnchor="middle" fontSize={13}>{incident.status === 'RESPONDING' ? 'Recovery on scene' : 'Collision · road closed'}</text>
+          </g>)}
 
           {amb && (
             <g transform={`translate(${px(amb.pos)} ${py(amb.pos)})`}>
@@ -802,23 +830,24 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
     <div className="request-scroll">
       {zone && <ZonePolicyCard job={zone} snapshot={snapshot} proposal={proposal} readOnly={readOnly} onAnswer={onAnswer} />}
       {shown.map(job => {
+        const collision = job.kind === 'COLLISION';
         const corridor = contribution(job, 'on corridor') > 0;
         const blocking = contribution(job, 'inside box') > 0;
         const passenger = contribution(job, 'passenger') > 0;
         const batch = job.requestIds.length > 1;
         const stuck = job.kind === 'STUCK' || job.title.startsWith('Stuck');
-        const label = mode === 'FIFO' ? 'FIFO' : corridor ? 'Corridor' : blocking ? 'Blocking' : batch ? 'Batch' : stuck ? 'Stuck' : 'Confirmation';
-        const title = blocking ? 'Clear a blocked intersection' : stuck ? 'Vehicle unable to proceed' : batch ? 'Confirm dark signals' : 'Confirm a dark signal';
+        const label = collision ? 'Collision' : mode === 'FIFO' ? 'FIFO' : corridor ? 'Corridor' : blocking ? 'Blocking' : batch ? 'Batch' : stuck ? 'Stuck' : 'Confirmation';
+        const title = collision ? 'Dispatch road recovery' : blocking ? 'Clear a blocked intersection' : stuck ? 'Vehicle unable to proceed' : batch ? 'Confirm dark signals' : 'Confirm a dark signal';
         const node = job.sub.match(/node\s+(-?\d+)/)?.[1];
         const weight = snapshot.policy.triageWeights.perQueuedBehind;
         const behind = weight > 0 ? contribution(job, 'queued behind') / weight : null;
-        return <article className={`request-card ${corridor || blocking || stuck ? 'is-urgent' : ''}`} key={job.id}>
-          <div className="request-meta"><span className={`request-kind ${corridor || blocking || stuck ? 'urgent-kind' : ''}`}><span />{label}</span>
+        return <article className={`request-card ${collision || corridor || blocking || stuck ? 'is-urgent' : ''}`} key={job.id}>
+          <div className="request-meta"><span className={`request-kind ${collision || corridor || blocking || stuck ? 'urgent-kind' : ''}`}><span />{label}</span>
             <span className="request-wait" title="Waiting time in simulation seconds"><Clock3 />{formatT(Math.max(0, snapshot.t - job.createdAt))} sim</span>
           </div>
           <h3>{title}</h3>
-          <div className="request-location"><CarFront />{batch ? `${job.vehicleIds.length} vehicles` : `Vehicle #${job.vehicleIds[0]}`}{node && <> · Node {node}</>}</div>
-          <p>{blocking ? `Stopped inside an intersection${corridor ? ' on the ambulance route' : ''}.` : stuck ? 'Waiting in traffic long enough to request operator assistance.' : batch ? 'Answer compatible confirmation requests at this intersection together.' : 'Waiting for an operator to confirm passage through a dark signal.'}</p>
+          <div className="request-location">{collision ? <TriangleAlert /> : <CarFront />}{collision ? 'Two-vehicle incident · road closed' : batch ? `${job.vehicleIds.length} vehicles` : `Vehicle #${job.vehicleIds[0]}`}{node && <> · Node {node}</>}</div>
+          <p>{collision ? job.sub : blocking ? `Stopped inside an intersection${corridor ? ' on the ambulance route' : ''}.` : stuck ? 'Waiting in traffic long enough to request operator assistance.' : batch ? 'Answer compatible confirmation requests at this intersection together.' : 'Waiting for an operator to confirm passage through a dark signal.'}</p>
           <div className="request-tags">{corridor && <span><Route />Ambulance route</span>}{blocking && <span>Inside intersection</span>}{passenger && <span>Passenger</span>}{batch && <span><Layers3 />{job.requestIds.length} requests</span>}</div>
           <details className="job-explanation"><summary><span>{behind !== null && behind > 0 ? `${behind} queued behind · ` : ''}{job.p} s handling</span><CircleHelp /></summary>
             <div><p>Priority {job.w.toFixed(1)} / {job.p} s = {(job.w / job.p).toFixed(2)} per second.</p>{job.breakdown.map(term => <span className="breakdown-term" key={term.label}>{term.label}<strong>{term.value.toFixed(1)}</strong></span>)}</div>
@@ -830,8 +859,8 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
       })}
       {filtered.length > shown.length && <p className="queue-tail">{filtered.length - shown.length} more jobs waiting{compact ? ' · exit presentation to see all' : ''}</p>}
       {!zone && !shown.length && <div className="queue-empty"><ShieldCheck /><h3>{locked ? 'Review in progress' : filter === 'all' ? 'The queue is clear.' : 'No matching requests.'}</h3>
-        <p>{locked ? 'The current review will finish as simulation time advances.' : snapshot.darkNodes.length ? 'Requests will appear here when a vehicle needs assistance.' : 'The city is moving. Trigger a blackout to begin the demonstration.'}</p>
-        {!snapshot.darkNodes.length && !readOnly && <button className="action-button warning" onClick={onBlackout}><Zap />Trigger blackout</button>}
+        <p>{locked ? 'The current review will finish as simulation time advances.' : snapshot.outage?.status === 'RESTORED' ? 'Power is restored. Start a new scenario for another incident.' : snapshot.darkNodes.length ? 'Requests will appear here when a vehicle needs assistance.' : 'The city is moving. Trigger a blackout to begin the demonstration.'}</p>
+        {!snapshot.outage && !readOnly && <button className="action-button warning" onClick={onBlackout}><Zap />Trigger blackout</button>}
       </div>}
     </div>
     <div className="queue-control">
@@ -841,9 +870,42 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
   </section>;
 }
 
-function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse, onCompare }: {
+function ScenarioControls({ snapshot, readOnly, onNew, onCollision }: {
+  snapshot: SimSnapshot; readOnly: boolean; onNew: () => void; onCollision: () => void;
+}) {
+  const outage = snapshot.outage;
+  return <section className="scenario-controls" aria-label="Scenario controls">
+    <div className="scenario-heading"><span>Random scenario</span><code>Seed {snapshot.scenario?.seed}</code></div>
+    <p>{!outage ? `Blackout scheduled · T+${formatT(snapshot.scenario?.outageAt ?? 0)}` : outage.status === 'RESTORED' ? 'Power restored across the affected area' : `${Math.round(outage.radiusM)} m outage · ${outage.status === 'RESTORING' ? 'restoring power' : 'active'}`}</p>
+    <div className="scenario-actions"><button type="button" className="action-button secondary" onClick={onNew}><Shuffle />New scenario</button>
+      <button type="button" className="action-button secondary" disabled={readOnly || (snapshot.incidents?.length ?? 0) >= MAX_COLLISION_INCIDENTS} onClick={onCollision}><TriangleAlert />Collision</button></div>
+    <small>Reset replays this seed. Both cities receive the same incidents.</small>
+  </section>;
+}
+
+function CorridorProtocol({ snapshot }: { snapshot: SimSnapshot }) {
+  const protocol = snapshot.corridorStatus;
+  const incidents = snapshot.incidents ?? [];
+  const commands = protocol?.commands ?? [];
+  const blocked = commands.filter(c => c.state === 'BLOCKED').length;
+  const clear = commands.filter(c => c.state === 'CLEARED').length;
+  return <div className="mission-section corridor-protocol">
+    <h3><Radio />Road response</h3>
+    {protocol?.active ? <>
+      <p className="protocol-summary">{protocol.segments.filter(s => s.state === 'CLEAR').length}/{protocol.segments.length} reserved road segments free of modeled obstructions</p>
+      <div className="protocol-counts"><span>{commands.length} sent</span><span>{clear} cleared</span><span className={blocked ? 'text-dg-red' : ''}>{blocked} blocked</span></div>
+      <details><summary>Vehicle acknowledgements<ChevronRight /></summary><ul>{commands.slice(-12).reverse().map(c => <li key={c.vehicleId}><span>Vehicle #{c.vehicleId}<small>{c.reason}</small></span><strong>{c.state.toLowerCase()}</strong></li>)}</ul></details>
+    </> : <p className="protocol-summary">{snapshot.mode === 'FIFO' ? 'Local emergency yielding · no fleet reservation' : snapshot.ambulance?.status === 'ARRIVED' ? 'Corridor released after delivery' : 'Reservation begins before ambulance dispatch'}</p>}
+    {incidents.map(incident => <div className={`collision-ledger ${incident.status === 'CLEARED' ? 'is-cleared' : ''}`} key={incident.id}>
+      <TriangleAlert /><div><strong>Collision · road {incident.edgeId}</strong><span>{incident.status === 'BLOCKED' ? 'Road blocked · awaiting recovery dispatch' : incident.status === 'RESPONDING' ? `Recovery on scene · ${formatT(Math.max(0, (incident.clearAt ?? snapshot.t) - snapshot.t))} remaining` : 'Road cleared · traffic restored'}</span></div>
+    </div>)}
+  </div>;
+}
+
+function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse, onCompare, scenarioControls }: {
   snapshot: SimSnapshot; rival: SimSnapshot; graph: RoadGraph; follow: boolean;
   onFollow: () => void; onCollapse: () => void; onCompare: () => void;
+  scenarioControls: ReactNode;
 }) {
   const amb = snapshot.ambulance;
   const downtown = Math.abs(graph.center.lat - 37.788) < 0.01 && Math.abs(graph.center.lng + 122.406) < 0.01;
@@ -855,6 +917,8 @@ function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse,
     <div className="panel-title"><h2>Mission overview</h2><button className="icon-button" aria-label="Collapse mission panel" onClick={onCollapse}><ChevronRight /></button></div>
     <div className={`ambulance-summary ${amb?.status === 'ARRIVED' ? 'has-arrived' : ''}`}><div className="ambulance-icon"><Ambulance /></div><div><h3>{status}</h3><p>{routeLabel}</p>{amb && amb.status !== 'WAITING' && <strong className="mission-time">{formatT(amb.tripS)}<span> elapsed</span></strong>}</div></div>
     <button className="action-button secondary follow-button" disabled={!amb} aria-pressed={follow} onClick={onFollow}><Crosshair />{follow ? 'Stop following' : 'Follow ambulance'}</button>
+    {scenarioControls}
+    <CorridorProtocol snapshot={snapshot} />
     <div className="mission-section"><h3><Route />Dispatch strategy</h3>
       <ul className="strategy-list">
         <li><ListFilter /><span>{dg ? 'WSPT triage' : 'First come, first served'}</span><span className="strategy-state">{dg ? 'Impact first' : 'Oldest first'}</span></li>
@@ -885,6 +949,31 @@ function ComparisonMetrics({ fifo, darkgrid }: { fifo: SimSnapshot; darkgrid: Si
 // Scene-local CSS: the approved presentation composition, separate from the
 // denser operations workspace. All selectors remain under the DARK GRID root.
 const CINEMATIC_STYLES = `
+.dg-workspace .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+.dg-workspace [aria-label="Simulation timeline"] { display: flex; align-items: center; width: 100%; }
+.dg-workspace [aria-label="Simulation timeline"] > div { position: relative; flex: 1; min-width: 0; }
+.dg-workspace [aria-label="Simulation history time"] { display: block; width: 100%; }
+.dg-workspace .scenario-controls { margin: 12px 16px; padding: 12px 0; border-top: 1px solid #34434d; border-bottom: 1px solid #34434d; }
+.dg-workspace .scenario-heading { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: #e1edf2; }
+.dg-workspace .scenario-heading code { font-size: 10px; color: #aebec9; overflow-wrap: anywhere; }
+.dg-workspace .scenario-controls p { margin: 9px 0; font-size: 12px; line-height: 1.5; color: #c6d4dd; }
+.dg-workspace .scenario-actions { display: flex; gap: 8px; }
+.dg-workspace .scenario-actions .action-button { flex: 1; min-width: 0; padding: 8px; min-height: 36px; font-size: 11px; }
+.dg-workspace .scenario-actions svg { width: 14px; height: 14px; }
+.dg-workspace .scenario-controls > small { display: block; margin-top: 9px; font-size: 10px; line-height: 1.6; color: #aebec9; }
+.dg-workspace .protocol-summary { font-size: 12px; line-height: 1.6; color: #c6d4dd; }
+.dg-workspace .protocol-counts { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0; font-size: 11px; color: #c6d4dd; }
+.dg-workspace .corridor-protocol details > summary { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; font-size: 11px; color: #9ce0df; cursor: pointer; }
+.dg-workspace .corridor-protocol summary svg { width: 13px; height: 13px; }
+.dg-workspace .corridor-protocol details ul { padding: 0; list-style: none; }
+.dg-workspace .corridor-protocol details li { display: flex; justify-content: space-between; align-items: start; gap: 8px; padding: 8px 0; border-top: 1px solid #34434d; font-size: 11px; color: #e1edf2; }
+.dg-workspace .corridor-protocol li small { display: block; margin-top: 5px; color: #aebec9; line-height: 1.5; }
+.dg-workspace .corridor-protocol li strong { font-weight: 500; color: #f1ce77; }
+.dg-workspace .collision-ledger { display: flex; gap: 9px; margin-top: 12px; font-size: 11px; color: #ffb4be; }
+.dg-workspace .collision-ledger > svg { width: 16px; height: 16px; flex: none; }
+.dg-workspace .collision-ledger strong { font-weight: 500; }
+.dg-workspace .collision-ledger span { display: block; margin-top: 5px; color: #c6d4dd; line-height: 1.5; }
+.dg-workspace .collision-ledger.is-cleared { color: #7ce1bf; }
 .dg-workspace .workspace-brand > svg { color: #d9e4e9; }
 .dg-workspace .policy-action > button { width: 100%; }
 .dg-workspace.is-presenting .workspace-header { height: 60px; flex-basis: 60px; padding: 0 30px; background: #101c26; }

@@ -6,6 +6,7 @@ import type { ChaosResult } from '@/app/api/analyze-chaos/route';
 
 const PRESETS = [
   { title: 'Substation outage', text: 'Substation fire near 8th and Harrison, power is out across SoMa', live: true },
+  { title: 'Road collision', text: 'Two vehicles crashed on the ambulance route. The wreck is blocking the road.', live: true },
   { title: 'Event exit', text: 'A crowd is leaving Chase Center and ride requests are surging', live: false },
   { title: 'Network disruption', text: 'Cell network degraded across the Mission, robotaxis losing their operator link', live: false },
 ];
@@ -51,6 +52,6 @@ export default function ChaosInjectorPanel({ onResult }: { onResult?: (r: ChaosR
       <button className="action-button primary" disabled={loading || !text.trim()} type="submit"><Sparkles />{loading ? 'Analyzing incident…' : 'Analyze incident'}{!loading && <ArrowRight />}</button>
     </form>
     {error && <p className="analysis-error" role="alert">{error}</p>}
-    {result && <div className="analysis-result"><div className="result-source"><span>{result.event.type === 'OUTAGE' ? <Zap /> : <Sparkles />}{result.event.type.replaceAll('_', ' ')}</span><span className="draft-source">{result.source === 'CLAUDE' ? 'Claude' : 'Offline rules'}</span></div><p>{result.rationale}</p><p className="analysis-result-note"><ShieldCheck />{result.event.type === 'OUTAGE' ? 'Blackout applied if this run has no outage yet. The zone policy still needs human approval in Requests.' : 'Analysis only. This event does not change the current simulation.'}</p></div>}
+    {result && <div className="analysis-result"><div className="result-source"><span>{result.event.type === 'OUTAGE' ? <Zap /> : <Sparkles />}{result.event.type.replaceAll('_', ' ')}</span><span className="draft-source">{result.source === 'CLAUDE' ? 'Claude' : 'Offline rules'}</span></div><p>{result.rationale}</p><p className="analysis-result-note"><ShieldCheck />{result.event.type === 'OUTAGE' ? 'Blackout applies to a live run without an outage. Zone policy still needs human approval in Requests.' : result.event.type === 'COLLISION' ? 'On a live run, the collision is injected into both cities. Recovery must finish before the road reopens.' : 'Analysis only. This event does not change the current simulation.'}</p></div>}
   </section>;
 }

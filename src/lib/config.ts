@@ -31,3 +31,18 @@ export const REVIEW_LOCK_REAL_S = SERVICE_SINGLE_S / SIM_SPEED; // = 3
 export const HISTORY_EVERY_S = 4;
 
 export const DEFAULT_WEIGHTS = { onCorridor: 10, insideBox: 3, perQueuedBehind: 1, passenger: 0.5 };
+
+// Prototype scenario assumptions, not measurements of real AV performance.
+export const RANDOM_OUTAGE_START_S = [25, 55] as const;
+export const RANDOM_OUTAGE_RADIUS_M = [420, 850] as const;
+export const RANDOM_RESTORATION_DELAY_S = [240, 360] as const;
+export const RESTORATION_SPREAD_S = 90;
+export const COLLISION_CLEARANCE_S = [90, 150] as const;
+export const MAX_COLLISION_INCIDENTS = 6;
+export const CORRIDOR_LEAD_S = 20;
+export const CORRIDOR_LOOKAHEAD_M = 650;
+export const YIELD_ACK_S = 1;
+export const YIELD_MANEUVER_S = 4;
+export const YIELD_OFFSET_M = 4;
+export const CURB_SLOTS_PER_LANE = 3;
+export const LOCAL_EMERGENCY_YIELD_M = 90;

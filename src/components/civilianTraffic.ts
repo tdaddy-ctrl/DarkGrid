@@ -15,7 +15,7 @@ const YIELD_SIDE_M = 14;           // ...on the same street
 const YIELD_NEAR_M = 30;           // anyone this close stops, whatever street they are on
 const NEAR_CORRIDOR_M = 220;       // once the route is known, most cars are placed near it
 
-type Edge = { from: number; to: number; len: number; ex: number; ny: number; bearing: number; lng0: number; lat0: number };
+type Edge = { id: number; forward: boolean; from: number; to: number; len: number; ex: number; ny: number; bearing: number; lng0: number; lat0: number };
 export type Civilian = { e: number; s: number; v: number; pull: number; waited: number; heading: number; paint: number };
 export type Traffic = { edges: Edge[]; out: Map<number, number[]>; cars: Civilian[]; seededNearRoute: boolean; mLng: number };
 
@@ -25,13 +25,13 @@ export function createTraffic(graph: RoadGraph): Traffic {
   const mLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
   const edges: Edge[] = [];
-  const add = (a: number, b: number) => {
+  const add = (id: number, a: number, b: number, forward: boolean) => {
     const p = nodes.get(a)!, q = nodes.get(b)!;
     const dx = (q.lng - p.lng) * mLng, dy = (q.lat - p.lat) * M_LAT, len = Math.hypot(dx, dy);
     if (len < 1) return;
-    edges.push({ from: a, to: b, len, ex: dx / len, ny: dy / len, bearing: (Math.atan2(dx, dy) * 180) / Math.PI, lng0: p.lng, lat0: p.lat });
+    edges.push({ id, forward, from: a, to: b, len, ex: dx / len, ny: dy / len, bearing: (Math.atan2(dx, dy) * 180) / Math.PI, lng0: p.lng, lat0: p.lat });
   };
-  for (const e of graph.edges) { add(e.from, e.to); if (!e.oneway) add(e.to, e.from); }
+  for (const e of graph.edges) { add(e.id, e.from, e.to, true); if (!e.oneway) add(e.id, e.to, e.from, false); }
   const out = new Map<number, number[]>();   // node id -> edges leaving it
   edges.forEach((e, i) => (out.get(e.from) ?? out.set(e.from, []).get(e.from)!).push(i));
   const traffic: Traffic = { edges, out, cars: [], seededNearRoute: false, mLng };
@@ -73,7 +73,7 @@ function seedNearRoute(t: Traffic, corridor: LatLng[], amb: LatLng | null) {
  * Advances every car by `simDt` sim-seconds (0 while paused or replaying); `dt` is real seconds for
  * the smooth parts (pulling over, turning). `darkNodes` are node ids without power.
  */
-export function updateTraffic(t: Traffic, simDt: number, dt: number, amb: Ambulance | null, darkNodes: Set<number>, corridor: LatLng[]) {
+export function updateTraffic(t: Traffic, simDt: number, dt: number, amb: Ambulance | null, darkNodes: Set<number>, corridor: LatLng[], blockedEdges: Set<number> = new Set()) {
   if (!t.seededNearRoute && corridor.length > 1) seedNearRoute(t, corridor, amb?.pos ?? null);
   const siren = amb && (amb.status === 'EN_ROUTE' || amb.status === 'STUCK');
   const fx = amb ? Math.sin((amb.headingDeg * Math.PI) / 180) : 0, fy = amb ? Math.cos((amb.headingDeg * Math.PI) / 180) : 0;
@@ -93,13 +93,16 @@ export function updateTraffic(t: Traffic, simDt: number, dt: number, amb: Ambula
     if (yieldNow || simDt <= 0) { c.v = yieldNow ? 0 : c.v; continue; }
     c.v = Math.min(CRUISE_MPS, c.v + 3 * simDt);
     // Blacked-out intersection ahead: stop at the line, wait, then go.
-    const stopAt = darkNodes.has(e.to) && c.waited < DARK_STOP_S ? e.len - 4 : Infinity;
+    const wreckAt = e.len * (e.forward ? 0.55 : 0.45);
+    const collisionStop = blockedEdges.has(e.id) && c.s < wreckAt ? wreckAt - 6 : Infinity;
+    const stopAt = Math.max(c.s, Math.min(collisionStop, darkNodes.has(e.to) && c.waited < DARK_STOP_S ? e.len - 4 : Infinity));
     if (c.s >= stopAt - 0.1) { c.waited += simDt; c.v = 0; continue; }
     c.s = Math.min(c.s + c.v * simDt, stopAt);
     if (c.s < e.len) continue;
-    const options = outOf(t, e.to).filter((i) => t.edges[i].to !== e.from);
-    const choices = options.length ? options : outOf(t, e.to);
-    if (!choices.length) { c.s = 0; continue; }
+    const open = outOf(t, e.to).filter(i => !blockedEdges.has(t.edges[i].id));
+    const options = open.filter((i) => t.edges[i].to !== e.from);
+    const choices = options.length ? options : open;
+    if (!choices.length) { c.s = e.len; c.v = 0; continue; }
     c.s -= e.len;
     c.e = choices[Math.floor(Math.random() * choices.length)];
     c.waited = 0;

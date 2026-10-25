@@ -2,7 +2,7 @@
 // Uses Claude when ANTHROPIC_API_KEY is set; otherwise, or on any failure, a keyword
 // parser answers instead. Always returns valid JSON, never throws.
 
-export type EventType = 'OUTAGE' | 'DEMAND_SURGE' | 'COMMS_DEGRADATION';
+export type EventType = 'OUTAGE' | 'COLLISION' | 'DEMAND_SURGE' | 'COMMS_DEGRADATION';
 
 export type ChaosResult = {
   event: { type: EventType; zone?: string; radius_m?: number; magnitude?: number };
@@ -11,12 +11,13 @@ export type ChaosResult = {
   source: 'CLAUDE' | 'OFFLINE_RULES';
 };
 
-const EVENT_TYPES: EventType[] = ['OUTAGE', 'DEMAND_SURGE', 'COMMS_DEGRADATION'];
+const EVENT_TYPES: EventType[] = ['OUTAGE', 'COLLISION', 'DEMAND_SURGE', 'COMMS_DEGRADATION'];
 const CLAUDE_TIMEOUT_MS = 20_000;   // the demo falls back to offline rules rather than hang
 
 const SYSTEM_PROMPT = `You turn a short incident report into a structured event for DARK GRID, the dispatch platform a robotaxi remote-operations team uses in San Francisco (SoMa / Mission).
 
 Event types:
+- COLLISION: a crash, collision, or wreck blocks a road. Dispatch recovery; maintain the closure until recovery completes. Vehicles may reroute but must not drive through the wreck.
 - OUTAGE: power loss, substation fire, blackout. Traffic lights go dark, so robotaxis ask operators for help at every intersection. radius_m is the blackout radius (a typical substation outage is about 700 m).
 - DEMAND_SURGE: a crowd leaving a venue (concert, game). magnitude is the multiplier on ride requests (1-5).
 - COMMS_DEGRADATION: cellular or network trouble, so cars lose their link to operators. magnitude is the share of cars affected (0-1).
@@ -62,6 +63,10 @@ const ZONES = ['SoMa', 'Mission', 'Chase Center', 'Financial District', 'Dogpatc
 function offline(text: string, why: string): ChaosResult {
   const t = text.toLowerCase();
   const zone = ZONES.find((z) => t.includes(z.toLowerCase()));
+  if (/collision|crash|wreck|撞车|车祸|追尾/.test(t)) {
+    return { event: { type: 'COLLISION', zone }, policy: policy(1),
+      rationale: 'Collision blocks a road. Dispatch recovery, divert approaching vehicles, and verify the ambulance route. The road stays closed until on-scene recovery finishes.', source: 'OFFLINE_RULES' };
+  }
   if (/cell|network|signal loss|comms|lte|5g/.test(t)) {
     return {
       event: { type: 'COMMS_DEGRADATION', zone, magnitude: 0.4 },
