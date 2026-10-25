@@ -399,13 +399,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         // Placeholder blocks: drawn over the streaming photoreal tiles so the city is visible
         // immediately, then removed once enough photo tiles have loaded.
         let blocksVisible = true;
-        let manualPhoto = false;    // the user explicitly chose Photo while following
         const fallBackToOsm = (unavailable = false) => {
           if (!photo) return;
           photo = false;
           photoAttempt++;
           tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
-          blocksVisible = true; manualPhoto = false;
+          blocksVisible = true;
           staticLayers = osmLayers();
           setSource('osm');
           setPhotoNotice(unavailable ? 'Photo unavailable. Showing Blocks; select Photo to retry.' : '');
@@ -414,19 +413,16 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           if (to === 'osm') { fallBackToOsm(); setPhotoNotice(''); return; }
           if (!geo) return;
           if (photo) {
-            // Photo was already the mode; force its layers back even if follow had swapped to blocks.
-            manualPhoto = followRef.current;
-            blocksVisible = !manualPhoto; tilesLoaded = 0;
-            staticLayers = manualPhoto ? photoLayers() : [...photoLayers(), buildingsLayer()];
+            // Keep the existing tileset and cache when Photo is already selected.
             setPhotoNotice('');
             setSource('google');
             return;
           }
           photoAttempt++;
           photo = true; tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
-          manualPhoto = followRef.current; blocksVisible = !manualPhoto;
+          blocksVisible = !followRef.current;
           setPhotoNotice('');
-          staticLayers = manualPhoto ? photoLayers() : [...photoLayers(), buildingsLayer()];
+          staticLayers = blocksVisible ? [...photoLayers(), buildingsLayer()] : photoLayers();
           setSource('google');
         };
         const photoLayers = (): Layer[] => {
@@ -599,35 +595,15 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
 
         let last = performance.now();
         let lastMotionT = -1;
-        let lastFollowOn = false;
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (!activeRef.current) { last = now; lastMotionT = -1; trafficSimT = -1; return; }
           if (photo && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm(true);
-          if (photo && !followRef.current && blocksVisible && tilesLoaded >= 8) {
-            // The photoreal city now covers the view: drop the placeholder blocks, keeping the
-            // same tile layer instance so nothing that loaded gets re-fetched.
+          if (photo && blocksVisible && (followRef.current || tilesLoaded >= 8)) {
+            // Do not put opaque placeholder towers in front of the chase camera.
+            // Keep the selected Photo mode and the already-loaded tileset.
             blocksVisible = false;
             staticLayers = staticLayers.filter((layer) => layer.id !== 'buildings');
-          }
-          // While chasing the ambulance, the streaming photoreal tiles cannot keep up with the
-          // moving camera, so the area ahead turns into a black void. Swap to the local block city
-          // for the whole chase (instant, fully covered); the photo mode resumes when follow ends.
-          // A manual Photo click during follow wins over the automatic swap.
-          const followOn = followRef.current;
-          if (followOn !== lastFollowOn) {
-            lastFollowOn = followOn;
-            manualPhoto = false;   // a follow toggle re-arms the automatic behavior
-            if (photo) {
-              if (followOn) {
-                staticLayers = osmLayers();
-                setSource('osm');
-              } else {
-                blocksVisible = true; tilesLoaded = 0;
-                staticLayers = [...photoLayers(), buildingsLayer()];
-                setSource('google');
-              }
-            }
           }
           const dt = (now - last) / 1000; last = now;
           const isPresenting = presentingRef.current;
