@@ -3,14 +3,15 @@
 // Main page: runs a FIFO city and a DARK GRID city side by side from the same seed.
 // Sim state lives in refs (mutated every frame); React state is a copy refreshed at most
 // 4 times per second, so 250 cars never cause 60 re-renders a second.
-// The *Placeholder components below stand in for C's and D's real components.
+// Workspace navigation only changes presentation; the same simulation refs keep running.
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type CSSProperties } from 'react';
+import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
 import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
   answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickOutageCenter, setControl, step, type Sim,
 } from '@/lib/sim';
-import { HISTORY_EVERY_S, REVIEW_LOCK_REAL_S, SEED, SIM_SPEED } from '@/lib/config';
+import { HISTORY_EVERY_S, SEED, SIM_SPEED } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
 import { createHistory, push as pushHistory, frameAt, range as historyRange, type History } from '@/lib/history';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
@@ -18,7 +19,6 @@ import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
 import TacticalMap3D from '@/components/TacticalMap3D';
 import TimelineScrubber from '@/components/TimelineScrubber';
-import DemoDirectorBar from '@/components/DemoDirectorBar';
 import MetricsChart from '@/components/MetricsChart';
 import ArrivalOverlay from '@/components/ArrivalOverlay';
 
@@ -29,6 +29,7 @@ const MAX_FRAME_S = 0.25;    // a stalled tab doesn't fast-forward minutes at on
 const FOLLOW_SPEED = 0.3;    // following the ambulance runs the sim in slow motion (3x instead of 10x) so the camera can keep up
 
 type Mode = SimSnapshot['mode'];
+type Surface = 'city' | 'requests' | 'compare' | 'analyze';
 type View = {
   fifo: SimSnapshot; darkgrid: SimSnapshot; chart: ChartPoint[];
   historyRange: ReturnType<typeof historyRange>; outageT: number | null; isLive: boolean;
@@ -102,7 +103,7 @@ export default function Home() {
       <label htmlFor="simulation-environment" className="sr-only">Environment</label>
       <select id="simulation-environment" value={environment}
         onChange={event => { setEnvironment(event.target.value as Environment); setGeneration(n => n + 1); }}
-        className="min-h-9 rounded-md border border-dg-line bg-[#0c111a] px-2 font-mono text-xs uppercase tracking-[0.12em] text-slate-200">
+        className="environment-select">
         <option value="DOWNTOWN">Downtown SF</option>
         <option value="SF">SoMa / Mission</option>
         <option value="GRID">Test Grid</option>
@@ -141,14 +142,20 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     fifo: ReturnType<typeof historyContext>; darkgrid: ReturnType<typeof historyContext>;
   }>());
   const playbackTRef = useRef<number | null>(null);
+  const requestPanelRef = useRef<HTMLElement | null>(null);
+  const workspaceBodyRef = useRef<HTMLDivElement | null>(null);
 
   const [view, setView] = useState<View | null>(null);
   const [mode, setMode] = useState<Mode>('DARKGRID');
   const [paused, setPaused] = useState(false);
-  const [judge, setJudge] = useState<Mode | null>(null);   // which city the judge is operating
-  const [split, setSplit] = useState(false);                // both cities side by side
+  const [surface, setSurface] = useState<Surface>('city');
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const workspaceRef = useRef<{ surface: Surface; follow: boolean }>({ surface: 'city', follow: false });
+  const [act, setAct] = useState(0);
   const [follow, setFollow] = useState(false);              // 3D camera chases the ambulance
-  const [expanded, setExpanded] = useState(false);          // the map takes the whole screen below the header
+  const [expanded, setExpanded] = useState(false);          // reversible presentation mode
+  const split = surface === 'compare';
   const slowRef = useRef(false);
   const ambDriving = view ? (mode === 'FIFO' ? view.fifo : view.darkgrid).ambulance?.status === 'EN_ROUTE' : false;
   useEffect(() => { slowRef.current = follow && ambDriving; }, [follow, ambDriving]);
@@ -215,19 +222,21 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     playbackTRef.current = null;
     setControl(sims.fifo, m === 'FIFO' ? 'MANUAL' : 'AUTO');
     setControl(sims.darkgrid, m === 'DARKGRID' ? 'MANUAL' : 'AUTO');
-    setJudge(m);
     if (m) setMode(m);
     publish();
   }, [publish]);
 
   // The judge answers in their city. Without a judge, the presenter can still approve the
   // zone-policy card in the city on screen (automatic operators never approve policy).
-  const onAnswer = useCallback((jobId: string) => {
+  const onAnswer = useCallback((jobId: string, city: Mode) => {
     const sims = simsRef.current;
     if (!sims || playbackTRef.current !== null) return;
-    answerJob((judge ?? mode) === 'FIFO' ? sims.fifo : sims.darkgrid, jobId);
+    const target = city === 'FIFO' ? sims.fifo : sims.darkgrid;
+    const job = target.jobs.find(j => j.id === jobId);
+    if (target.control !== 'MANUAL' && job?.kind !== 'ZONE_POLICY') return;
+    answerJob(target, jobId);
     publish();
-  }, [judge, mode, publish]);
+  }, [publish]);
 
   const blackout = useCallback(() => {
     const sims = simsRef.current;
@@ -259,26 +268,37 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     return getMotion(mode === 'FIFO' ? sims.fifo : sims.darkgrid);
   }, [mode]);
 
+  const enterPresentation = useCallback((next?: Surface) => {
+    if (!expanded) workspaceRef.current = { surface, follow };
+    setExpanded(true);
+    setSurface(next ?? (surface === 'analyze' ? 'city' : surface));
+  }, [expanded, surface, follow]);
+
+  const exitPresentation = useCallback(() => {
+    setExpanded(false);
+    setSurface(workspaceRef.current.surface);
+    setFollow(workspaceRef.current.follow);
+  }, []);
+
   const director = useMemo(() => [
     onReset,
-    blackout,
-    () => takeOver('FIFO'),
-    () => takeOver('DARKGRID'),
-    () => { setFollow(false); setExpanded(false); setSplit(true); },
-    () => { setSplit(false); setMode('DARKGRID'); setFollow(true); setExpanded(true); },
-  ], [onReset, blackout, takeOver]);
+    () => { blackout(); setAct(1); setSurface('city'); setFollow(false); },
+    () => { takeOver('FIFO'); setAct(2); setSurface('city'); setFollow(false); },
+    () => { takeOver('DARKGRID'); setAct(3); setSurface('city'); setFollow(false); },
+    () => { setFollow(false); setSurface('compare'); setAct(4); },
+    () => { enterPresentation('city'); setMode('DARKGRID'); setFollow(true); setAct(5); },
+  ], [onReset, blackout, takeOver, enterPresentation]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement;
-      if (e.metaKey || e.ctrlKey || e.altKey || el.closest('input, textarea, select, [contenteditable="true"]')) return;
-      const i = Number(e.key);
-      if (e.key === 'Escape') setExpanded(false);
-      else if (e.key === 'm' || e.key === 'M') setExpanded((v) => !v);
-      else if (e.key.length === 1 && i >= 0 && i < director.length) { e.preventDefault(); director[i](); }
+      const el = e.target;
+      if (e.metaKey || e.ctrlKey || e.altKey || (el instanceof Element && el.closest('input, textarea, select, [contenteditable="true"]'))) return;
+      if (e.key === 'Escape' && expanded) exitPresentation();
+      else if (e.key.toLowerCase() === 'm') { if (expanded) exitPresentation(); else enterPresentation(); }
+      else if (/^[0-5]$/.test(e.key)) { e.preventDefault(); director[Number(e.key)](); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [director]);
+  }, [director, expanded, enterPresentation, exitPresentation]);
 
   useEffect(() => {
     freshSims();             // first publish happens in the loop below
@@ -327,109 +347,147 @@ function Simulation({ graph, onReset, envSelect }: { graph: RoadGraph; onReset: 
     );
   }
   const snap = mode === 'FIFO' ? view.fifo : view.darkgrid;
-  const outage = view.fifo.darkNodes.length > 0;
-  const phase: { label: string; tone: Tone } = !view.isLive
-    ? { label: 'Replay', tone: 'cyan' } : judge
-    ? { label: `Judge · ${cityShort(judge)}`, tone: 'red' }
-    : outage ? { label: 'Blackout', tone: 'amber' } : { label: 'Nominal', tone: 'cyan' };
-  // Which act of the demo we are in, read from what is on screen.
-  const demoStep = follow ? 5 : split ? 4 : judge === 'DARKGRID' ? 3 : judge === 'FIFO' ? 2 : outage ? 1 : 0;
+  const rival = mode === 'FIFO' ? view.darkgrid : view.fifo;
+  const outage = snap.darkNodes.length > 0;
+  const phase = !view.isLive ? 'Replaying history' : outage ? 'Blackout active' : 'City online';
+  const pendingPolicy = snap.jobs.some(j => j.kind === 'ZONE_POLICY');
+  const showLeft = !expanded && surface !== 'compare' && surface !== 'analyze' && leftOpen;
+  const showRight = !expanded && surface === 'city' && rightOpen;
+  const contextualQueue = expanded && !split && !follow && (snap.control === 'MANUAL' || pendingPolicy);
+  const demoStep = follow ? 5 : split ? 4 : snap.control === 'MANUAL' ? (mode === 'FIFO' ? 2 : 3) : act;
   const timeline = <TimelineScrubber range={view.historyRange} t={snap.t} isLive={view.isLive}
     outageT={view.outageT} onScrub={onScrub} onGoLive={onGoLive} />;
+  const changeSurface = (next: Surface) => {
+    setSurface(next);
+    if (next === 'requests') setLeftOpen(true);
+    // The narrow workspace stacks the map above the feed. Navigation must move
+    // to the destination in both directions without changing simulation state.
+    if (window.matchMedia('(max-width: 760px)').matches) {
+      requestAnimationFrame(() => {
+        const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+        if (next === 'requests') requestPanelRef.current?.scrollIntoView({ block: 'start', behavior });
+        else workspaceBodyRef.current?.scrollTo({ top: 0, behavior });
+      });
+    }
+  };
 
   return (
-    <main className="relative z-10 mx-auto flex w-full max-w-[1920px] flex-1 flex-col gap-3 p-3 lg:h-screen lg:max-h-screen lg:flex-none lg:overflow-hidden lg:p-4">
-      <header className="dg-panel flex shrink-0 flex-wrap items-center gap-x-5 gap-y-3 px-4 py-2.5 xl:flex-nowrap">
-        <div className="mr-auto flex items-center gap-3">
-          <BrandMark />
-          <div>
-            <h1 className="font-display text-xl font-semibold tracking-[0.22em] text-slate-50">DARK GRID</h1>
-            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Remote ops · San Francisco</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-5">
-          <StatusPill tone={phase.tone} label={phase.label} />
-          <div className="text-right">
-            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-dg-label">Sim clock</p>
-            <p className="font-mono text-lg leading-tight tabular-nums text-slate-50">T+{formatT(snap.t)}</p>
-          </div>
-        </div>
-        <nav aria-label="Demo controls" className="flex flex-wrap items-center gap-2 xl:flex-nowrap">
-          {envSelect}
-          <div className="flex rounded-lg border border-dg-line bg-black/30 p-0.5" role="group" aria-label="City on screen">
-            {(['FIFO', 'DARKGRID'] as const).map((m) => (
-              <button key={m} onClick={() => setMode(m)} aria-pressed={mode === m}
-                className={`min-h-9 whitespace-nowrap rounded-md px-3 font-mono text-[11px] font-semibold uppercase tracking-[0.12em] transition-colors ${
-                  mode === m
-                    ? m === 'FIFO' ? 'bg-slate-200 text-slate-950' : 'bg-dg-cyan text-slate-950 shadow-[0_0_18px_-4px_rgba(56,189,248,.8)]'
-                    : 'text-slate-300 hover:text-slate-50'}`}>
-                {cityShort(m)}
-              </button>
-            ))}
-          </div>
-          <button onClick={blackout} disabled={view.outageT !== null} className={btn('amber')}>Blackout</button>
-          {judge === null && <button onClick={() => takeOver('FIFO')} className={btn('red')}>Judge takes over</button>}
-          {judge === 'FIFO' && <button onClick={() => takeOver('DARKGRID')} className={btn('cyan')}>Dark Grid on</button>}
-          {judge !== null && <button onClick={() => takeOver(null)} className={btn('ghost')}>Auto operators</button>}
-          <button onClick={() => { setSplit((v) => !v); setFollow(false); setExpanded(false); }} aria-pressed={split} className={btn(split ? 'cyan' : 'ghost')}>
-            {split ? 'Single view' : 'Split view'}
+    <main className={`dg-workspace ${expanded ? 'is-presenting' : ''}`}><style>{CINEMATIC_STYLES}</style>
+      <header className="workspace-header">
+        <div className="workspace-brand"><BrandMark /><h1>DARK GRID</h1></div>
+        <div className="workspace-environment">{expanded ? 'San Francisco' : envSelect}</div>
+        <span className={`city-status ${!view.isLive ? 'is-replay' : outage ? 'is-outage' : ''}`}>
+          <span aria-hidden="true" />{phase}
+        </span>
+        <span className="header-clock" title="Simulation time">T+{formatT(snap.t)}</span>
+        <div className="header-actions">
+          {!expanded && <>
+            <button type="button" className="icon-button" aria-label={showLeft ? 'Hide request panel' : 'Show request panel'}
+              aria-expanded={showLeft} aria-controls="request-panel"
+              onClick={() => { if (surface === 'compare' || surface === 'analyze') setSurface('city'); setLeftOpen(!showLeft); }}>
+              {showLeft ? <PanelLeftClose /> : <PanelLeftOpen />}
+            </button>
+            <button type="button" className="icon-button" aria-label={showRight ? 'Hide mission panel' : 'Show mission panel'}
+              aria-expanded={showRight} aria-controls="mission-panel"
+              onClick={() => { if (surface === 'compare' || surface === 'analyze') setSurface('city'); setRightOpen(!showRight); }}>
+              {showRight ? <PanelRightClose /> : <PanelRightOpen />}
+            </button>
+          </>}
+          <button type="button" className="present-button" onClick={() => expanded ? exitPresentation() : enterPresentation()}>
+            {expanded ? <Minimize2 /> : <Maximize2 />}<span>{expanded ? 'Exit presentation' : 'Present'}</span>
+            {expanded && <kbd>Esc</kbd>}
           </button>
-          <button onClick={togglePause} className={btn('ghost')}>{paused ? 'Resume' : 'Pause'}</button>
-          <button onClick={onReset} className={btn('ghost')}>Reset</button>
-        </nav>
+          <details className="session-menu">
+            <summary className="icon-button" aria-label="Session controls"><MoreHorizontal /></summary>
+            <div className="session-menu-content">
+              <p>Simulation controls</p>
+              <button disabled={view.outageT !== null} onClick={director[1]}><Zap />Trigger blackout <kbd>1</kbd></button>
+              <button onClick={director[2]}><UsersRound />Judge takes over FIFO <kbd>2</kbd></button>
+              <button onClick={director[3]}><ShieldCheck />Operate DARK GRID <kbd>3</kbd></button>
+              <button onClick={() => takeOver(null)}><Radio />Automatic operators</button>
+              <button onClick={togglePause}>{paused ? <Play /> : <Pause />}{paused ? 'Resume simulation' : 'Pause simulation'}</button>
+              <button onClick={onReset}><RotateCcw />Reset simulation <kbd>0</kbd></button>
+            </div>
+          </details>
+        </div>
       </header>
 
-      <DemoDirectorBar step={demoStep} onReset={director[0]} onBlackout={director[1]} onManual={director[2]}
-        onDarkGrid={director[3]} onSplit={director[4]} onFollow={director[5]} />
+      <div ref={workspaceBodyRef} className="workspace-body" data-left={showLeft} data-right={showRight} data-surface={surface}
+        style={{ '--left': showLeft ? surface === 'requests' ? '430px' : undefined : '0px', '--right': showRight ? undefined : '0px' } as CSSProperties}>
+        <aside ref={requestPanelRef} id="request-panel" className="request-panel" hidden={!showLeft} aria-label="Live request panel">
+          <RequestFeed snapshot={snap} mode={mode} onModeChange={setMode} onAnswer={onAnswer}
+            proposal={outage ? proposal : null} readOnly={!view.isLive} paused={paused}
+            onTakeOver={() => takeOver(snap.control === 'MANUAL' ? null : mode)}
+            onBlackout={director[1]} onCollapse={() => setLeftOpen(false)} />
+        </aside>
 
-      <div className={`grid min-h-0 gap-3 ${expanded && !split ? 'flex-1' : 'lg:flex-[62] lg:grid-cols-[minmax(0,1fr)_minmax(320px,25%)]'}`}>
-        {split ? (
-          /* Same seed, same blackout: the only difference between the two maps is the dispatch policy. */
-          <div className="flex min-h-0 flex-col gap-3">
-            <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-2">
-              <MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} />
-              <MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} />
+        <div className="workspace-stage">
+          {/* Keep the imperative map mounted across destinations and presentation transitions. */}
+          <section className={`city-stage ${split || surface === 'analyze' ? 'is-concealed' : ''}`} aria-label="Tactical city map" aria-hidden={split || surface === 'analyze'}>
+            <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}
+              motion={motion} follow={follow} onFollowChange={setFollow} presenting={expanded} active={surface === 'city' || surface === 'requests'}
+              fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={rival} />} />
+            <PatientClock snapshot={snap} rival={rival} />
+            <div key={`${snap.mode}-${snap.ambulance?.status}`} className="arrival-banner">
+              <ArrivalOverlay ambulance={snap.ambulance} />
             </div>
-            {timeline}
-          </div>
-        ) : (
-          <section className={`dg-panel flex flex-col overflow-hidden lg:min-h-0 ${expanded ? 'min-h-[75vh]' : 'min-h-[440px]'}`}>
-            <PanelHeader title={`Tactical map · ${cityShort(snap.mode)}`} tone={outage ? 'amber' : 'cyan'}>
-              <Badge>{snap.vehicles.length} units</Badge>
-              {outage && <Badge tone="amber">{snap.darkNodes.length} dark</Badge>}
-              <button type="button" onClick={() => setExpanded((v) => !v)} aria-pressed={expanded}
-                title={expanded ? 'Back to the dashboard (Esc)' : 'Full-screen map (M)'}
-                className="flex min-h-7 items-center gap-1.5 rounded-md border border-dg-line px-2 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label transition-colors hover:border-dg-cyan/40 hover:text-dg-cyan">
-                <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                  <path d={expanded ? 'M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4' : 'M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4'} />
-                </svg>
-                {expanded ? 'Exit' : 'Expand'}
-              </button>
-            </PanelHeader>
-            <div className="relative min-h-0 flex-1">
-              <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}
-                motion={motion} follow={follow} onFollowChange={setFollow}
-                fallback={<MapPlaceholder snapshot={snap} graph={graph} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />} />
-              <PatientClock snapshot={snap} rival={mode === 'FIFO' ? view.darkgrid : view.fifo} />
-              {/* ARRIVED / STUCK banner: replays when the status changes, then fades so the map stays visible */}
-              <div key={`${snap.mode}-${snap.ambulance?.status}`} className="pointer-events-none absolute inset-0 z-20 [animation:dg-banner_7s_ease-out_forwards]">
-                <ArrivalOverlay ambulance={snap.ambulance} />
-              </div>
-            </div>
-            {timeline}
           </section>
-        )}
-        {!(expanded && !split) && <QueuePlaceholder snapshot={snap} onAnswer={onAnswer}
-          proposal={outage ? proposal : null} readOnly={!view.isLive} />}
+
+          {!expanded && surface !== 'analyze' && !split && <div className="map-caption">
+            <span>{cityShort(mode)}</span><span>{snap.vehicles.length} robotaxis · {snap.darkNodes.length} dark signals</span>
+          </div>}
+
+          {split && <section className="comparison-workspace" aria-label="FIFO and DARK GRID comparison">
+            <div className="surface-heading"><div><h2>Same city. Different decisions.</h2><p>Same seed, same blackout. Rewind to see where the two runs diverge.</p></div><span className="quiet-badge">{view.isLive ? 'Live comparison' : 'Recorded comparison'}</span></div>
+            <div className="comparison-maps"><MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} /><MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} /></div>
+            <div className="comparison-data"><MetricsChart data={view.chart} /><ComparisonMetrics fifo={view.fifo} darkgrid={view.darkgrid} /></div>
+          </section>}
+
+          {/* Keep these forms mounted so switching destinations never loses an analysis or voice session. */}
+          <section className="analysis-workspace" hidden={surface !== 'analyze'} aria-label="Incident analysis">
+            <div className="surface-heading"><div><h2>Understand the incident.</h2><p>Analyze an event, review the proposed response, and explain a dispatch decision.</p></div><Sparkles /></div>
+            <div className="analysis-columns"><ChaosInjectorPanel onResult={onChaos} /><AskWhyBar active={surface === 'analyze'} jobs={snap.jobs} contextKey={`${snap.mode}-${view.isLive ? 'live' : snap.t}`} /></div>
+            <p className="analysis-note"><ShieldCheck />Policies always need human approval. Only blackout events currently change the simulation.</p>
+          </section>
+
+          {contextualQueue && <div className={`presentation-queue ${pendingPolicy ? 'policy-only' : ''}`}>
+            {pendingPolicy ? <ZonePolicyCard cinematic job={snap.jobs.find(j => j.kind === 'ZONE_POLICY')!} snapshot={snap}
+              proposal={outage ? proposal : null} readOnly={!view.isLive} onAnswer={onAnswer} /> :
+              <RequestFeed snapshot={snap} mode={mode} onModeChange={setMode} onAnswer={onAnswer}
+                proposal={outage ? proposal : null} readOnly={!view.isLive} paused={paused} compact
+                onTakeOver={() => takeOver(snap.control === 'MANUAL' ? null : mode)} onBlackout={director[1]} />}
+          </div>}
+
+          {surface !== 'analyze' && <div className={`playback-dock ${expanded ? 'with-director' : ''}`}>
+            {expanded && <nav className="demo-act-nav" aria-label="Demo director">
+              {['Blackout', 'Judge', 'Dark Grid', 'Compare', 'Follow'].map((label, i) =>
+                <button key={label} aria-current={demoStep === i + 1 ? 'step' : undefined} onClick={director[i + 1]}><span>{i + 1}</span>{label}</button>)}
+            </nav>}
+            <div className="playback-row"><button className="play-toggle" aria-label={paused ? 'Resume simulation' : 'Pause simulation'} onClick={togglePause}>{paused ? <Play /> : <Pause />}</button>
+              <span className="playback-state">{!view.isLive ? 'Replay' : paused ? 'Paused' : 'Running'}</span>{timeline}
+              {expanded && <button className="dock-reset" onClick={onReset}><RotateCcw />Reset</button>}
+            </div>
+          </div>}
+          {expanded && <span className="presentation-footnote">Deterministic simulation</span>}
+
+        </div>
+
+        <aside id="mission-panel" className="mission-panel" hidden={!showRight} aria-label="Mission overview">
+          <MissionOverview snapshot={snap} rival={rival} graph={graph} follow={follow} onFollow={() => setFollow(v => !v)}
+            onCollapse={() => setRightOpen(false)} onCompare={() => changeSurface('compare')} />
+        </aside>
       </div>
 
-      {/* hidden, not unmounted, in full-screen map mode so the injector and Ask-why keep their state */}
-      <div className={expanded && !split ? 'hidden' : 'grid min-h-0 gap-3 md:grid-cols-2 lg:flex-[28] xl:grid-cols-4'}>
-        <KpiPanel snapshot={mode === 'FIFO' ? view.darkgrid : view.fifo} other={snap} />
-        <MetricsChart data={view.chart} />
-        <ChaosInjectorPanel onResult={onChaos} />
-        <AskWhyBar key={view.isLive ? 'live' : snap.t} jobs={snap.jobs} />
-      </div>
+      {!expanded && <footer className="workspace-footer">
+        <span className="simulation-label"><span />Deterministic simulation</span>
+        <nav aria-label="Workspace" className="workspace-navigation">
+          {([{ id: 'city', label: 'City', icon: MapIcon }, { id: 'requests', label: 'Requests', icon: ListFilter },
+            { id: 'compare', label: 'Compare', icon: ChartNoAxesCombined }, { id: 'analyze', label: 'Analyze', icon: Sparkles }] as const).map(item => (
+              <button key={item.id} aria-current={surface === item.id ? 'page' : undefined} onClick={() => changeSurface(item.id)}><item.icon /><span>{item.label}</span></button>
+            ))}
+        </nav>
+        <button className="reset-button" onClick={onReset}><RotateCcw /><span>Reset</span></button>
+      </footer>}
     </main>
   );
 }
@@ -450,14 +508,7 @@ const TONE_TEXT: Record<Tone, string> = {
 };
 
 function btn(tone: 'amber' | 'red' | 'cyan' | 'ghost'): string {
-  const base = 'min-h-9 whitespace-nowrap rounded-lg px-3 font-mono text-[11px] font-semibold uppercase tracking-[0.12em] transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40';
-  const tones = {
-    amber: 'bg-linear-to-b from-[#ffd46b] to-dg-amber text-slate-950 shadow-[0_0_20px_-6px_rgba(255,184,0,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,184,0,.9)]',
-    red: 'bg-linear-to-b from-[#ff8ba0] to-dg-red text-slate-950 shadow-[0_0_20px_-6px_rgba(255,42,84,.7)] enabled:hover:shadow-[0_0_28px_-4px_rgba(255,42,84,.9)]',
-    cyan: 'bg-linear-to-b from-[#7dd3fc] to-dg-cyan text-slate-950 shadow-[0_0_20px_-6px_rgba(56,189,248,.8)] enabled:hover:shadow-[0_0_28px_-4px_rgba(56,189,248,1)]',
-    ghost: 'border border-dg-line bg-white/[0.03] text-slate-200 enabled:hover:border-white/20 enabled:hover:bg-white/[0.07]',
-  };
-  return `${base} ${tones[tone]}`;
+  return `action-button ${tone === 'cyan' ? 'primary' : tone === 'amber' ? 'warning' : tone === 'red' ? 'danger' : 'secondary'}`;
 }
 
 function Dot({ tone, pulse = true }: { tone: Tone; pulse?: boolean }) {
@@ -467,13 +518,6 @@ function Dot({ tone, pulse = true }: { tone: Tone; pulse?: boolean }) {
   );
 }
 
-function StatusPill({ tone, label }: { tone: Tone; label: string }) {
-  return (
-    <span className={`inline-flex items-center gap-2 rounded-full border border-current/30 bg-current/[0.06] px-3 py-1 font-mono text-[11px] font-semibold uppercase tracking-[0.18em] ${TONE_TEXT[tone]}`}>
-      <Dot tone={tone} />{label}
-    </span>
-  );
-}
 
 function Badge({ children, tone = 'idle' }: { children: ReactNode; tone?: Tone }) {
   return (
@@ -493,15 +537,9 @@ function PanelHeader({ title, tone, titleClass = '', children }: { title: string
 }
 
 function BrandMark() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 28 28" className="size-8">
-      <rect x="0.5" y="0.5" width="27" height="27" rx="6" fill="none" stroke="rgb(56 189 248 / 0.45)" />
-      {[0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => (
-        <rect key={`${r}${c}`} x={6 + c * 6} y={6 + r * 6} width="4" height="4" rx="1"
-          fill={r === 1 && c === 1 ? '#38bdf8' : 'rgb(148 163 184 / 0.35)'} />
-      )))}
-    </svg>
-  );
+  return <svg aria-hidden="true" viewBox="0 0 30 30" className="size-8" fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round">
+    <path d="M6 2v26M14 2v26M22 3v24M2 7h26M2 15h26M3 23h24M10 2h5M22 7v8M6 23v5" />
+  </svg>;
 }
 
 // ---------- placeholders (delete each one when the real component lands) ----------
@@ -523,7 +561,7 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
   const uid = useId().replace(/:/g, '');
   const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
   const minLat = Math.min(...lats), maxLat = Math.max(...lats), minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
-  const W = 1000, H = 1000, pad = 60;
+  const W = 1000, H = 600, pad = 45;
   const px = (p: LatLng) => pad + ((p.lng - minLng) / (maxLng - minLng || 1)) * (W - 2 * pad);
   const py = (p: LatLng) => H - pad - ((p.lat - minLat) / (maxLat - minLat || 1)) * (H - 2 * pad);
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
@@ -674,31 +712,15 @@ function SplitStrip({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnap
 // arrival, plus how much sooner this city delivered the patient than the other one.
 function PatientClock({ snapshot, rival }: { snapshot: SimSnapshot; rival?: SimSnapshot }) {
   const a = snapshot.ambulance;
-  if (!a || a.status === 'WAITING') return null;
+  if (!a) return null;
   const arrived = a.status === 'ARRIVED';
   const r = rival?.ambulance;
   const lead = arrived && r && r.status !== 'WAITING' ? r.tripS - a.tripS : 0;
-  return (
-    <div role="status" className="pointer-events-none absolute left-1/2 top-4 z-10 flex -translate-x-1/2 flex-col items-center gap-1.5">
-      <div className={`flex items-center gap-2 whitespace-nowrap rounded-full border px-3 py-1.5 font-mono text-[11px] font-semibold uppercase tracking-[0.16em] backdrop-blur ${
-        arrived ? 'border-dg-green/50 bg-dg-green/10 text-dg-green' : 'border-dg-red/60 bg-dg-red/15 text-dg-red shadow-[0_0_24px_-6px_rgba(255,42,84,.8)]'}`}>
-        {arrived ? (
-          <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8.5l3 3 7-7" /></svg>
-        ) : (
-          <svg aria-hidden="true" viewBox="0 0 40 16" className="h-3.5 w-9" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
-            <polyline points="0,8 10,8 13,3 17,13 20,8 26,8 28,5 30,8 40,8" pathLength="100" className="[stroke-dasharray:100] [animation:dg-ecg_1.2s_linear_infinite]" />
-          </svg>
-        )}
-        <span>{arrived ? 'Patient delivered' : a.status === 'STUCK' ? 'Ambulance stuck' : 'Patient waiting'}</span>
-        <span className={`text-sm tabular-nums ${arrived ? '' : 'inline-block [animation:dg-heartbeat_1s_ease-in-out_infinite]'}`}>{formatT(a.tripS)}</span>
-      </div>
-      {lead >= 30 && rival && (
-        <div className="whitespace-nowrap rounded-full border border-dg-cyan/50 bg-dg-cyan/10 px-3 py-1 font-mono text-[11px] font-semibold tracking-[0.14em] text-dg-cyan backdrop-blur">
-          {r!.status === 'ARRIVED' ? '' : '≥ '}{formatT(lead)} faster than {cityShort(rival.mode)}
-        </div>
-      )}
-    </div>
-  );
+  const label = arrived ? 'Patient delivered' : a.status === 'STUCK' ? 'Ambulance stuck' : a.status === 'WAITING' ? 'Awaiting dispatch' : 'Patient en route';
+  return <div role="status" className={`patient-clock ${arrived ? 'is-arrived' : a.status === 'STUCK' ? 'is-stuck' : ''}`}>
+    <div>{arrived ? <Check /> : <Ambulance />}<span>{label}</span>{a.status !== 'WAITING' && <strong>{formatT(a.tripS)}</strong>}</div>
+    {lead >= 30 && rival && <p>{r!.status === 'ARRIVED' ? '' : 'At least '}{formatT(lead)} ahead of {cityShort(rival.mode)}</p>}
+  </div>;
 }
 
 function Brackets() {
@@ -713,181 +735,224 @@ function Brackets() {
   );
 }
 
-const KIND_PILL: Record<Job['kind'], string> = {
-  ZONE_POLICY: 'bg-dg-cyan text-slate-950',
-  BATCH: 'border border-dg-cyan/50 text-dg-cyan',
-  CORRIDOR: 'border border-dg-amber/50 text-dg-amber',
-  STUCK: 'border border-dg-orange/50 text-dg-orange',
-  SINGLE: 'border border-white/15 text-slate-300',
-  FIFO: 'border border-white/15 text-slate-300',
-};
+// Queue cards use only the existing job, policy and snapshot data. Node IDs are shown
+// because the road graph does not provide verified street/intersection names.
+function contribution(job: Job, label: string): number {
+  return job.breakdown.find(term => term.label === label)?.value ?? 0;
+}
 
-// Stand-in for RequestQueuePanel. In MANUAL the cards are clickable; the zone-policy card
-// is clickable for whoever is presenting, judge or not.
-function QueuePlaceholder({ snapshot, onAnswer, proposal, readOnly = false }: {
-  snapshot: SimSnapshot; onAnswer: (jobId: string) => void; proposal?: ChaosResult | null; readOnly?: boolean;
+function ModeSwitch({ mode, onChange }: { mode: Mode; onChange: (mode: Mode) => void }) {
+  return <div className="mode-switch" role="group" aria-label="City on screen">
+    {(['FIFO', 'DARKGRID'] as const).map(city => <button key={city} aria-pressed={mode === city} onClick={() => onChange(city)}>{cityShort(city)}</button>)}
+  </div>;
+}
+
+function ZonePolicyCard({ job, snapshot, proposal, readOnly, onAnswer, cinematic = false }: {
+  job: Job; snapshot: SimSnapshot; proposal?: ChaosResult | null; readOnly: boolean; cinematic?: boolean;
+  onAnswer: (id: string, city: Mode) => void;
 }) {
+  const locked = snapshot.manual.reviewingJobId !== null;
+  return <article className={`request-card policy-card ${cinematic ? 'cinematic-policy' : ''}`}>
+    <div className="request-meta"><span className="request-kind policy-kind"><ShieldCheck />{cinematic ? 'Human approval required' : 'Human approval'}</span>
+      {proposal && <span className="draft-source">{proposal.source === 'CLAUDE' ? 'Claude draft' : 'Offline draft'}</span>}
+    </div>
+    <h3>Approve zone policy</h3>
+    <p>{cinematic ? 'Treat dark signals as four-way stops.' : 'Treat dark signals as four-way stops across the outage zone.'}</p>
+    {!cinematic && <div className="policy-scope"><Zap />{contribution(job, 'dark signals')} dark signals · {contribution(job, 'confirm requests cleared')} confirmations to clear</div>}
+    {!cinematic && proposal && <details className="job-explanation"><summary>Review the draft<ChevronRight /></summary><p>{proposal.rationale}</p></details>}
+    <div className={cinematic ? 'cinematic-policy-actions' : 'policy-action'}>
+      <button className="action-button primary" disabled={readOnly || locked} onClick={() => onAnswer(job.id, snapshot.mode)}>
+        {readOnly ? 'Recorded policy' : locked ? 'Review in progress' : 'Approve policy'}{!cinematic && <ArrowRight />}
+      </button>
+      {cinematic && <details className="cinematic-policy-review"><summary>Review details</summary><div><p>{job.sub}</p>{proposal && <p>{proposal.rationale}</p>}</div></details>}
+    </div>
+
+  </article>;
+}
+
+function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnly, paused, onTakeOver, onBlackout, onCollapse, compact = false }: {
+  snapshot: SimSnapshot; mode: Mode; onModeChange: (mode: Mode) => void;
+  onAnswer: (id: string, city: Mode) => void; proposal?: ChaosResult | null;
+  readOnly: boolean; paused: boolean; onTakeOver: () => void; onBlackout: () => void; onCollapse?: () => void; compact?: boolean;
+}) {
+  const [filter, setFilter] = useState<'all' | 'corridor' | 'blocking'>('all');
   const manual = snapshot.control === 'MANUAL';
-  const locked = snapshot.manual.lockRemainingS > 0;
-  const m = snapshot.metrics;
-  const util = Math.min(m.rho / 6.5, 1);
-  const rhoTone: Tone = m.rho > 1 ? 'red' : m.rho > 0.7 ? 'amber' : 'cyan';
-  const shown = snapshot.jobs.slice(0, 12);
-
-  return (
-    <section className="dg-panel flex min-h-[440px] flex-col overflow-hidden lg:min-h-0">
-      <PanelHeader title="Request queue" tone={snapshot.jobs.length ? (manual ? 'red' : 'cyan') : 'idle'}>
-        <Badge>REQ {m.requests}</Badge>
-        <Badge>JOBS {readOnly ? m.jobs : snapshot.jobs.length}</Badge>
-      </PanelHeader>
-
-      {readOnly && <p className="border-b border-dg-line px-4 py-2 text-xs text-dg-label">
-        Recorded queue (up to 8 jobs). Go LIVE to answer requests.
-      </p>}
-
-      <div className="space-y-3 border-b border-dg-line px-4 py-3">
-        <div>
-          <div className="flex items-baseline justify-between">
-            <span className="dg-label">Operator load ρ</span>
-            <span className={`font-mono text-2xl font-semibold tabular-nums ${TONE_TEXT[rhoTone]}`}>{m.rho.toFixed(2)}</span>
-          </div>
-          <div className="relative mt-1.5 h-1.5 rounded-full bg-white/[0.06]">
-            <div className={`h-full rounded-full bg-current transition-[width] duration-500 ${TONE_TEXT[rhoTone]}`} style={{ width: `${util * 100}%` }} />
-            <span aria-hidden="true" className="absolute -top-1 h-3.5 w-px bg-white/80" style={{ left: `${100 / 6.5}%` }} />
-          </div>
-          <p className="mt-1 text-[11px] text-dg-label">ρ above 1 means requests arrive faster than operators can answer.</p>
-        </div>
-
-        <ul className="space-y-1">
-          {snapshot.operators.map((op) => {
-            const busy = op.task !== 'idle';
-            const reviewing = manual && locked;
-            return (
-              <li key={op.id} className="flex items-center gap-2 rounded-lg border border-dg-line bg-white/[0.02] px-2 py-1.5">
-                <span className="w-12 shrink-0 font-mono text-[11px] uppercase text-slate-400">{op.id}</span>
-                <span className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${
-                  busy ? 'bg-dg-cyan/15 text-dg-cyan shadow-[0_0_10px_-2px_rgba(56,189,248,.6)]' : 'bg-white/[0.05] text-slate-500'}`}>
-                  {busy ? 'ACTIVE' : 'IDLE'}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-slate-300">{busy ? op.task : 'Standing by'}</span>
-                {reviewing && (
-                  <span className="h-1 w-12 shrink-0 overflow-hidden rounded-full bg-white/10">
-                    <span className="block h-full bg-dg-red" style={{ width: `${(1 - snapshot.manual.lockRemainingS / REVIEW_LOCK_REAL_S) * 100}%` }} />
-                  </span>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+  const locked = snapshot.manual.reviewingJobId !== null;
+  const zone = snapshot.jobs.find(job => job.kind === 'ZONE_POLICY');
+  const jobs = snapshot.jobs.filter(job => job.kind !== 'ZONE_POLICY');
+  const filtered = jobs.filter(job => filter === 'all' || contribution(job, filter === 'corridor' ? 'on corridor' : 'inside box') > 0);
+  const shown = filtered.slice(0, compact ? 3 : 40);
+  const busy = snapshot.operators.filter(operator => operator.task !== 'idle').length;
+  const policyActive = snapshot.policy.darkSignalsAsFourWayStop.length > 0;
+  return <section className={`request-feed ${compact ? 'is-compact' : ''}`}>
+    <div className="panel-title"><h2>{compact ? `${cityShort(mode)} · ${manual ? 'You are the operator' : 'Policy review'}` : 'Live requests'}</h2>
+      {onCollapse && <button className="icon-button" aria-label="Collapse request panel" onClick={onCollapse}><ChevronLeft /></button>}
+    </div>
+    {!compact && <>
+      <ModeSwitch mode={mode} onChange={onModeChange} />
+      <div className="queue-summary"><div><strong className={snapshot.metrics.requests ? 'text-dg-amber' : ''}>{snapshot.metrics.requests}</strong><span>Requests waiting</span></div><div><strong>{readOnly ? snapshot.metrics.jobs : snapshot.jobs.length}</strong><span>Dispatch jobs</span></div></div>
+      <div className="queue-order"><ListFilter />{mode === 'FIFO' ? 'First come, first served' : 'Sorted by impact / handling time'}</div>
+      <div className="queue-filters" role="group" aria-label="Filter requests">
+        {(['all', 'corridor', 'blocking'] as const).map(value => <button key={value} aria-pressed={filter === value} onClick={() => setFilter(value)}>{value === 'all' ? 'All' : value === 'corridor' ? 'Corridor' : 'Blocking'}</button>)}
       </div>
-
-      {manual && !readOnly && (
-        <p className="flex items-center justify-between gap-2 border-b border-dg-red/30 bg-dg-red/10 px-4 py-2 text-sm text-[#ffc2cd]">
-          <span>{locked ? `Reviewing… ${snapshot.manual.lockRemainingS.toFixed(1)} s` : 'You are the operator. Click a card.'}</span>
-          <span className="font-mono text-xs tabular-nums">YOU {snapshot.manual.answered} · WAITING {snapshot.jobs.length}</span>
-        </p>
-      )}
-
-      {shown.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
-          <svg aria-hidden="true" viewBox="0 0 80 80" className="size-20">
-            {[34, 24, 14].map((r) => <circle key={r} cx="40" cy="40" r={r} fill="none" stroke="rgb(56 189 248 / 0.25)" strokeDasharray="3 5" />)}
-            <circle cx="40" cy="40" r="3" fill="#38bdf8" />
-          </svg>
-          <p className="dg-label">Queue clear</p>
-          <p className="text-xs text-dg-label">No robotaxi is waiting for an operator.</p>
-        </div>
-      ) : (
-        <ol className="flex-1 space-y-2 overflow-y-auto px-4 py-3">
-          {shown.map((j, i) => {
-            const zone = j.kind === 'ZONE_POLICY';
-            return (
-              <li key={j.id} className="[animation:dg-rise_.25s_ease-out]">
-                <button disabled={readOnly || locked || !(manual || zone)} onClick={() => onAnswer(j.id)}
-                  className={`flex w-full items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 enabled:hover:-translate-y-px disabled:cursor-default ${
-                    zone
-                      ? 'border-dg-cyan/60 bg-dg-cyan/[0.07] shadow-[0_0_24px_-10px_rgba(56,189,248,.9)] enabled:hover:bg-dg-cyan/[0.12]'
-                      : 'border-dg-line bg-white/[0.02] enabled:hover:border-white/20 enabled:hover:bg-white/[0.05]'}`}>
-                  <span className="pt-0.5 font-mono text-[11px] tabular-nums text-slate-500">#{String(i + 1).padStart(2, '0')}</span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm text-slate-100">{j.title}</span>
-                    <span className="block truncate text-xs text-dg-label">{j.sub}</span>
-                    {zone && proposal && (
-                      <span className="mt-2 block rounded-lg border border-dg-cyan/25 bg-black/30 px-2.5 py-2">
-                        <span className="mb-1 flex items-center gap-1.5 font-mono text-[9px] font-semibold tracking-[0.16em] text-dg-cyan">
-                          <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3" fill="currentColor"><path d="M8 0l1.6 5.2L15 7l-5.4 1.8L8 14l-1.6-5.2L1 7l5.4-1.8z" /></svg>
-                          {proposal.source === 'CLAUDE' ? 'DRAFTED BY CLAUDE' : 'DRAFTED BY OFFLINE RULES'}
-                        </span>
-                        <span className="line-clamp-4 block text-xs leading-relaxed text-slate-200">{proposal.rationale}</span>
-                      </span>
-                    )}
-                  </span>
-                  <span className="flex shrink-0 flex-col items-end gap-1">
-                    <span className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-[0.14em] ${KIND_PILL[j.kind]}`}>
-                      {zone ? 'ZONE POLICY' : j.kind}
-                    </span>
-                    {!zone && <span className="font-mono text-[10px] tabular-nums text-slate-500">w/p {(j.w / j.p).toFixed(2)}</span>}
-                    {zone && <span className="font-mono text-[10px] text-dg-cyan">Human approval</span>}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-          {snapshot.jobs.length > shown.length && (
-            <li className="pt-1 text-center font-mono text-[11px] text-slate-500">+{snapshot.jobs.length - shown.length} more waiting</li>
-          )}
-        </ol>
-      )}
-    </section>
-  );
+    </>}
+    {readOnly && <p className="queue-notice"><Clock3 />Recorded queue, up to 8 jobs. Return to LIVE to review.</p>}
+    {locked && <p className="queue-notice is-review" role="status"><Clock3 /><span>{paused ? 'Review paused. Resume to finish.' : `Reviewing · ${Math.ceil(snapshot.manual.lockRemainingS * SIM_SPEED)} sim s remaining`}</span></p>}
+    {policyActive && <p className="policy-active"><Check />Zone policy active</p>}
+    <div className="request-scroll">
+      {zone && <ZonePolicyCard job={zone} snapshot={snapshot} proposal={proposal} readOnly={readOnly} onAnswer={onAnswer} />}
+      {shown.map(job => {
+        const corridor = contribution(job, 'on corridor') > 0;
+        const blocking = contribution(job, 'inside box') > 0;
+        const passenger = contribution(job, 'passenger') > 0;
+        const batch = job.requestIds.length > 1;
+        const stuck = job.kind === 'STUCK' || job.title.startsWith('Stuck');
+        const label = mode === 'FIFO' ? 'FIFO' : corridor ? 'Corridor' : blocking ? 'Blocking' : batch ? 'Batch' : stuck ? 'Stuck' : 'Confirmation';
+        const title = blocking ? 'Clear a blocked intersection' : stuck ? 'Vehicle unable to proceed' : batch ? 'Confirm dark signals' : 'Confirm a dark signal';
+        const node = job.sub.match(/node\s+(-?\d+)/)?.[1];
+        const weight = snapshot.policy.triageWeights.perQueuedBehind;
+        const behind = weight > 0 ? contribution(job, 'queued behind') / weight : null;
+        return <article className={`request-card ${corridor || blocking || stuck ? 'is-urgent' : ''}`} key={job.id}>
+          <div className="request-meta"><span className={`request-kind ${corridor || blocking || stuck ? 'urgent-kind' : ''}`}><span />{label}</span>
+            <span className="request-wait" title="Waiting time in simulation seconds"><Clock3 />{formatT(Math.max(0, snapshot.t - job.createdAt))} sim</span>
+          </div>
+          <h3>{title}</h3>
+          <div className="request-location"><CarFront />{batch ? `${job.vehicleIds.length} vehicles` : `Vehicle #${job.vehicleIds[0]}`}{node && <> · Node {node}</>}</div>
+          <p>{blocking ? `Stopped inside an intersection${corridor ? ' on the ambulance route' : ''}.` : stuck ? 'Waiting in traffic long enough to request operator assistance.' : batch ? 'Answer compatible confirmation requests at this intersection together.' : 'Waiting for an operator to confirm passage through a dark signal.'}</p>
+          <div className="request-tags">{corridor && <span><Route />Ambulance route</span>}{blocking && <span>Inside intersection</span>}{passenger && <span>Passenger</span>}{batch && <span><Layers3 />{job.requestIds.length} requests</span>}</div>
+          <details className="job-explanation"><summary><span>{behind !== null && behind > 0 ? `${behind} queued behind · ` : ''}{job.p} s handling</span><CircleHelp /></summary>
+            <div><p>Priority {job.w.toFixed(1)} / {job.p} s = {(job.w / job.p).toFixed(2)} per second.</p>{job.breakdown.map(term => <span className="breakdown-term" key={term.label}>{term.label}<strong>{term.value.toFixed(1)}</strong></span>)}</div>
+          </details>
+          <button className="action-button secondary" disabled={readOnly || locked || !manual} onClick={() => onAnswer(job.id, snapshot.mode)}>
+            {readOnly ? 'Recorded request' : !manual ? 'Auto operators active' : locked ? 'Review in progress' : batch ? 'Review batch' : 'Review request'}{manual && !locked && <ArrowRight />}
+          </button>
+        </article>;
+      })}
+      {filtered.length > shown.length && <p className="queue-tail">{filtered.length - shown.length} more jobs waiting{compact ? ' · exit presentation to see all' : ''}</p>}
+      {!zone && !shown.length && <div className="queue-empty"><ShieldCheck /><h3>{locked ? 'Review in progress' : filter === 'all' ? 'The queue is clear.' : 'No matching requests.'}</h3>
+        <p>{locked ? 'The current review will finish as simulation time advances.' : snapshot.darkNodes.length ? 'Requests will appear here when a vehicle needs assistance.' : 'The city is moving. Trigger a blackout to begin the demonstration.'}</p>
+        {!snapshot.darkNodes.length && !readOnly && <button className="action-button warning" onClick={onBlackout}><Zap />Trigger blackout</button>}
+      </div>}
+    </div>
+    <div className="queue-control">
+      <div><UsersRound /><span>{manual ? `Judge control · ${snapshot.manual.answered} answered` : `${snapshot.operators.length} operators · ${busy} active`}</span></div>
+      <button className="text-button" disabled={readOnly} onClick={onTakeOver}>{manual ? 'Return to auto' : 'Take over'}<ArrowRight /></button>
+    </div>
+  </section>;
 }
 
-// Stand-in for the metrics panel: each number compared with the other city.
-function KpiPanel({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnapshot }) {
-  const m = snapshot.metrics, o = other.metrics;
-  const dg = snapshot.mode === 'DARKGRID';
-  const otherName = cityShort(other.mode);
-  const kpis: { label: string; v: number; o: number; digits?: number }[] = [
-    { label: 'Open requests', v: m.requests, o: o.requests },
-    { label: 'Arrivals / min', v: m.lambdaPerMin, o: o.lambdaPerMin },
-    { label: 'Load ρ', v: m.rho, o: o.rho, digits: 2 },
-    { label: 'Stuck vehicles', v: m.stuck, o: o.stuck },
-    { label: 'Blocking veh·min', v: m.blockingVehMin, o: o.blockingVehMin },
-  ];
+function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse, onCompare }: {
+  snapshot: SimSnapshot; rival: SimSnapshot; graph: RoadGraph; follow: boolean;
+  onFollow: () => void; onCollapse: () => void; onCompare: () => void;
+}) {
   const amb = snapshot.ambulance;
-  const ambTone: Tone = !amb ? 'idle' : amb.status === 'ARRIVED' ? 'green' : amb.status === 'STUCK' ? 'red' : amb.status === 'EN_ROUTE' ? 'cyan' : 'idle';
-
-  return (
-    <section className="dg-panel flex min-h-0 flex-col overflow-hidden">
-      <PanelHeader title={dg ? 'DARK GRID · triage' : 'FIFO · first come, first served'} tone={dg ? 'cyan' : m.rho > 1 ? 'red' : 'idle'} />
-      <div className="grid min-h-0 flex-1 grid-cols-2 gap-1.5 overflow-y-auto p-2 sm:grid-cols-3">
-        {kpis.map((k) => {
-          const max = Math.max(k.v, k.o, 1e-9);
-          const pct = k.o === 0 ? null : ((k.v - k.o) / k.o) * 100;
-          const better = k.v < k.o, worse = k.v > k.o;
-          return (
-            <div key={k.label} className="rounded-lg border border-dg-line bg-white/[0.02] px-2.5 py-2">
-              <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">{k.label}</p>
-              <p className="mt-1 font-mono text-xl font-semibold tabular-nums text-slate-50">{k.v.toFixed(k.digits ?? 0)}</p>
-              <div className="mt-1.5 h-1 rounded-full bg-white/[0.06]">
-                <div className={`h-full rounded-full transition-[width] duration-500 ${dg ? 'bg-dg-cyan' : 'bg-slate-400'}`} style={{ width: `${(k.v / max) * 100}%` }} />
-              </div>
-              <p className={`mt-1 font-mono text-[10px] tabular-nums ${better ? 'text-dg-green' : worse ? 'text-dg-red' : 'text-slate-500'}`}>
-                {pct === null || (!better && !worse) ? `= ${otherName}` : `${better ? '▼' : '▲'} ${Math.abs(pct).toFixed(0)}% vs ${otherName}`}
-              </p>
-            </div>
-          );
-        })}
-        <div className="rounded-lg border border-dg-line bg-white/[0.02] px-2.5 py-2">
-          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Ambulance</p>
-          <p className={`mt-1 font-mono text-xl font-semibold tabular-nums ${amb ? 'text-slate-50' : 'text-slate-600'}`}>
-            {amb ? formatT(amb.tripS) : '--:--'}
-          </p>
-          <span className={`mt-1.5 inline-flex items-center gap-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] ${TONE_TEXT[ambTone]}`}>
-            <Dot tone={ambTone} pulse={amb?.status === 'STUCK'} />{amb ? amb.status.replace('_', ' ') : 'STANDBY'}
-          </span>
-        </div>
-      </div>
-    </section>
-  );
+  const downtown = Math.abs(graph.center.lat - 37.788) < 0.01 && Math.abs(graph.center.lng + 122.406) < 0.01;
+  const status = !amb ? 'Standing by' : amb.status === 'WAITING' ? 'Awaiting dispatch' : amb.status === 'ARRIVED' ? 'Patient delivered' : amb.status === 'STUCK' ? 'Ambulance stuck' : 'Patient en route';
+  const routeLabel = downtown ? 'Station 35 → Chinese Hospital' : 'Fire station → Hospital';
+  const policyActive = snapshot.policy.darkSignalsAsFourWayStop.length > 0;
+  const dg = snapshot.mode === 'DARKGRID';
+  return <section className="mission-overview">
+    <div className="panel-title"><h2>Mission overview</h2><button className="icon-button" aria-label="Collapse mission panel" onClick={onCollapse}><ChevronRight /></button></div>
+    <div className={`ambulance-summary ${amb?.status === 'ARRIVED' ? 'has-arrived' : ''}`}><div className="ambulance-icon"><Ambulance /></div><div><h3>{status}</h3><p>{routeLabel}</p>{amb && amb.status !== 'WAITING' && <strong className="mission-time">{formatT(amb.tripS)}<span> elapsed</span></strong>}</div></div>
+    <button className="action-button secondary follow-button" disabled={!amb} aria-pressed={follow} onClick={onFollow}><Crosshair />{follow ? 'Stop following' : 'Follow ambulance'}</button>
+    <div className="mission-section"><h3><Route />Dispatch strategy</h3>
+      <ul className="strategy-list">
+        <li><ListFilter /><span>{dg ? 'WSPT triage' : 'First come, first served'}</span><span className="strategy-state">{dg ? 'Impact first' : 'Oldest first'}</span></li>
+        <li><Layers3 /><span>Batch confirmations</span>{dg ? <Check /> : <span className="strategy-state">Off</span>}</li>
+        <li><MapPin /><span>Curb & staging</span>{dg && snapshot.darkNodes.length ? <Check /> : <span className="strategy-state">{dg ? 'Standby' : 'Off'}</span>}</li>
+        <li><Ambulance /><span>Ambulance corridor</span>{snapshot.corridor.length ? <Check /> : <span className="strategy-state">Standby</span>}</li>
+        <li><ShieldCheck /><span>Zone policy</span><span className={`strategy-state ${policyActive ? 'is-active' : ''}`}>{policyActive ? 'Approved' : snapshot.darkNodes.length && dg ? 'Needs approval' : 'Standby'}</span></li>
+      </ul>
+    </div>
+    <div className="mission-section"><h3><ChartNoAxesCombined />Live metrics</h3><dl className="mission-metrics">
+      <div><dt>Requests waiting</dt><dd>{snapshot.metrics.requests}</dd></div><div><dt>Operator load ρ</dt><dd className={snapshot.metrics.rho > 1 ? 'text-dg-red' : ''}>{snapshot.metrics.rho.toFixed(2)}</dd></div><div><dt>Stuck vehicles</dt><dd>{snapshot.metrics.stuck}</dd></div>
+    </dl><button className="text-button" onClick={onCompare}>Open comparison<ArrowRight /></button></div>
+    <div className="mission-footnote"><span className="quiet-badge">Same seed · same outage</span><p>{cityShort(rival.mode)} is running alongside this city. Civilian traffic is visual only.</p></div>
+  </section>;
 }
+
+function ComparisonMetrics({ fifo, darkgrid }: { fifo: SimSnapshot; darkgrid: SimSnapshot }) {
+  const rows = [
+    ['Requests waiting', fifo.metrics.requests.toString(), darkgrid.metrics.requests.toString()],
+    ['Operator load ρ', fifo.metrics.rho.toFixed(2), darkgrid.metrics.rho.toFixed(2)],
+    ['Stuck vehicles', fifo.metrics.stuck.toString(), darkgrid.metrics.stuck.toString()],
+    ['Blocking vehicle-min', fifo.metrics.blockingVehMin.toFixed(0), darkgrid.metrics.blockingVehMin.toFixed(0)],
+    ['Ambulance trip', fifo.metrics.ambulanceTripS === null ? 'Not arrived' : formatT(fifo.metrics.ambulanceTripS), darkgrid.metrics.ambulanceTripS === null ? 'Not arrived' : formatT(darkgrid.metrics.ambulanceTripS)],
+  ];
+  return <section className="comparison-metrics"><h3>From this simulation</h3><table><thead><tr><th scope="col">Metric</th><th scope="col">FIFO</th><th scope="col">DARK GRID</th></tr></thead><tbody>{rows.map(([label, f, d]) => <tr key={label}><th scope="row">{label}</th><td>{f}</td><td>{d}</td></tr>)}</tbody></table></section>;
+}
+
+// Scene-local CSS: the approved presentation composition, separate from the
+// denser operations workspace. All selectors remain under the DARK GRID root.
+const CINEMATIC_STYLES = `
+.dg-workspace .workspace-brand > svg { color: #d9e4e9; }
+.dg-workspace .policy-action > button { width: 100%; }
+.dg-workspace.is-presenting .workspace-header { height: 60px; flex-basis: 60px; padding: 0 30px; background: #101c26; }
+.dg-workspace.is-presenting .workspace-brand h1 { font-size: 18px; letter-spacing: .17em; }
+.dg-workspace.is-presenting .workspace-environment { display: block; color: #e0e6eb; font-size: 14px; }
+.dg-workspace.is-presenting .city-status { position: absolute; left: 50%; transform: translateX(-50%); margin: 0; font-size: 14px; font-weight: 500; }
+.dg-workspace.is-presenting .header-actions { margin-left: auto; }
+.dg-workspace.is-presenting .header-clock, .dg-workspace.is-presenting .session-menu, .dg-workspace.is-presenting .present-button > svg { display: none; }
+.dg-workspace.is-presenting .present-button { min-height: 36px; font-size: 13px; padding: 0 14px; gap: 12px; }
+.dg-workspace.is-presenting .city-status > span { box-shadow: 0 0 9px #f5b24a88; }
+.dg-workspace.is-presenting .city-stage > .patient-clock { display: none; }
+.dg-workspace.is-presenting .tactical-city .city-model-toggle,
+.dg-workspace.is-presenting .tactical-city .map-camera-controls,
+.dg-workspace.is-presenting .tactical-city .map-legend,
+.dg-workspace.is-presenting .tactical-city .map-follow-button { display: none; }
+.dg-workspace.is-presenting .presentation-queue { left: 30px; bottom: 155px; width: 405px; max-height: calc(100% - 185px); background: #131d26ed; border-color: #657179; border-radius: 12px; backdrop-filter: blur(12px); box-shadow: 0 10px 28px #0004; }
+.dg-workspace.is-presenting .presentation-queue.policy-only { overflow: visible; }
+.dg-workspace .cinematic-policy { position: relative; margin: 0; padding: 22px; background: transparent; border: 0; border-radius: 12px; }
+.dg-workspace .cinematic-policy .request-meta { margin-bottom: 14px; }
+.dg-workspace .cinematic-policy .request-kind { padding: 0; background: transparent; font-size: 12px; font-weight: 400; color: #ffd16e; }
+.dg-workspace .cinematic-policy .request-kind > svg { width: 13px; height: 13px; }
+.dg-workspace .cinematic-policy h3 { margin-bottom: 12px; font-size: 25px; font-weight: 500; letter-spacing: -.03em; }
+.dg-workspace .cinematic-policy > p { margin-bottom: 21px; font-size: 15px; line-height: 1.5; }
+.dg-workspace .cinematic-policy .draft-source { padding: 5px 7px; font-size: 10px; background: #30363b; }
+.dg-workspace .cinematic-policy-actions { display: grid; grid-template-columns: 1.15fr 1fr; gap: 12px; align-items: stretch; }
+.dg-workspace .cinematic-policy-actions > button, .dg-workspace .cinematic-policy-review > summary { min-height: 43px; border-radius: 7px; font-size: 13px; }
+.dg-workspace .cinematic-policy-actions > button { background: #009da6; color: #f4feff; }
+.dg-workspace .cinematic-policy-review > summary { display: flex; align-items: center; justify-content: center; list-style: none; border: 1px solid #67717b; color: #e4ecf1; }
+.dg-workspace .cinematic-policy-review > summary::-webkit-details-marker { display: none; }
+.dg-workspace .cinematic-policy-review > div { position: absolute; bottom: calc(100% + 10px); left: 0; width: 100%; padding: 17px 20px; border: 1px solid #68747b; border-radius: 10px; background: #14222ff5; font-size: 13px; line-height: 1.6; color: #d6e2e9; }
+.dg-workspace.is-presenting .playback-dock { bottom: 28px; max-width: 780px; width: calc(100% - 64px); border-radius: 12px; padding: 12px 18px 9px; background: #111c25ed; backdrop-filter: blur(12px); border-color: #718088; }
+.dg-workspace .demo-act-nav { display: flex; justify-content: space-between; gap: 8px; padding: 0 0 14px; margin-bottom: 7px; border-bottom: 1px solid #495762; }
+.dg-workspace .demo-act-nav > button { display: flex; align-items: center; gap: 10px; padding: 0 5px; min-height: 34px; font-size: 12px; color: #e1e8ed; background: transparent; border: 0; border-radius: 5px; }
+.dg-workspace .demo-act-nav > button > span { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid #b6c3cb; border-radius: 50%; color: #e1e8ed; font-size: 12px; }
+.dg-workspace .demo-act-nav > button[aria-current="step"] { color: #ffd065; }
+.dg-workspace .demo-act-nav > button[aria-current="step"] > span { border-color: #ffbf38; background: #ffbf38; color: #1b211e; }
+.dg-workspace .with-director .playback-row { gap: 12px; min-height: 37px; }
+.dg-workspace .with-director .playback-state { display: inline; font-size: 12px; }
+.dg-workspace .with-director [aria-label="Current simulation time"] { display: none; }
+.dg-workspace .with-director [aria-label="Simulation timeline"] input { accent-color: #ffbf38; }
+.dg-workspace .with-director input::-webkit-slider-thumb { background: #ffbf38 !important; }
+.dg-workspace .with-director input::-moz-range-thumb { background: #ffbf38 !important; }
+.dg-workspace .dock-reset { display: flex; align-items: center; gap: 9px; padding: 7px 4px 7px 18px; margin-left: 5px; border: 0; border-left: 1px solid #50616c; color: #e3edf3; background: transparent; font-size: 12px; }
+.dg-workspace .dock-reset svg { width: 17px; height: 17px; }
+.dg-workspace .presentation-footnote { position: absolute; left: 16px; bottom: 8px; color: #c2cbd1; font-size: 9px; text-shadow: 0 1px 3px #000; pointer-events: none; z-index: 30; }
+.dg-workspace .mission-map-pin { position: absolute; left: 0; top: 0; display: flex; gap: 9px; align-items: center; padding: 9px 12px; color: #f0f3f6; background: #15212bf0; border: 1px solid #8c9499; border-radius: 9px; pointer-events: none; white-space: nowrap; }
+.dg-workspace .mission-map-pin > svg { width: 21px; height: 21px; color: #fff2de; }
+.dg-workspace .mission-map-pin strong { font-size: 13px; font-weight: 500; }
+.dg-workspace .mission-map-pin > div { display: flex; flex-direction: column; gap: 4px; }
+.dg-workspace .mission-map-pin span { font-size: 12px; color: #f1ce77; }
+.dg-workspace .hospital-pin { padding: 7px 10px; border: 0; background: #101b25f0; border-radius: 5px; }
+.dg-workspace .hospital-pin > svg { width: 16px; height: 16px; color: #ff7d8d; fill: #b53144; }
+@media (max-width: 760px) {
+  .dg-workspace.is-presenting .workspace-header { height: 54px; flex-basis: 54px; padding: 0 12px; }
+  .dg-workspace.is-presenting .workspace-brand h1 { font-size: 13px; }
+  .dg-workspace.is-presenting .workspace-environment, .dg-workspace.is-presenting .city-status { display: none; }
+  .dg-workspace.is-presenting .presentation-queue { left: 12px; width: min(350px, calc(100% - 24px)); bottom: 150px; }
+  .dg-workspace .cinematic-policy { padding: 17px; }
+  .dg-workspace .cinematic-policy h3 { font-size: 21px; }
+  .dg-workspace .cinematic-policy > p { font-size: 13px; margin-bottom: 15px; }
+  .dg-workspace.is-presenting .playback-dock { width: calc(100% - 24px); bottom: 25px; padding: 9px 9px 6px; }
+  .dg-workspace .demo-act-nav { gap: 0; }
+  .dg-workspace .demo-act-nav > button { flex-direction: column; gap: 5px; font-size: 9px; padding: 0 3px; }
+  .dg-workspace .demo-act-nav > button > span { width: 22px; height: 22px; font-size: 10px; }
+  .dg-workspace .with-director .playback-row { gap: 3px; }
+  .dg-workspace .with-director .playback-state { display: none; }
+  .dg-workspace .dock-reset { font-size: 0; padding-left: 7px; }
+  .dg-workspace .mission-map-pin strong { font-size: 11px; }
+  .dg-workspace .mission-map-pin span { font-size: 10px; }
+}
+`;

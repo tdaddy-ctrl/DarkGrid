@@ -4,7 +4,8 @@
 // invented. Ask about a rank with "#3"; the default is #1, the job answered next.
 // The mic uses the browser's speech recognition where it exists (Chrome, Safari).
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { ArrowRight, CircleHelp, Mic, Square } from 'lucide-react';
 import type { Job } from '@/types/sim';
 
 type Recognizer = {
@@ -17,13 +18,6 @@ type Recognizer = {
   stop(): void;
 };
 type SpeechWindow = { SpeechRecognition?: new () => Recognizer; webkitSpeechRecognition?: new () => Recognizer };
-
-const BARS = 44;
-// Symmetric spectrum: tall in the middle, low at both ends, with a little texture.
-const PROFILE = Array.from({ length: BARS }, (_, i) => {
-  const x = (i - (BARS - 1) / 2) / (BARS * 0.24);
-  return 0.12 + 0.88 * Math.exp(-x * x) * (0.55 + 0.45 * Math.abs(Math.sin(i * 1.7)));
-});
 
 const fmt = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
 const tag = (rank: number) => `#${String(rank).padStart(3, '0')}`;
@@ -45,84 +39,45 @@ export function explainJob(job: Job | undefined, rank: number): string {
     + `Priority ${fmt(job.w)} / ${fmt(job.p)} s = ${(job.w / job.p).toFixed(2)} per s.${batch}`;
 }
 
-export default function AskWhyBar({ jobs }: { jobs: Job[] }) {
+export default function AskWhyBar({ jobs, contextKey = 'live', active = true }: { jobs: Job[]; contextKey?: string; active?: boolean }) {
   const [question, setQuestion] = useState('');
-  const [answer, setAnswer] = useState<string | null>(null);
+  const [answer, setAnswer] = useState<{ text: string; context: string } | null>(null);
   const [listening, setListening] = useState(false);
   const recRef = useRef<Recognizer | null>(null);
+  const currentRef = useRef({ jobs, contextKey });
+  useEffect(() => { currentRef.current = { jobs, contextKey }; }, [jobs, contextKey]);
+  useEffect(() => () => { recRef.current?.stop(); recRef.current = null; }, [contextKey, active]);
 
   const ask = (q: string) => {
+    const current = currentRef.current;
     const rank = Number(q.match(/#?\s*(\d+)/)?.[1] ?? 1) || 1;
-    setAnswer(explainJob(jobs[rank - 1], rank));
+    setAnswer({ text: explainJob(current.jobs[rank - 1], rank), context: current.contextKey });
   };
-
   const toggleMic = () => {
     if (listening) { recRef.current?.stop(); return; }
     const w = window as unknown as SpeechWindow;
     const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition;
-    if (!Ctor) { setAnswer('Voice input is not supported in this browser. Type the question instead.'); return; }
+    if (!Ctor) { setAnswer({ text: 'Voice input is not supported in this browser. Type your question instead.', context: contextKey }); return; }
     const rec = new Ctor();
-    rec.lang = 'en-US';
-    rec.interimResults = false;
-    rec.onresult = (e) => {
-      const said = e.results[0]?.[0]?.transcript ?? '';
-      setQuestion(said);
-      ask(said);
-    };
-    rec.onend = () => setListening(false);
-    rec.onerror = () => setListening(false);
+    rec.lang = 'en-US'; rec.interimResults = false;
+    rec.onresult = e => { const said = e.results[0]?.[0]?.transcript ?? ''; setQuestion(said); ask(said); };
+    rec.onend = () => { recRef.current = null; setListening(false); };
+    rec.onerror = () => { recRef.current = null; setListening(false); setAnswer({ text: 'Voice input could not start. You can type your question below.', context: currentRef.current.contextKey }); };
     recRef.current = rec;
-    setListening(true);
-    rec.start();
+    try { rec.start(); setListening(true); }
+    catch { recRef.current = null; setListening(false); setAnswer({ text: 'Voice input could not start. You can type your question below.', context: contextKey }); }
   };
-
-  return (
-    <section className="dg-panel flex min-h-0 flex-col gap-2.5 overflow-y-auto p-4">
-      <h2 className="dg-label flex items-center gap-2">
-        <span aria-hidden="true" className={`size-1.5 rounded-full bg-current ${listening ? 'text-dg-cyan [animation:dg-breathe_1.2s_ease-in-out_infinite]' : 'text-slate-500'}`} />
-        Ask why
-      </h2>
-
-      <div className="flex items-center gap-3">
-        <button onClick={toggleMic} aria-label={listening ? 'Stop listening' : 'Ask by voice'} aria-pressed={listening}
-          className={`grid size-11 shrink-0 place-items-center rounded-full border transition-colors ${
-            listening
-              ? 'border-dg-cyan bg-dg-cyan/20 text-dg-cyan shadow-[0_0_24px_-4px_rgba(56,189,248,.9)]'
-              : 'border-dg-line bg-white/[0.03] text-slate-200 hover:border-white/25 hover:bg-white/[0.07]'}`}>
-          <svg aria-hidden="true" viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <rect x="9" y="3" width="6" height="11" rx="3" />
-            <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
-          </svg>
-        </button>
-        <div aria-hidden="true" className="flex h-10 flex-1 items-center gap-[2px]">
-          {Array.from({ length: BARS }, (_, i) => (
-            <span key={i} className="h-full flex-1 origin-center rounded-full transition-opacity duration-300"
-              style={{
-                // Teal-green to sky; at rest the bars hold the symmetric profile, dimmed.
-                background: `linear-gradient(180deg, hsl(${160 + Math.abs(i - (BARS - 1) / 2) * 1.6} 80% 62%), hsl(${165 + Math.abs(i - (BARS - 1) / 2) * 1.6} 75% 38%))`,
-                opacity: listening ? 1 : 0.55,
-                transform: `scaleY(${PROFILE[i].toFixed(2)})`,
-                animation: listening ? `dg-wave ${0.7 + (i % 5) * 0.12}s ease-in-out ${(i * 0.05).toFixed(2)}s infinite` : undefined,
-              }} />
-          ))}
-        </div>
-      </div>
-
-      <form className="flex flex-col gap-2" onSubmit={(e) => { e.preventDefault(); ask(question); }}>
-        <label htmlFor="ask-why" className="dg-label">
-          Your question
-        </label>
-        <div className="flex gap-2">
-          <input id="ask-why" value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Why is #1 first?"
-            className="min-h-11 min-w-0 flex-1 rounded-xl border border-dg-line bg-black/40 px-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-dg-cyan/70 focus:shadow-[0_0_0_3px_rgba(56,189,248,.15)]" />
-          <button type="submit"
-            className="min-h-11 rounded-xl border border-dg-cyan/60 bg-linear-to-b from-dg-cyan/20 to-dg-cyan/5 px-5 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-dg-cyan transition-all duration-200 hover:-translate-y-px hover:border-dg-cyan hover:shadow-[0_0_24px_-6px_rgba(56,189,248,.9)]">
-            Ask
-          </button>
-        </div>
-      </form>
-
-      {answer && <p key={answer} aria-live="polite" className="rounded-xl border border-dg-line bg-black/40 p-3 font-mono text-sm leading-relaxed text-slate-200 [animation:dg-rise_.3s_ease-out]">{answer}</p>}
-    </section>
-  );
+  return <section className="analysis-panel why-panel">
+    <h2><CircleHelp />Ask why</h2>
+    <p className="analysis-description">Understand the reasoning behind a request’s position in the queue.</p>
+    <div className="why-example"><span>Try a question</span><button onClick={() => { setQuestion('Why is #1 first?'); ask('Why is #1 first?'); }}>Why is #1 first?<ArrowRight /></button></div>
+    <form onSubmit={e => { e.preventDefault(); ask(question); }}>
+      <label htmlFor="ask-why">Your question</label>
+      <div className="analysis-input-row"><input id="ask-why" value={question} onChange={e => setQuestion(e.target.value)} placeholder="Ask about #1, #2, or another request" />
+        <button type="button" className="icon-button mic-button" onClick={toggleMic} aria-label={listening ? 'Stop listening' : 'Ask by voice'} aria-pressed={listening}>{listening ? <Square /> : <Mic />}</button></div>
+      <button className="action-button secondary" type="submit">Explain decision<ArrowRight /></button>
+    </form>
+    {answer?.context === contextKey && <p className="why-answer" aria-live="polite">{answer.text}</p>}
+    <p className="analysis-footnote">Explanations come directly from the job’s priority, handling time, and impact breakdown.</p>
+  </section>;
 }

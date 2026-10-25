@@ -6,6 +6,7 @@
 // deck.gl is loaded inside useEffect, so nothing WebGL runs during server rendering.
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Ambulance as AmbulanceIcon, ChevronLeft, ChevronRight, Cross, Crosshair, House, Info, Layers3 } from 'lucide-react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
 import type { Ambulance, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
@@ -17,17 +18,16 @@ type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, ln
 // falls back to OpenStreetMap footprints extruded to their real heights.
 const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 const GOOGLE_TILES_URL = 'https://tile.googleapis.com/v1/3dtiles/root.json';
-const NIGHT_TINT: [number, number, number, number] = [6, 11, 19, 110];   // grades the daytime photo city to night
 // If no photo tile has loaded by then (blocked key, no network), switch to the OSM blocks
 // (instant, offline). A slow but working network keeps the photo city; it sharpens as tiles arrive.
-const PHOTO_TIMEOUT_MS = 20000;
+const PHOTO_TIMEOUT_MS = 60000;
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
-// Drawn over the buildings (tactical x-ray): the hazard, corridor and traffic must never hide behind towers.
-// They also never write depth, so a flat overlay can't hide a car standing on the real (lower) ground.
-const ON_TOP = { depthCompare: 'always' as const, depthWriteEnabled: false };
+// Ground overlays respect the city's depth buffer. Buildings occlude routes and
+// traffic naturally; overlays never write depth or create x-ray views.
+const SURFACE_DEPTH = { depthCompare: 'less-equal' as const, depthWriteEnabled: false };
 // Additive light: streetlights and the ambulance's flashers brighten what is under them.
-const GLOW = { ...ON_TOP, blend: true, blendColorOperation: 'add' as const, blendColorSrcFactor: 'src-alpha' as const, blendColorDstFactor: 'one' as const,
+const GLOW = { ...SURFACE_DEPTH, blend: true, blendColorOperation: 'add' as const, blendColorSrcFactor: 'src-alpha' as const, blendColorDstFactor: 'one' as const,
   blendAlphaOperation: 'add' as const, blendAlphaSrcFactor: 'one' as const, blendAlphaDstFactor: 'one-minus-src-alpha' as const };
 
 const STATE_RGB: Record<string, Rgba> = {
@@ -43,7 +43,8 @@ const CIVILIAN_PAINT: Rgba[] = [[24, 26, 30, 255], [70, 74, 82, 255], [130, 134,
 // (Salesforce Tower), so the hazard sits in the lower middle and the towers fill the top.
 const HOME = { longitude: -122.4030, latitude: 37.7776, zoom: 13.75, pitch: 60, bearing: 15 };
 // Downtown map: from Market & 6th looking northeast over Union Square to the FiDi towers and the bay.
-const HOME_DOWNTOWN = { longitude: -122.4078, latitude: 37.7838, zoom: 14.35, pitch: 58, bearing: 38 };
+const HOME_DOWNTOWN = { longitude: -122.4024, latitude: 37.7904, zoom: 15.1, pitch: 64, bearing: 24 };
+const PRESENT_DOWNTOWN = { longitude: -122.3988, latitude: 37.7915, zoom: 15.35, pitch: 66, bearing: -18 };
 const SWAY_DEG = 10;              // idle camera sways ±10° instead of spinning away from the skyline
 const SWAY_PERIOD_S = 40;
 const IDLE_BEFORE_ORBIT_MS = 5000;
@@ -176,15 +177,23 @@ class Glider {
 }
 const HAZARD_LABEL_ALT_M = 220;
 
-export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire', motion, follow = false, onFollowChange }: {
+export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter, hazardLabel = 'Substation fire', motion, follow = false, onFollowChange, presenting = false, active = true }: {
   snapshot: SimSnapshot; graph: RoadGraph; fallback: ReactNode; hazardCenter?: LatLng; hazardLabel?: string;
   motion?: () => Motion | null;              // live positions, read every frame (null while replaying)
   follow?: boolean;                          // chase camera behind the ambulance
+  presenting?: boolean;
+  active?: boolean;
   onFollowChange?: (on: boolean) => void;    // the user turned follow on or off (button, drag, camera button)
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelRef = useRef<HTMLDivElement>(null);
   const leaderRef = useRef<SVGLineElement>(null);
+  const hospitalLabelRef = useRef<HTMLDivElement>(null);
+  const ambulanceLabelRef = useRef<HTMLDivElement>(null);
+  const hospitalLeaderRef = useRef<SVGLineElement>(null);
+  const ambulanceLeaderRef = useRef<SVGLineElement>(null);
+  const presentingRef = useRef(presenting);
+  useEffect(() => { presentingRef.current = presenting; }, [presenting]);
   const snapRef = useRef(snapshot);
   const hazardRef = useRef<LatLng | undefined>(hazardCenter);
   useEffect(() => { hazardRef.current = hazardCenter; }, [hazardCenter]);
@@ -202,9 +211,18 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
   const carsRef = useRef(new Glider());
   const ambRef = useRef(new Glider());
-  const [hud, setHud] = useState({ pitch: HOME.pitch, bearing: HOME.bearing, lat: HOME.latitude, lng: HOME.longitude, zoom: HOME.zoom });
+  const activeRef = useRef(active);
+  useEffect(() => { activeRef.current = active; }, [active]);
+  const streamRef = useRef({ mode: snapshot.mode, t: snapshot.t });
 
   useEffect(() => {
+    const previous = streamRef.current;
+    if (previous.mode !== snapshot.mode || snapshot.t < previous.t) {
+      carsRef.current.items.clear(); ambRef.current.items.clear();
+      trailsRef.current = { map: new Map(), data: [] };
+      pushMotion(carsRef.current, ambRef.current, snapshot, performance.now());
+    }
+    streamRef.current = { mode: snapshot.mode, t: snapshot.t };
     snapRef.current = snapshot;
     // Short light trails: each vehicle keeps its last few positions; staged cars drop theirs.
     const trails = trailsRef.current;
@@ -243,7 +261,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           .catch((): [CarPart[], CarPart[]] => [[], []]);
         const geo = GOOGLE_KEY ? await import('@deck.gl/geo-layers').catch(() => null) : null;
         let photo = !!geo;
-        if (!photo) setSource('osm');
+        setSource(photo ? 'google' : 'osm');
         const res = await fetch('/data/sf_buildings.json');
         const buildings: Building[] = res.ok ? await res.json() : [];
         const groundRes = await fetch('/data/sf_ground.json').catch(() => null);
@@ -310,12 +328,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         switchRef.current = (to) => {
           autoFallback = false;
           if (to === 'osm') { fallBackToOsm(); return; }
-          if (!geo || photo) return;
+          if (!geo) return;
+          if (photo) { setSource('google'); return; }
           photo = true; tileErrors = 0; photoSince = performance.now();
           staticLayers = photoLayers();
           setSource('google');
         };
-        const tint = [[box.w - 0.05, box.s - 0.05], [box.e + 0.05, box.s - 0.05], [box.e + 0.05, box.n + 0.05], [box.w - 0.05, box.n + 0.05]] as Pt[];
         const photoLayers = (): Layer[] => [
           new geo!.Tile3DLayer({
             id: 'google-3d',
@@ -342,15 +360,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             onTileLoad: () => { tilesLoaded++; },
             onTileError: () => { if (autoFallback && ++tileErrors > 5) fallBackToOsm(); },
           }),
-          new L.SolidPolygonLayer({
-            id: 'night-tint', data: [tint], getPolygon: (d: Pt[]) => d, getFillColor: NIGHT_TINT, parameters: ON_TOP,
-          }),
           new L.PathLayer({
-            id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 12], parameters: ON_TOP,
+            id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 12], parameters: SURFACE_DEPTH,
             getWidth: 1, widthUnits: 'pixels',
           }),
           new L.PathLayer({
-            id: 'roads', data: roads, getPath: (d: Pt[]) => d.map(([x, y]) => [x, y, gz(x, y) + 0.5] as Pt), getColor: [56, 189, 248, 55], parameters: ON_TOP,
+            id: 'roads', data: roads, getPath: (d: Pt[]) => d.map(([x, y]) => [x, y, gz(x, y) + 0.5] as Pt), getColor: [56, 189, 248, 55], parameters: SURFACE_DEPTH,
             getWidth: 1, widthUnits: 'pixels',
           }),
         ];
@@ -360,7 +375,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         const sf = Math.abs(graph.center.lat - 37.77) < 0.02 && Math.abs(graph.center.lng + 122.408) < 0.02;
         const downtown = Math.abs(graph.center.lat - 37.788) < 0.01 && Math.abs(graph.center.lng + 122.406) < 0.01;
         const home: MapViewState = downtown ? { ...HOME_DOWNTOWN, maxPitch: 70 } : sf ? { ...HOME, maxPitch: 70 } : { longitude: graph.center.lng, latitude: graph.center.lat, zoom: 14.2, pitch: 50, bearing: 15, maxPitch: 70 };
-        let view: MapViewState = home;
+        const presentationHome: MapViewState = downtown ? { ...PRESENT_DOWNTOWN, maxPitch: 70 } : { ...home, zoom: home.zoom + 0.5, pitch: 64 };
+        let wasPresenting = presentingRef.current;
+        let view: MapViewState = wasPresenting ? presentationHome : home;
         let swayBase = view.bearing ?? 0;
         let swayT = 0;
         let lastTouch = 0;
@@ -444,14 +461,14 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           const pulse = 0.5 + 0.5 * Math.sin(now / 300);
           return [
             new layers.ScatterplotLayer({
-              id: 'car-rings', parameters: ON_TOP, data: flagged, getPosition: (c: typeof flagged[number]) => c.head,
+              id: 'car-rings', parameters: SURFACE_DEPTH, data: flagged, getPosition: (c: typeof flagged[number]) => c.head,
               getRadius: 5, radiusUnits: 'pixels', stroked: true, filled: true, lineWidthUnits: 'pixels', getLineWidth: 1.5,
               getFillColor: (c: typeof flagged[number]) => { const k = STATE_RGB[c.state]; return [k[0], k[1], k[2], 50]; },
               getLineColor: (c: typeof flagged[number]) => STATE_RGB[c.state],
             }),
             ...modelLayers('car', waymoParts, cars, (c) => c.head, (c) => c.heading, carScale(), now),
             new layers.ScatterplotLayer({
-              id: 'car-help-pulse', parameters: ON_TOP, data: help, getPosition: (c: typeof help[number]) => c.head,
+              id: 'car-help-pulse', parameters: SURFACE_DEPTH, data: help, getPosition: (c: typeof help[number]) => c.head,
               getRadius: 6 + 6 * pulse, radiusUnits: 'pixels', stroked: true, filled: false, lineWidthUnits: 'pixels',
               getLineWidth: 1.2, getLineColor: [255, 42, 84, Math.round(200 * (1 - pulse))],
               updateTriggers: { getRadius: Math.round(now / 40), getLineColor: Math.round(now / 40) },
@@ -465,19 +482,26 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         const nodeIdAt = new Map(graph.nodes.map((n) => [`${n.lat},${n.lng}`, n.id]));
         let darkIds = new Set<number>();
         let trafficSimT = -1;
+        const mPerLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
 
         // Streetlights at every lit intersection; the ones inside the blackout go out.
-        let lightsFor: SimSnapshot | null = null;
         let lightsPhoto = photo;
         let streetLights: Pt[] = [];
+        let lightSignature = '';
+
 
         let last = performance.now();
         let lastMotionT = -1;
-        let lastHud = 0;
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
+          if (!activeRef.current) { last = now; lastMotionT = -1; trafficSimT = -1; return; }
           if (photo && autoFallback && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
           const dt = (now - last) / 1000; last = now;
+          const isPresenting = presentingRef.current;
+          if (isPresenting !== wasPresenting) {
+            wasPresenting = isPresenting;
+            if (!followRef.current) target = isPresenting ? presentationHome : home;
+          }
           const live = motionRef.current?.();
           if (live && live.t !== lastMotionT) { lastMotionT = live.t; pushMotion(carsRef.current, ambRef.current, live, now); }
           carsRef.current.turn(dt);
@@ -486,7 +510,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           const ambNow = snapRef.current.ambulance && ambGlide
             ? { ...snapRef.current.ambulance, pos: (([lng, lat]) => ({ lng, lat }))(ambRef.current.where(ambGlide, now)), headingDeg: ambGlide.heading }
             : snapRef.current.ambulance;
-          const chase = followRef.current ? ambNow : null;
+          const chase = followRef.current && ambNow?.status !== 'WAITING' ? ambNow : null;
           if (chase) {
             if (!chasing) {
               alignHeading = true;
@@ -516,7 +540,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             if (Math.abs((view.bearing ?? 0) - (t.bearing ?? 0)) < 0.1 && Math.abs(view.zoom - t.zoom) < 0.001) { view = { ...t }; target = null; }
             lastTouch = now;
             swayBase = view.bearing ?? 0; swayT = 0;
-          } else if (!preserveView && !interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
+          } else if (!isPresenting && !preserveView && !interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
             swayT += dt;
             view = { ...view, bearing: swayBase + SWAY_DEG * Math.sin((2 * Math.PI * swayT) / SWAY_PERIOD_S) };
           } else {
@@ -532,8 +556,10 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           // The red wash reads well from above but floods a street-level close-up: fade it when zoomed in.
           const hazardFade = Math.round(Math.min(1, Math.max(0.15, (17.5 - view.zoom) / 2)) * 20) / 20;
           const dyn: Layer[] = [];
-          if (snap !== lightsFor || photo !== lightsPhoto) {
-            lightsFor = snap; lightsPhoto = photo;
+          const signature = `${snap.darkNodes.length}:${hz.lng}:${hz.lat}:${photo}`;
+          if (signature !== lightSignature || photo !== lightsPhoto) {
+            lightSignature = signature;
+            lightsPhoto = photo;
             darkIds = new Set(snap.darkNodes.map((p) => nodeIdAt.get(`${p.lat},${p.lng}`) ?? -1));
             streetLights = graph.nodes.filter((n) => !darkIds.has(n.id)).map((n) => [n.lng, n.lat, gz(n.lng, n.lat) + 3] as Pt);
           }
@@ -553,28 +579,28 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           if (outage) {
             // Power is out: the whole zone drops into shadow, buildings included.
             dyn.push(new L.ScatterplotLayer({
-              id: 'blackout-shade', parameters: ON_TOP, data: [0], getPosition: () => center,
+              id: 'blackout-shade', visible: !isPresenting, parameters: SURFACE_DEPTH, data: [0], getPosition: () => center,
               getRadius: OUTAGE_RADIUS_M, radiusUnits: 'meters', getFillColor: [2, 4, 10, photo ? 120 : 90],
             }));
             dyn.push(
               new L.ScatterplotLayer({
-                id: 'hazard-glow', parameters: ON_TOP, data: [0.35, 0.65, 1], getPosition: () => center,
+                id: 'hazard-glow', visible: !isPresenting, parameters: SURFACE_DEPTH, data: [0.35, 0.65, 1], getPosition: () => center,
                 getRadius: (f: number) => OUTAGE_RADIUS_M * f, getFillColor: (f: number) => [255, 42, 84, Math.round(40 * (1.2 - f) * hazardFade)],
                 stroked: false, filled: true, radiusUnits: 'meters', updateTriggers: { getFillColor: hazardFade },
               }),
               new L.ScatterplotLayer({
-                id: 'hazard-rings', parameters: ON_TOP, data: [0, 1 / 3, 2 / 3], getPosition: () => center,
+                id: 'hazard-rings', visible: !isPresenting, parameters: SURFACE_DEPTH, data: [0, 1 / 3, 2 / 3], getPosition: () => center,
                 getRadius: (o: number) => OUTAGE_RADIUS_M * (0.15 + 0.85 * ((pulse + o) % 1)),
                 getLineColor: (o: number) => [255, 42, 84, Math.round(200 * (1 - ((pulse + o) % 1)))],
                 stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 2, radiusUnits: 'meters',
                 updateTriggers: { getRadius: pulse, getLineColor: pulse },
               }),
               new L.ScatterplotLayer({
-                id: 'hazard-edge', parameters: ON_TOP, data: [0], getPosition: () => center, getRadius: OUTAGE_RADIUS_M,
-                getLineColor: [255, 42, 84, 150], stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 1.2, radiusUnits: 'meters',
+                id: 'hazard-edge', parameters: SURFACE_DEPTH, data: [0], getPosition: () => center, getRadius: OUTAGE_RADIUS_M,
+                getLineColor: isPresenting ? [185, 204, 216, 170] : [255, 42, 84, 150], stroked: true, filled: false, lineWidthUnits: 'pixels', getLineWidth: 1.2, radiusUnits: 'meters',
               }),
               new L.ScatterplotLayer({
-                id: 'dark-nodes', parameters: ON_TOP, data: snap.darkNodes, getPosition: (p: { lat: number; lng: number }) => [p.lng, p.lat, gz(p.lng, p.lat) + 1],
+                id: 'dark-nodes', visible: !isPresenting, parameters: SURFACE_DEPTH, data: snap.darkNodes, getPosition: (p: { lat: number; lng: number }) => [p.lng, p.lat, gz(p.lng, p.lat) + 1],
                 getRadius: 2.6, radiusUnits: 'pixels', getFillColor: [255, 90, 115, 255],
                 opacity: 0.45 + 0.4 * Math.abs(Math.sin(now / 420)),
               }),
@@ -583,23 +609,23 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           if (snap.corridor.length > 1) {
             const path = snap.corridor.map((p) => [p.lng, p.lat, gz(p.lng, p.lat) + 1.5] as Pt);
             dyn.push(
-              new L.PathLayer({ id: 'corridor-glow', parameters: ON_TOP, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 184, 0, 55], getWidth: 12, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
-              new L.PathLayer({ id: 'corridor', parameters: ON_TOP, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 200, 60, 255], getWidth: 3, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+              new L.PathLayer({ id: 'corridor-glow', parameters: GLOW, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 170, 48, 95], getWidth: 10, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
+              new L.PathLayer({ id: 'corridor', parameters: SURFACE_DEPTH, data: [path], getPath: (d: Pt[]) => d, getColor: [255, 208, 109, 255], getWidth: 3.5, widthUnits: 'pixels', capRounded: true, jointRounded: true }),
             );
           }
           dyn.push(
             new L.ScatterplotLayer({
-              id: 'lots', data: snap.lots, getPosition: (l: SimSnapshot['lots'][number]) => [l.pos.lng, l.pos.lat, gz(l.pos.lng, l.pos.lat) + 2],
+              id: 'lots', visible: !isPresenting, data: snap.lots, getPosition: (l: SimSnapshot['lots'][number]) => [l.pos.lng, l.pos.lat, gz(l.pos.lng, l.pos.lat) + 2],
               getRadius: 7, radiusUnits: 'pixels', stroked: true, filled: true, lineWidthUnits: 'pixels', getLineWidth: 1.5,
               getFillColor: [56, 189, 248, 40], getLineColor: [56, 189, 248, 220],
             }),
             new L.TextLayer({
-              id: 'lot-labels', data: snap.lots, getPosition: (l: SimSnapshot['lots'][number]) => [l.pos.lng, l.pos.lat, gz(l.pos.lng, l.pos.lat) + 2],
+              id: 'lot-labels', visible: !isPresenting, data: snap.lots, getPosition: (l: SimSnapshot['lots'][number]) => [l.pos.lng, l.pos.lat, gz(l.pos.lng, l.pos.lat) + 2],
               getText: (l: SimSnapshot['lots'][number]) => `${l.used}/${l.cap}`, getSize: 11, getColor: [125, 211, 252, 255],
               getPixelOffset: [0, -16], fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, billboard: true,
             }),
             new L.PathLayer({
-              id: 'trails', parameters: ON_TOP, data: trailsRef.current.data, getPath: (d: { path: Pt[] }) => d.path.map(([x, y]) => [x, y, gz(x, y) + 1] as Pt),
+              id: 'trails', visible: !isPresenting, parameters: SURFACE_DEPTH, data: trailsRef.current.data, getPath: (d: { path: Pt[] }) => d.path.map(([x, y]) => [x, y, gz(x, y) + 1] as Pt),
               getColor: (d: { state: string }) => { const c = STATE_RGB[d.state]; return [c[0], c[1], c[2], 45]; },
               getWidth: 2, widthUnits: 'pixels', capRounded: true, jointRounded: true,
             }),
@@ -617,7 +643,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
                 getFillColor: (k: number) => (flash ? [255, 30, 50, k ? 70 : 32] : [190, 215, 255, k ? 55 : 24]),
                 updateTriggers: { getFillColor: flash },
               }),
-              ...modelLayers('amb', ambulanceParts, [amb], (a) => [a.pos.lng, a.pos.lat, gz(a.pos.lng, a.pos.lat) + CAR_LIFT_M], (a) => a.headingDeg, carScale() > 1 ? carScale() * 1.3 : 1, now),
+              ...modelLayers('amb', ambulanceParts, [amb], (a) => [a.pos.lng, a.pos.lat, gz(a.pos.lng, a.pos.lat) + CAR_LIFT_M], (a) => a.headingDeg, Math.max(1, carScale() * 2.3), now),
             );
           }
           deck!.setProps({ viewState: view, layers: [...staticLayers, ...dyn] });
@@ -626,6 +652,20 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           // getViewports() asserts until deck.gl has finished initializing its first frame.
           let vp: ReturnType<Deck['getViewports']>[number] | undefined;
           try { vp = deck!.getViewports()[0]; } catch { vp = undefined; }
+          const pin = (element: HTMLDivElement | null, line: SVGLineElement | null, p: Pt, lift: number) => {
+            if (!element || !line || !vp || !isPresenting) { if (element) element.style.display = 'none'; if (line) line.style.display = 'none'; return; }
+            const [x, y] = vp.project(p);
+            const visible = Number.isFinite(x) && Number.isFinite(y) && x > 12 && x < host.clientWidth - 12 && y > 15 && y < host.clientHeight - 75;
+            element.style.display = visible ? 'flex' : 'none'; line.style.display = visible ? '' : 'none';
+            if (!visible) return;
+            element.style.transform = `translate(${x}px, ${y - lift}px) translate(-50%, -100%)`;
+            line.setAttribute('x1', String(x)); line.setAttribute('x2', String(x));
+            line.setAttribute('y1', String(y - lift)); line.setAttribute('y2', String(y));
+          };
+          const hospital = graph.pois.hospital;
+          pin(hospitalLabelRef.current, hospitalLeaderRef.current, [hospital.lng, hospital.lat, gz(hospital.lng, hospital.lat) + 2], 35);
+          const nearHospital = ambNow && Math.hypot((ambNow.pos.lng - hospital.lng) * mPerLng, (ambNow.pos.lat - hospital.lat) * 110540) < 150;
+          pin(ambulanceLabelRef.current, ambulanceLeaderRef.current, ambNow ? [ambNow.pos.lng, ambNow.pos.lat, gz(ambNow.pos.lng, ambNow.pos.lat) + 3] : [0, 0, 0], nearHospital ? -85 : 35);
           const label = labelRef.current, leader = leaderRef.current;
           if (vp && label && leader) {
             if (outage) {
@@ -641,10 +681,6 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
               leader.style.display = 'none';
             }
           }
-          if (now - lastHud > 200) {
-            lastHud = now;
-            setHud({ pitch: view.pitch ?? 0, bearing: (((view.bearing ?? 0) % 360) + 360) % 360, lat: view.latitude, lng: view.longitude, zoom: view.zoom });
-          }
         };
         raf = requestAnimationFrame(frame);
       } catch {
@@ -657,139 +693,42 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
 
   if (failed) return <>{fallback}</>;
 
-  const outage = snapshot.darkNodes.length > 0;
   return (
-    <div className="relative h-full min-h-0 overflow-hidden bg-[#070a0f]">
-      <div ref={hostRef} className="absolute inset-0"
+    <div className={`tactical-city ${presenting ? 'is-presenting' : ''}`}>
+      <div ref={hostRef} className="map-canvas-host absolute inset-0" style={{ filter: 'none' }}
         onPointerDownCapture={event => { dragButtonRef.current = event.button; }}
         onContextMenu={event => event.preventDefault()} />
-
-      {/* depth: distance haze toward the horizon (top of the frame is farthest away) */}
-      <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:linear-gradient(180deg,rgba(9,14,22,0.8)_0%,rgba(9,14,22,0.4)_12%,rgba(9,14,22,0.08)_30%,transparent_45%)]" />
-      <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-1/3 [background:radial-gradient(ellipse_at_50%_0%,rgba(56,189,248,0.10),transparent_70%)]" />
-
-      {/* screen treatment: scanlines + vignette + faint crosshair */}
-      <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:repeating-linear-gradient(0deg,rgba(255,255,255,0.025)_0px,rgba(255,255,255,0.025)_1px,transparent_1px,transparent_3px)]" />
-      <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:radial-gradient(ellipse_at_center,transparent_55%,rgba(0,0,0,0.65)_100%)]" />
+      <div aria-hidden="true" className="city-atmosphere" style={{ display: 'none' }} />
       <svg aria-hidden="true" className="pointer-events-none absolute inset-0 h-full w-full">
-        <line ref={leaderRef} stroke="rgba(255,90,115,0.8)" strokeWidth="1" strokeDasharray="3 4" style={{ display: 'none' }} />
+        <line ref={hospitalLeaderRef} stroke="#f8d699" strokeWidth="1.2" style={{ display: 'none' }} />
+        <line ref={ambulanceLeaderRef} stroke="#f8d699" strokeWidth="1.2" style={{ display: 'none' }} />
+        <line ref={leaderRef} stroke="rgba(255,196,120,.7)" strokeWidth="1" strokeDasharray="3 4" style={{ display: 'none' }} />
       </svg>
-      <div aria-hidden="true" className="pointer-events-none absolute left-1/2 top-1/2 size-6 -translate-x-1/2 -translate-y-1/2 opacity-30">
-        <span className="absolute left-1/2 top-0 h-full w-px bg-dg-cyan" /><span className="absolute left-0 top-1/2 h-px w-full bg-dg-cyan" />
-      </div>
+      <div ref={labelRef} className="hazard-map-label" style={{ display: 'none' }}><span />{hazardLabel}</div>
 
-      {/* floating hazard label (positioned every frame) */}
-      <div ref={labelRef} className="pointer-events-none absolute left-0 top-0 hidden items-center gap-2 rounded-full border border-[#ff2a54]/50 bg-[#2a0b12]/70 px-3 py-1.5 font-mono text-xs font-semibold text-[#ffd0d8] shadow-[0_0_30px_-6px_rgba(255,42,84,.9)] backdrop-blur" style={{ display: 'none' }}>
-        <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5 text-[#ff5a73]" fill="currentColor"><path d="M8 1c1 2.5 4 4 4 8a4 4 0 0 1-8 0c0-1.6.8-2.8 1.6-3.6C6 7 6.5 8 7.3 8.3 7 6 7.5 3.4 8 1z" /></svg>
-        {hazardLabel}
-      </div>
-
-      <ScaleRuler lat={hud.lat} zoom={hud.zoom} />
-
-      {/* city source: Google photoreal (needs a good network) or OSM blocks (instant, offline) */}
-      <div role="group" aria-label="City model" className="absolute left-7 top-[4.25rem] flex rounded-md border border-dg-line bg-black/55 p-0.5 backdrop-blur">
-        {([['google', 'Photo'], ['osm', 'Blocks']] as const).map(([value, label]) => (
-          <button key={value} type="button" aria-pressed={source === value}
-            disabled={value === 'google' && !GOOGLE_KEY}
-            onClick={() => switchRef.current?.(value)}
-            className={`min-h-7 rounded px-2 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] transition-colors disabled:opacity-40 ${
-              source === value ? 'bg-dg-cyan/20 text-dg-cyan' : 'text-dg-label hover:text-slate-100'}`}>
-            {label}
-          </button>
+      <div ref={hospitalLabelRef} className="mission-map-pin hospital-pin" style={{ display: 'none' }}><Cross /><strong>{Math.abs(graph.center.lat - 37.788) < 0.01 ? 'Chinese Hospital' : 'Hospital'}</strong></div>
+      <div ref={ambulanceLabelRef} className="mission-map-pin ambulance-pin" style={{ display: 'none' }}><AmbulanceIcon /><div><strong>Ambulance</strong><span>{snapshot.ambulance?.status === 'WAITING' ? 'Awaiting dispatch' : snapshot.ambulance?.status === 'ARRIVED' ? 'Patient delivered' : snapshot.ambulance?.status === 'STUCK' ? 'Stopped in traffic' : 'En route to hospital'}</span></div></div>
+      <div role="group" aria-label="City model" className="city-model-toggle">
+        <Layers3 />{([['google', 'Photo'], ['osm', 'Blocks']] as const).map(([value, label]) => (
+          <button key={value} type="button" aria-pressed={source === value} disabled={value === 'google' && !GOOGLE_KEY}
+            title={value === 'google' && !GOOGLE_KEY ? 'A Google Maps API key is required for Photo mode' : `${label} city model`}
+            onClick={() => switchRef.current?.(value)}>{label}</button>
         ))}
       </div>
-
-      {/* corner brackets */}
-      {['left-3 top-3 border-l border-t', 'right-3 top-3 border-r border-t', 'bottom-3 right-3 border-b border-r', 'bottom-3 left-3 border-b border-l'].map((c) => (
-        <span key={c} aria-hidden="true" className={`pointer-events-none absolute size-5 border-dg-cyan/50 ${c}`} />
-      ))}
-
-      {/* compass */}
-      <div aria-label={`Heading ${Math.round(hud.bearing)} degrees`} role="img" className="pointer-events-none absolute right-6 top-6 grid size-20 place-items-center rounded-full border border-dg-line bg-black/30 backdrop-blur-sm">
-        <div className="relative size-full" style={{ transform: `rotate(${-hud.bearing}deg)` }}>
-          {(['N', 'E', 'S', 'W'] as const).map((d, i) => (
-            <span key={d} className={`absolute font-mono text-[9px] font-semibold ${d === 'N' ? 'text-dg-red' : 'text-dg-label'}`}
-              style={{ left: '50%', top: '50%', transform: `rotate(${i * 90}deg) translateY(-31px) rotate(${-i * 90}deg) translate(-50%, -50%)` }}>{d}</span>
-          ))}
-          <span className="absolute left-1/2 top-1/2 h-6 w-px -translate-x-1/2 -translate-y-full bg-dg-red" />
-        </div>
-        <span className="absolute size-1.5 rounded-full bg-dg-cyan" />
-      </div>
-
-      {/* camera buttons, under the compass */}
-      <div role="group" aria-label="Camera" className="absolute right-6 top-[7.5rem] grid w-20 grid-cols-3 rounded-md border border-dg-line bg-black/55 p-0.5 backdrop-blur">
-        {([['left', 'Rotate left', 'M10 4 6 8l4 4'], ['home', 'Reset view', 'M3 8.5 8 4l5 4.5M5 7.5V12h6V7.5'], ['right', 'Rotate right', 'm6 4 4 4-4 4']] as const).map(([cmd, label, d]) => (
-          <button key={cmd} type="button" aria-label={label} title={label} onClick={() => cameraRef.current?.(cmd)}
-            className="grid size-7 place-items-center rounded text-dg-label transition-colors hover:bg-dg-cyan/15 hover:text-dg-cyan">
-            <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>
-          </button>
+      <div role="group" aria-label="Camera" className="map-camera-controls">
+        {([['left', 'Rotate left', ChevronLeft], ['home', 'Reset view', House], ['right', 'Rotate right', ChevronRight]] as const).map(([cmd, label, Icon]) => (
+          <button key={cmd} type="button" aria-label={label} title={label} onClick={() => cameraRef.current?.(cmd)}><Icon /></button>
         ))}
         {(['in', 'out'] as const).map(cmd => (
           <button key={cmd} type="button" aria-label={cmd === 'in' ? 'Zoom in' : 'Zoom out'}
-            onClick={() => cameraRef.current?.(cmd)}
-            className="min-h-7 rounded text-dg-label hover:text-dg-cyan">
-            {cmd === 'in' ? '+' : '−'}
-          </button>
-        ))}
-        <button type="button" aria-pressed={follow} disabled={!snapshot.ambulance} onClick={() => onFollowChange?.(!follow)}
-          className={`col-span-3 mt-0.5 min-h-7 rounded font-mono text-[9px] font-semibold uppercase tracking-[0.12em] transition-colors disabled:opacity-40 ${
-            follow ? 'bg-dg-amber/20 text-dg-amber' : 'text-dg-label hover:bg-dg-cyan/15 hover:text-dg-cyan'}`}>
-          {follow ? 'Cancel follow' : 'Follow amb.'}
-        </button>
-      </div>
-
-      {/* legend */}
-      <ul className="absolute bottom-4 left-4 flex flex-wrap gap-x-3 gap-y-1 rounded-lg border border-dg-line bg-black/55 px-3 py-1.5 backdrop-blur">
-        {LEGEND.map(([label, color]) => (
-          <li key={label} className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label">
-            <span aria-hidden="true" className="size-2 rounded-full" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />{label}
-          </li>
-        ))}
-        <li className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-dg-label">
-          <span aria-hidden="true" className="h-0.5 w-3 rounded bg-dg-amber" />Corridor
-        </li>
-      </ul>
-
-      {/* camera readout */}
-      <dl className="absolute bottom-4 right-4 grid grid-cols-[auto_auto] gap-x-3 rounded-lg border border-dg-line bg-black/55 px-3 py-2 font-mono text-[10px] tabular-nums text-dg-label backdrop-blur">
-        <dt>PITCH</dt><dd className="text-right text-slate-200">{hud.pitch.toFixed(0)}°</dd>
-        <dt>YAW</dt><dd className="text-right text-slate-200">{hud.bearing.toFixed(1)}°</dd>
-        <dt>ZOOM</dt><dd className="text-right text-slate-200">{hud.zoom.toFixed(2)}</dd>
-        <dt>LAT/LON</dt><dd className="text-right text-slate-200">{hud.lat.toFixed(4)}, {hud.lng.toFixed(4)}</dd>
-      </dl>
-
-      {follow ? (
-        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap rounded-full border border-dg-amber/40 bg-black/55 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.16em] text-dg-amber backdrop-blur">Following ambulance · left drag to stop · right drag to rotate</p>
-      ) : !outage && (
-        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Left drag: pan · Right drag: rotate · Scroll: zoom</p>
-      )}
-      <p className="pointer-events-none absolute bottom-1 left-1/2 max-w-[70%] -translate-x-1/2 truncate text-center font-mono text-[9px] text-slate-500">
-        {source === 'google'
-          ? <>Google{credits ? ` · ${credits}` : ''} · roads © OpenStreetMap contributors</>
-          : 'Buildings & roads © OpenStreetMap contributors'}
-      </p>
-    </div>
-  );
-}
-
-// Scale bar for the map center: deck.gl's web-mercator tiles are 512 px at zoom 0.
-function ScaleRuler({ lat, zoom }: { lat: number; zoom: number }) {
-  const mPerPx = (40075016.686 * Math.cos((lat * Math.PI) / 180)) / (512 * 2 ** zoom);
-  const meters = [100, 200, 250, 500, 1000, 2000].find((m) => m / mPerPx >= 90) ?? 2000;
-  const px = meters / mPerPx;
-  const label = (m: number) => (m >= 1000 ? `${m / 1000} km` : `${m} m`);
-  return (
-    <div aria-label={`Scale: ${Math.round(px)} pixels is ${label(meters)} at the map center`} role="img"
-      className="pointer-events-none absolute left-7 top-7 font-mono text-[9px] tabular-nums text-dg-label">
-      <div className="relative h-2" style={{ width: px }}>
-        <span className="absolute inset-x-0 bottom-0 h-px bg-dg-label/70" />
-        {Array.from({ length: 11 }, (_, i) => (
-          <span key={i} className={`absolute bottom-0 w-px bg-dg-label/70 ${i % 5 === 0 ? 'h-2' : 'h-1'}`} style={{ left: `${i * 10}%` }} />
+            onClick={() => cameraRef.current?.(cmd)}>{cmd === 'in' ? '+' : '−'}</button>
         ))}
       </div>
-      <div className="mt-0.5 flex justify-between" style={{ width: px }}>
-        <span>0</span><span>{label(meters / 2)}</span><span>{label(meters)}</span>
-      </div>
+      <button type="button" className="map-follow-button" aria-pressed={follow} disabled={!snapshot.ambulance} onClick={() => onFollowChange?.(!follow)}>
+        <Crosshair />{follow ? snapshot.ambulance?.status === 'WAITING' ? 'Follow when dispatched' : 'Following ambulance' : 'Follow ambulance'}
+      </button>
+      <details className="map-legend"><summary><Info />Map key</summary><ul>{LEGEND.map(([label, color]) => <li key={label}><span style={{ background: color }} />{label}</li>)}<li><span style={{ background: '#f7b84d' }} />Ambulance corridor</li></ul><p>Civilian traffic is visual only.</p><p>Left drag to pan · Right drag to rotate</p></details>
+      <p className="map-attribution">{source === 'google' ? <>Google{credits ? ` · ${credits}` : ''} · roads © OpenStreetMap contributors</> : 'Buildings & roads © OpenStreetMap contributors'}</p>
     </div>
   );
 }
