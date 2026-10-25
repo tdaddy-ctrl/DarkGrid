@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Ambulance as AmbulanceIcon, ChevronLeft, ChevronRight, Cross, Crosshair, House, Info, Layers3, TriangleAlert } from 'lucide-react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
-import type { Ambulance, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
+import type { Ambulance, LatLng, RoadGraph, SimSnapshot, RoadMotion } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
 import { civilianPos, createTraffic, updateTraffic } from './civilianTraffic';
 
@@ -134,19 +134,65 @@ async function loadCarParts(url: string): Promise<CarPart[]> {
   });
 }
 
-type Mover = { id: number; pos: LatLng; headingDeg: number; state: string };
-type Glide = { from: [number, number]; to: [number, number]; at: number; heading: number; aim: number; state: string };
+type XY = [number, number];
+type Mover = { id: number; pos: LatLng; headingDeg: number; state: string; road?: RoadMotion };
+type Glide = { from: XY; to: XY; path: XY[]; lengths: number[]; road?: RoadMotion; at: number; heading: number; aim: number; state: string };
 export type Motion = { t: number; vehicles: Mover[]; ambulance: Ambulance | null };
 
 function pushMotion(cars: Glider, amb: Glider, m: Motion, now: number) {
   cars.push(m.vehicles.filter((v) => v.state !== 'STAGED'), now);   // staged cars are shown as lot counts
-  amb.push(m.ambulance ? [{ id: 0, pos: m.ambulance.pos, headingDeg: m.ambulance.headingDeg, state: m.ambulance.status }] : [], now);
+  amb.push(m.ambulance ? [{ id: 0, pos: m.ambulance.pos, headingDeg: m.ambulance.headingDeg, state: m.ambulance.status, road: m.ambulance.road }] : [], now);
+}
+
+const xyDistance = (a: XY, b: XY) => Math.hypot((b[0] - a[0]) * 111320 * Math.cos(a[1] * Math.PI / 180), (b[1] - a[1]) * 110540);
+
+function pathLengths(path: XY[]): number[] {
+  const lengths = [0];
+  for (let i = 1; i < path.length; i++) lengths.push(lengths[i - 1] + xyDistance(path[i - 1], path[i]));
+  return lengths;
+}
+
+function projectedDistance(path: XY[], point: XY, lengths: number[]): number {
+  let best = Infinity, distance = 0;
+  const sx = 111320 * Math.cos(point[1] * Math.PI / 180);
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1], b = path[i];
+    const dx = (b[0] - a[0]) * sx, dy = (b[1] - a[1]) * 110540;
+    const px = (point[0] - a[0]) * sx, py = (point[1] - a[1]) * 110540;
+    const t = Math.max(0, Math.min(1, (px * dx + py * dy) / (dx * dx + dy * dy || 1)));
+    const deviation = (px - t * dx) ** 2 + (py - t * dy) ** 2;
+    if (deviation < best) { best = deviation; distance = lengths[i - 1] + (lengths[i] - lengths[i - 1]) * t; }
+  }
+  return distance;
+}
+
+function pathSlice(path: XY[], from: XY, to: XY): XY[] | null {
+  const lengths = pathLengths(path);
+  const start = projectedDistance(path, from, lengths), end = projectedDistance(path, to, lengths);
+  if (end < start - 0.1) return null;
+  return [from, ...path.filter((_, i) => lengths[i] > start + 0.01 && lengths[i] < end - 0.01), to];
+}
+
+/** Reconstruct only contiguous streets. Missing samples snap rather than crossing a block. */
+export function streetInterpolationPath(previous: RoadMotion | undefined, next: RoadMotion | undefined, from: XY, to: XY): XY[] {
+  const shape = (road: RoadMotion): XY[] => road.shape.map(p => [p.lng, p.lat]);
+  if (previous && next) {
+    if (previous.laneId === next.laneId) return pathSlice(shape(next), from, to) ?? [to];
+    if (previous.to === next.from) {
+      const before = shape(previous), after = shape(next);
+      const tail = pathSlice(before, from, before[before.length - 1]);
+      const head = pathSlice(after, after[0], to);
+      if (tail && head) return [...tail, ...head.slice(1)];
+    }
+    return [to];
+  }
+  return xyDistance(from, to) <= 8 ? [from, to] : [to];
 }
 
 // Positions arrive in samples (every sim step when live, 4x/s in replay). Each car glides from where
 // it is drawn to its newest position over one sample interval, and turns smoothly toward the way it
 // is actually moving instead of snapping to the next lane's direction.
-class Glider {
+export class Glider {
   items = new Map<number, Glide>();
   private at = 0;
   private interval = 250;
@@ -160,15 +206,28 @@ class Glider {
       const to: [number, number] = [v.pos.lng, v.pos.lat];
       const drawn = g ? this.where(g, now) : to;
       const dx = (to[0] - drawn[0]) * 111320 * Math.cos((to[1] * Math.PI) / 180), dy = (to[1] - drawn[1]) * 110540;
-      const jump = Math.hypot(dx, dy) > 800;   // a teleport (new trip) doesn't glide
-      const aim = !jump && Math.hypot(dx, dy) > 0.3 ? (Math.atan2(dx, dy) * 180) / Math.PI : g?.aim ?? v.headingDeg;
-      this.items.set(v.id, { from: jump ? to : drawn, to, at: now, heading: g && !jump ? g.heading : aim, aim, state: v.state });
+      let path: XY[] = [to];
+      if (g) {
+        const remaining = pathSlice(g.path, drawn, g.to) ?? [g.to];
+        const extension = streetInterpolationPath(g.road, v.road, g.to, to);
+        path = extension.length > 1 ? [...remaining, ...extension.slice(1)] : extension;
+      }
+      const jump = path.length < 2 || Math.hypot(dx, dy) > 800;
+      if (jump) path = [to];
+      const aim = v.road ? v.headingDeg : !jump && Math.hypot(dx, dy) > 0.3 ? (Math.atan2(dx, dy) * 180) / Math.PI : g?.aim ?? v.headingDeg;
+      this.items.set(v.id, { from: path[0], to, path, lengths: pathLengths(path), road: v.road, at: now, heading: g && !jump ? g.heading : aim, aim, state: v.state });
     }
     for (const id of this.items.keys()) if (!seen.has(id)) this.items.delete(id);
   }
   where(g: Glide, now: number): [number, number] {
     const f = Math.min(1, (now - g.at) / this.interval);
-    return [g.from[0] + (g.to[0] - g.from[0]) * f, g.from[1] + (g.to[1] - g.from[1]) * f];
+    const distance = f * g.lengths[g.lengths.length - 1];
+    for (let i = 1; i < g.path.length; i++) {
+      if (g.lengths[i] < distance) continue;
+      const k = (distance - g.lengths[i - 1]) / (g.lengths[i] - g.lengths[i - 1] || 1);
+      return [g.path[i - 1][0] + (g.path[i][0] - g.path[i - 1][0]) * k, g.path[i - 1][1] + (g.path[i][1] - g.path[i - 1][1]) * k];
+    }
+    return g.to;
   }
   turn(dt: number) {
     const k = 1 - Math.exp(-dt * 9);
@@ -273,7 +332,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
         const roads = graph.edges.map((e) => {
           const a = nodes.get(e.from)!, b = nodes.get(e.to)!;
-          return [[a.lng, a.lat], [b.lng, b.lat]] as Pt[];
+          return (e.geometry ?? [a, b]).map(p => [p.lng, p.lat] as Pt);
         });
         // Faint ground grid every ~250 m around the road network.
         const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
@@ -621,9 +680,20 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             );
           }
           const segments = snap.corridorStatus?.segments ?? [];
+          const rescue = ambNow?.mission;
+          if (rescue) dyn.push(
+            new L.ScatterplotLayer({ id: 'rescue-pickup', parameters: SURFACE_DEPTH, data: [rescue.pickup],
+              getPosition: (p: LatLng) => [p.lng, p.lat, gz(p.lng, p.lat) + 1], getRadius: 7, radiusUnits: 'meters', radiusMinPixels: 6,
+              getFillColor: [255, 190, 60, 140], stroked: true, getLineColor: [255, 220, 140, 255], getLineWidth: 2, lineWidthUnits: 'pixels' }),
+            new L.TextLayer({ id: 'rescue-pickup-label', parameters: SURFACE_DEPTH, data: [rescue.pickup],
+              getPosition: (p: LatLng) => [p.lng, p.lat, gz(p.lng, p.lat) + 4],
+              getText: () => rescue.phase === 'TO_PICKUP' ? 'RESCUE PICKUP' : rescue.phase === 'PICKING_UP' ? 'LOADING PATIENT' : 'PATIENT PICKED UP',
+              getSize: 11, getColor: [255, 220, 140, 255], getPixelOffset: [0, -20], billboard: true,
+              background: true, getBackgroundColor: [22, 29, 36, 235], backgroundPadding: [7, 5], fontFamily: 'sans-serif' }),
+          );
           if (segments.length) dyn.push(new L.PathLayer({
             id: 'corridor-verification', parameters: SURFACE_DEPTH, data: segments,
-            getPath: (s: typeof segments[number]) => [s.from, s.to].map(p => [p.lng, p.lat, gz(p.lng, p.lat) + 1.8] as Pt),
+            getPath: (s: typeof segments[number]) => (s.shape ?? [s.from, s.to]).map(p => [p.lng, p.lat, gz(p.lng, p.lat) + 1.8] as Pt),
             getColor: (s: typeof segments[number]) => s.state === 'CLEAR' ? [45, 212, 191, 255] : s.state === 'CLEARING' ? [255, 190, 60, 255] : [255, 95, 110, 255],
             getWidth: 4, widthUnits: 'pixels', capRounded: true,
           }));
@@ -675,7 +745,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
                 getFillColor: (k: number) => (flash ? [255, 30, 50, k ? 70 : 32] : [190, 215, 255, k ? 55 : 24]),
                 updateTriggers: { getFillColor: flash },
               }),
-              ...modelLayers('amb', ambulanceParts, [amb], (a) => [a.pos.lng, a.pos.lat, gz(a.pos.lng, a.pos.lat) + CAR_LIFT_M], (a) => a.headingDeg, Math.max(1, carScale() * 2.3), now),
+              ...modelLayers('amb', ambulanceParts, [amb], (a) => [a.pos.lng, a.pos.lat, gz(a.pos.lng, a.pos.lat) + CAR_LIFT_M], (a) => a.headingDeg, view.zoom >= 17 ? 1 : Math.min(2, carScale()), now),
             );
           }
           deck!.setProps({ viewState: view, layers: [...staticLayers, ...dyn] });
@@ -739,7 +809,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
       <div ref={labelRef} className="hazard-map-label" style={{ display: 'none' }}><span />{hazardLabel}</div>
 
       <div ref={hospitalLabelRef} className="mission-map-pin hospital-pin" style={{ display: 'none' }}><Cross /><strong>{Math.abs(graph.center.lat - 37.788) < 0.01 ? 'Chinese Hospital' : 'Hospital'}</strong></div>
-      <div ref={ambulanceLabelRef} className="mission-map-pin ambulance-pin" style={{ display: 'none' }}><AmbulanceIcon /><div><strong>Ambulance</strong><span>{snapshot.ambulance?.status === 'WAITING' ? 'Awaiting dispatch' : snapshot.ambulance?.status === 'ARRIVED' ? 'Patient delivered' : snapshot.ambulance?.status === 'STUCK' ? 'Stopped in traffic' : 'En route to hospital'}</span></div></div>
+      <div ref={ambulanceLabelRef} className="mission-map-pin ambulance-pin" style={{ display: 'none' }}><AmbulanceIcon /><div><strong>Ambulance</strong><span>{snapshot.ambulance?.status === 'WAITING' ? 'Awaiting dispatch' : snapshot.ambulance?.status === 'ARRIVED' ? 'Patient delivered' : snapshot.ambulance?.mission?.phase === 'PICKING_UP' ? 'Loading patient' : snapshot.ambulance?.status === 'STUCK' ? 'Stopped in traffic' : snapshot.ambulance?.mission?.phase === 'TO_PICKUP' ? 'Responding to pickup' : 'En route to hospital'}</span></div></div>
       <div role="group" aria-label="City model" className="city-model-toggle">
         <Layers3 />{([['google', 'Photo'], ['osm', 'Blocks']] as const).map(([value, label]) => (
           <button key={value} type="button" aria-pressed={source === value} disabled={value === 'google' && !GOOGLE_KEY}

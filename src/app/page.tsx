@@ -8,9 +8,9 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type CSSProperties } from 'react';
 import { Shuffle, TriangleAlert } from 'lucide-react';
 import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
-import type { ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
+import type { Ambulance as AmbulanceState, ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
-  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, setControl, step, type Sim,
+  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, setControl, step, withRoadGeometry, type Sim,
 } from '@/lib/sim';
 import { HISTORY_EVERY_S, MAX_COLLISION_INCIDENTS, SEED, SIM_SPEED } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
@@ -89,7 +89,7 @@ export default function Home() {
           graph = loadRoadGraph(await response.json());
           if (!graph.nodes.length || !graph.edges.length) throw new Error('Road data is empty');
         }
-        if (!controller.signal.aborted) setLoaded({ environment, generation, graph });
+        if (!controller.signal.aborted) setLoaded({ environment, generation, graph: withRoadGeometry(graph) });
       } catch (error) {
         if (!controller.signal.aborted) setLoaded({ environment, generation,
           error: error instanceof Error ? error.message : 'Unable to load road data' });
@@ -738,13 +738,20 @@ function SplitStrip({ snapshot, other }: { snapshot: SimSnapshot; other: SimSnap
 
 // Over each map: a patient clock that runs while the ambulance is on its way and stops on
 // arrival, plus how much sooner this city delivered the patient than the other one.
+function ambulanceLabel(ambulance: AmbulanceState): string {
+  return ambulance.status === 'ARRIVED' ? 'Patient delivered' : ambulance.status === 'WAITING' ? 'Awaiting dispatch'
+    : ambulance.mission?.phase === 'PICKING_UP' ? 'Loading patient'
+    : ambulance.status === 'STUCK' ? 'Ambulance stuck'
+    : ambulance.mission?.phase === 'TO_PICKUP' ? 'Responding to pickup' : 'Patient en route';
+}
+
 function PatientClock({ snapshot, rival }: { snapshot: SimSnapshot; rival?: SimSnapshot }) {
   const a = snapshot.ambulance;
   if (!a) return null;
   const arrived = a.status === 'ARRIVED';
   const r = rival?.ambulance;
   const lead = arrived && r && r.status !== 'WAITING' ? r.tripS - a.tripS : 0;
-  const label = arrived ? 'Patient delivered' : a.status === 'STUCK' ? 'Ambulance stuck' : a.status === 'WAITING' ? 'Awaiting dispatch' : 'Patient en route';
+  const label = ambulanceLabel(a);
   return <div role="status" className={`patient-clock ${arrived ? 'is-arrived' : a.status === 'STUCK' ? 'is-stuck' : ''}`}>
     <div>{arrived ? <Check /> : <Ambulance />}<span>{label}</span>{a.status !== 'WAITING' && <strong>{formatT(a.tripS)}</strong>}</div>
     {lead >= 30 && rival && <p>{r!.status === 'ARRIVED' ? '' : 'At least '}{formatT(lead)} ahead of {cityShort(rival.mode)}</p>}
@@ -909,8 +916,9 @@ function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse,
 }) {
   const amb = snapshot.ambulance;
   const downtown = Math.abs(graph.center.lat - 37.788) < 0.01 && Math.abs(graph.center.lng + 122.406) < 0.01;
-  const status = !amb ? 'Standing by' : amb.status === 'WAITING' ? 'Awaiting dispatch' : amb.status === 'ARRIVED' ? 'Patient delivered' : amb.status === 'STUCK' ? 'Ambulance stuck' : 'Patient en route';
-  const routeLabel = downtown ? 'Station 35 → Chinese Hospital' : 'Fire station → Hospital';
+  const status = amb ? ambulanceLabel(amb) : 'Standing by';
+  const routeLabel = amb?.mission ? `${downtown ? 'Station 35' : 'Fire station'} → ${areaName(amb.mission.pickup)} pickup → ${downtown ? 'Chinese Hospital' : 'Hospital'}`
+    : 'Rescue task follows the next blackout';
   const policyActive = snapshot.policy.darkSignalsAsFourWayStop.length > 0;
   const dg = snapshot.mode === 'DARKGRID';
   return <section className="mission-overview">

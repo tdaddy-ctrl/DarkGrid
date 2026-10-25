@@ -5,7 +5,7 @@
 
 import type {
   Ambulance, ControlMode, HelpRequest, Job, LatLng, Metrics, Policy, RoadEdge, RoadGraph,
-  RoadNode, SimSnapshot, Vehicle, CollisionIncident, YieldCommand, OutageState, CorridorStatus,
+  RoadNode, SimSnapshot, Vehicle, CollisionIncident, YieldCommand, OutageState, CorridorStatus, RoadMotion,
 } from '@/types/sim';
 import * as C from './config';
 import { orderJobs } from './dispatch';
@@ -23,6 +23,7 @@ type Place = 'ROAD' | 'BOX' | 'CURB' | 'LOT' | 'OFF';
 type Lane = {
   id: number; edgeId: number; from: number; to: number; len: number; headingDeg: number;
   obstacleS: number;
+  shape: LatLng[]; cumulativeM: number[]; shapeLengthM: number;
   cars: Agent[];                    // front (closest to `to`) first
 };
 
@@ -57,6 +58,8 @@ export type Sim = {
   control: ControlMode; policy: Policy;
   lanes: Lane[]; laneByStep: Map<string, Lane>; nodes: Map<number, NodeState>; nodeIds: number[];
   agents: Agent[]; amb: Agent; ambRoute: Lane[];
+  mission: { originNode: number; pickupNode: number; hospitalNode: number;
+    phase: NonNullable<Ambulance['mission']>['phase']; pickupStartedAt: number | null; pickupCompleteAt: number | null };
   dispatchT: number | null; arriveT: number | null;
   outageT: number | null; outageXY: { x: number; y: number } | null; zonePolicy: boolean; zoneJobTaken: boolean;
   corridorActive: boolean; corridorEdges: Set<number>; corridorNodes: Set<number>;
@@ -112,8 +115,38 @@ function nearestNode(graph: RoadGraph, p: LatLng): number {
   return best;
 }
 
-function lerp(a: RoadNode, b: RoadNode, f: number): LatLng {
-  return { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f };
+function pointDistance(a: LatLng, b: LatLng): number {
+  const d = toXY(a, b);
+  return Math.hypot(d.x, d.y);
+}
+
+/** Attach the OSM bends lost by the original exporter without changing teammates' graph loader. */
+export function withRoadGeometry(graph: RoadGraph): RoadGraph {
+  const nodes = new Map(graph.nodes.map(n => [n.id, n]));
+  const key = (p: LatLng) => `${p.lat.toFixed(6)},${p.lng.toFixed(6)}`;
+  return { ...graph, edges: graph.edges.map(edge => {
+    if (edge.geometry?.length) return edge;
+    const from = nodes.get(edge.from)!, to = nodes.get(edge.to)!;
+    const direct = C.ROAD_GEOMETRY_OVERRIDES[`${key(from)}>${key(to)}`];
+    const reversed = direct ? undefined : C.ROAD_GEOMETRY_OVERRIDES[`${key(to)}>${key(from)}`];
+    const coordinates = direct ?? reversed?.slice().reverse();
+    if (!coordinates) return edge;
+    const geometry = coordinates.map(([lat, lng]) => ({ lat, lng }));
+    geometry[0] = { lat: from.lat, lng: from.lng };
+    geometry[geometry.length - 1] = { lat: to.lat, lng: to.lng };
+    return { ...edge, geometry, lengthM: geometry.slice(1).reduce((sum, p, i) => sum + pointDistance(geometry[i], p), 0) };
+  }) };
+}
+
+function laneSample(lane: Lane, s: number): { pos: LatLng; headingDeg: number } {
+  const distance = Math.max(0, Math.min(lane.shapeLengthM, s / lane.len * lane.shapeLengthM));
+  let index = 1;
+  while (index < lane.shape.length - 1 && lane.cumulativeM[index] < distance) index++;
+  const a = lane.shape[index - 1], b = lane.shape[index];
+  const span = lane.cumulativeM[index] - lane.cumulativeM[index - 1];
+  const f = span > 0 ? (distance - lane.cumulativeM[index - 1]) / span : 0;
+  const d = toXY(a, b);
+  return { pos: { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f }, headingDeg: bearingDeg(d.x, d.y) };
 }
 
 // ---------- maps, routing and lot staging ----------
@@ -152,11 +185,11 @@ function edgeBlocked(sim: Sim, edgeId: number): boolean {
 }
 
 // B's shortestPath returns node ids; the sim drives lanes, so map each step to its lane.
-function route(sim: Sim, from: number, to: number, avoidCorridor: boolean): Lane[] | null {
+function route(sim: Sim, from: number, to: number, avoidCorridor: boolean, topologyOnly = false): Lane[] | null {
   if (from === to) return [];
-  const key = `${from}:${to}:${avoidCorridor}`;
+  const key = `${from}:${to}:${avoidCorridor}:${topologyOnly}`;
   if (sim.routeCache.has(key)) return sim.routeCache.get(key)?.slice() ?? null;
-  const cost = (e: RoadEdge) => edgeBlocked(sim, e.id) || (avoidCorridor && sim.corridorEdges.has(e.id)) ? Infinity : e.lengthM;
+  const cost = (e: RoadEdge) => !topologyOnly && (edgeBlocked(sim, e.id) || (avoidCorridor && sim.corridorEdges.has(e.id))) ? Infinity : e.lengthM;
   const path = shortestPath(sim.graph, from, to, cost);
   if (!path) { sim.routeCache.set(key, null); return null; }
   const lanes: Lane[] = [];
@@ -254,14 +287,18 @@ function policyFor(mode: SimMode): Policy {
 }
 
 export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options: { randomEvents?: boolean } = {}): Sim {
+  graph = withRoadGeometry(graph);
   const nodes = new Map<number, NodeState>();
   for (const node of graph.nodes) nodes.set(node.id, { node, out: [], in: [], dark: false, nextPassT: 0, box: [], curb: [] });
 
   const lanes: Lane[] = [];
   const laneByStep = new Map<string, Lane>();
-  const addLane = (edgeId: number, from: number, to: number, len: number, fraction = 0.55) => {
+  const addLane = (edgeId: number, from: number, to: number, len: number, shape: LatLng[], fraction = 0.55) => {
     const a = nodes.get(from)!.node, b = nodes.get(to)!.node;
-    const lane: Lane = { id: lanes.length, edgeId, from, to, len: Math.max(1, len), obstacleS: Math.max(1, len) * fraction, headingDeg: bearingDeg(b.x - a.x, b.y - a.y), cars: [] };
+    const cumulativeM = [0];
+    for (let i = 1; i < shape.length; i++) cumulativeM.push(cumulativeM[i - 1] + pointDistance(shape[i - 1], shape[i]));
+    const lane: Lane = { id: lanes.length, edgeId, from, to, len: Math.max(1, len), obstacleS: Math.max(1, len) * fraction,
+      shape, cumulativeM, shapeLengthM: cumulativeM[cumulativeM.length - 1], headingDeg: bearingDeg(b.x - a.x, b.y - a.y), cars: [] };
     lanes.push(lane);
     const key = `${from}>${to}`;
     const prev = laneByStep.get(key);
@@ -270,8 +307,9 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options
     nodes.get(to)!.in.push(lane);
   };
   for (const e of graph.edges) {
-    addLane(e.id, e.from, e.to, e.lengthM);
-    if (!e.oneway) addLane(e.id, e.to, e.from, e.lengthM, 0.45);
+    const shape = e.geometry ?? [nodes.get(e.from)!.node, nodes.get(e.to)!.node];
+    addLane(e.id, e.from, e.to, e.lengthM, shape);
+    if (!e.oneway) addLane(e.id, e.to, e.from, e.lengthM, shape.slice().reverse(), 0.45);
   }
 
   const blankAgent = (id: number, type: Agent['type']): Agent => ({
@@ -283,6 +321,8 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options
     graph, mode, rng: mulberry32(seed), t: 0, control: 'AUTO', policy: policyFor(mode),
     lanes, laneByStep, nodes, nodeIds: graph.nodes.map((n) => n.id),
     agents: [], amb: blankAgent(C.VEHICLES, 'AMBULANCE'), ambRoute: [],
+    mission: { originNode: nearestNode(graph, graph.pois.fireStation), pickupNode: -1,
+      hospitalNode: nearestNode(graph, graph.pois.hospital), phase: 'TO_PICKUP', pickupStartedAt: null, pickupCompleteAt: null },
     dispatchT: null, arriveT: null, outageT: null, outageXY: null, zonePolicy: false, zoneJobTaken: false,
     corridorActive: false, corridorEdges: new Set(), corridorNodes: new Set(),
     lots: stagingLots(graph).map((pos) => ({ pos, node: nearestNode(graph, pos), cap: C.LOT_CAPACITY, used: 0, reserved: 0 })),
@@ -296,12 +336,6 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options
     plannedCollisions: [], outage: null, restoreTimes: new Map(), incidents: [], yieldCommands: new Map(), routeCache: new Map(),
   };
 
-  // Ambulance route: fire station -> hospital. Same in both modes.
-  const fire = nearestNode(graph, graph.pois.fireStation);
-  const hosp = nearestNode(graph, graph.pois.hospital);
-  sim.ambRoute = route(sim, fire, hosp, false) ?? [];
-  sim.amb.dest = hosp;
-
   // A separate event RNG means traffic/policy decisions cannot change the world's incident schedule.
   const between = (range: readonly [number, number]) => Math.round(range[0] + sim.eventRng() * (range[1] - range[0]));
   sim.plannedOutage = {
@@ -309,8 +343,10 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options
     center: graph.nodes[Math.floor(sim.eventRng() * graph.nodes.length)],
     radiusM: between(C.RANDOM_OUTAGE_RADIUS_M), restoreAfterS: between(C.RANDOM_RESTORATION_DELAY_S),
   };
+  planAmbulanceMission(sim, sim.plannedOutage.center, sim.plannedOutage.radiusM);
   if (sim.randomEvents) {
-    const primary = sim.ambRoute.length ? sim.ambRoute[Math.floor(sim.ambRoute.length * (0.3 + sim.eventRng() * 0.4))].edgeId : graph.edges[0]?.id;
+    const rescueRoute = [...sim.ambRoute, ...(sim.mission.pickupNode >= 0 ? route(sim, sim.mission.pickupNode, sim.mission.hospitalNode, false, true) ?? [] : [])];
+    const primary = rescueRoute.length ? rescueRoute[Math.floor(rescueRoute.length * (0.3 + sim.eventRng() * 0.4))].edgeId : graph.edges[0]?.id;
     const others = graph.edges.filter(e => e.id !== primary);
     const secondary = others[Math.floor(sim.eventRng() * others.length)]?.id;
     for (const [index, edgeId] of [primary, secondary].entries()) if (edgeId !== undefined) {
@@ -340,6 +376,29 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode, options
 }
 
 // ---------- trips ----------
+
+function planAmbulanceMission(sim: Sim, center: LatLng, radiusM: number) {
+  const origin = sim.mission.originNode, hospital = sim.mission.hospitalNode;
+  const candidates = sim.graph.nodes.filter(n => pointDistance(center, n) <= radiusM && n.id !== origin && n.id !== hospital)
+    .sort((a, b) => pointDistance(center, a) - pointDistance(center, b) || a.id - b.id);
+  for (const node of candidates) {
+    const inbound = route(sim, origin, node.id, false, true);
+    const outbound = route(sim, node.id, hospital, false, true);
+    if (!inbound?.length || !outbound?.length) continue;
+    sim.mission.pickupNode = node.id;
+    sim.amb.dest = node.id;
+    sim.ambRoute = inbound;
+    return;
+  }
+  sim.mission.pickupNode = -1; sim.ambRoute = [];
+}
+
+function prepareHospitalLeg(sim: Sim): boolean {
+  const path = route(sim, sim.mission.pickupNode, sim.mission.hospitalNode, false);
+  if (!path?.length) return false;
+  sim.amb.dest = sim.mission.hospitalNode; sim.ambRoute = path;
+  return true;
+}
 
 function newTrip(sim: Sim, a: Agent, from: number) {
   if (sim.mode === 'DARKGRID' && sim.outageT !== null && a.type === 'EMPTY' && a.lot < 0) {
@@ -510,7 +569,8 @@ function remainingAmbulanceLanes(sim: Sim): Lane[] {
 
 function rerouteAmbulance(sim: Sim) {
   if (sim.arriveT !== null) return;
-  const from = sim.amb.place === 'ROAD' ? sim.lanes[sim.amb.lane].to : sim.ambRoute[0]?.from;
+  const from = sim.amb.place === 'ROAD' ? sim.lanes[sim.amb.lane].to
+    : sim.mission.phase === 'PICKING_UP' ? sim.mission.pickupNode : sim.ambRoute[0]?.from;
   if (from === undefined) return;
   const path = route(sim, from, sim.amb.dest, false);
   if (!path) return; // A disconnected route stays blocked until recovery; never teleport through it.
@@ -605,7 +665,7 @@ function corridorView(sim: Sim): CorridorStatus {
     if (!sim.corridorEdges.has(lane.edgeId)) continue;
     const blocked = edgeBlocked(sim, lane.edgeId) || sim.lanes.some(l => l.edgeId === lane.edgeId && l.cars.some(a => a.type !== 'AMBULANCE'))
       || [lane.from, lane.to].some(id => sim.nodes.get(id)!.box.length > 0);
-    segments.push({ edgeId: lane.edgeId, from: sim.nodes.get(lane.from)!.node, to: sim.nodes.get(lane.to)!.node,
+    segments.push({ edgeId: lane.edgeId, from: sim.nodes.get(lane.from)!.node, to: sim.nodes.get(lane.to)!.node, shape: lane.shape,
       state: blocked ? commands.some(c => c.edgeId === lane.edgeId && c.state === 'CLEARING') ? 'CLEARING' : 'RESERVED' : 'CLEAR' });
   }
   return { active: sim.corridorActive, commands, segments };
@@ -646,7 +706,16 @@ function atStopLine(sim: Sim, a: Agent, lane: Lane) {
   }
   if (a.route.length === 0) {
     if (a.type === 'AMBULANCE') {
-      lane.cars.shift(); a.place = 'OFF'; sim.arriveT = sim.t;
+      lane.cars.shift(); a.speed = 0; a.stoppedS = 0;
+      if (sim.mission.phase === 'TO_PICKUP') {
+        a.place = 'CURB'; a.boxNode = lane.to;
+        sim.mission.phase = 'PICKING_UP'; sim.mission.pickupStartedAt = sim.t;
+        sim.mission.pickupCompleteAt = sim.t + C.PATIENT_LOADING_S;
+        sim.ambRoute = [];
+        prepareHospitalLeg(sim);
+      } else {
+        a.place = 'OFF'; sim.arriveT = sim.t; sim.mission.phase = 'DELIVERED';
+      }
       return;
     }
     if (a.lot >= 0 && sim.lots[a.lot].node === lane.to) {
@@ -713,7 +782,7 @@ function leaveNode(sim: Sim, a: Agent, list: Agent[]) {
 
 function placeAmbulance(sim: Sim) {
   const a = sim.amb;
-  if (a.place !== 'OFF' || sim.dispatchT === null || sim.arriveT !== null || sim.ambRoute.length === 0) return;
+  if (a.place !== 'OFF' || sim.dispatchT === null || sim.arriveT !== null || sim.ambRoute.length === 0 || sim.mission.phase === 'PICKING_UP') return;
   a.route = sim.ambRoute.slice(1);
   if (!enterLane(sim, a, sim.ambRoute[0])) a.route = [];
 }
@@ -750,6 +819,9 @@ function tick(sim: Sim, dt: number) {
 
   if (sim.outageT !== null && sim.dispatchT === null && sim.t >= sim.outageT + C.AMBULANCE_DISPATCH_DELAY_S) {
     sim.dispatchT = sim.outageT + C.AMBULANCE_DISPATCH_DELAY_S;
+  }
+  if (sim.mission.phase === 'PICKING_UP' && sim.mission.pickupCompleteAt !== null && sim.t >= sim.mission.pickupCompleteAt && prepareHospitalLeg(sim)) {
+    sim.mission.phase = 'TO_HOSPITAL'; sim.amb.place = 'OFF'; sim.amb.stoppedS = 0;
   }
   updateCorridor(sim);
   yieldVehicles(sim);
@@ -788,7 +860,7 @@ function tick(sim: Sim, dt: number) {
   }
   sim.blockingVehMin += (blocking * dt) / 60;
   const amb = sim.amb;
-  if (amb.place === 'ROAD' && amb.speed >= 0.1) amb.stoppedS = 0;
+  if (sim.mission.phase === 'PICKING_UP' || amb.place === 'ROAD' && amb.speed >= 0.1) amb.stoppedS = 0;
   else if (sim.dispatchT !== null && sim.arriveT === null) amb.stoppedS += dt;
 
   // Operators.
@@ -864,9 +936,10 @@ export function injectEvent(sim: Sim, event: SimEvent) {
   if (event.type === 'COLLISION') {
     const road = sim.graph.edges.find(e => e.id === event.edgeId) ?? (event.edgeId === undefined ? sim.graph.edges.find(e => e.id === pickCollisionEdge(sim)) : undefined);
     if (!road || sim.incidents.length >= C.MAX_COLLISION_INCIDENTS || edgeBlocked(sim, road.id)) return;
-    const a = sim.nodes.get(road.from)!.node, b = sim.nodes.get(road.to)!.node;
-    sim.incidents.push({ id: `collision-${sim.incidents.length + 1}`, edgeId: road.id, pos: lerp(a, b, 0.55),
-      headingDeg: bearingDeg(b.x - a.x, b.y - a.y), createdAt: sim.t, assigned: false,
+    const lane = sim.lanes.find(l => l.edgeId === road.id && l.from === road.from)!;
+    const sample = laneSample(lane, lane.len * 0.55);
+    sim.incidents.push({ id: `collision-${sim.incidents.length + 1}`, edgeId: road.id, pos: sample.pos,
+      headingDeg: sample.headingDeg, createdAt: sim.t, assigned: false,
       status: 'BLOCKED', clearanceS: Number.isFinite(event.clearanceS) && event.clearanceS! > 0 ? event.clearanceS! : C.COLLISION_CLEARANCE_S[0], clearAt: null });
     sim.arrivals.push(sim.t); sim.routeCache.clear();
     if (sim.mode === 'DARKGRID') {
@@ -884,6 +957,8 @@ export function injectEvent(sim: Sim, event: SimEvent) {
   const restoreAt = Number.isFinite(event.restoreAfterS) && event.restoreAfterS! > 0 ? sim.t + event.restoreAfterS! : null;
   sim.outage = { center: { ...(event.center ?? sim.graph.center) }, radiusM, startedAt: sim.t, restoreAt,
     restoredAt: restoreAt === null ? null : restoreAt + C.RESTORATION_SPREAD_S, status: 'ACTIVE' };
+  planAmbulanceMission(sim, sim.outage.center, radiusM);
+  if (sim.mode === 'DARKGRID') rerouteAmbulance(sim);
   for (const ns of sim.nodes.values()) {
     if (Math.hypot(ns.node.x - c.x, ns.node.y - c.y) <= radiusM) {
       ns.dark = true; ns.nextPassT = sim.t;
@@ -945,15 +1020,17 @@ function agentPos(sim: Sim, a: Agent): LatLng {
   if (a.place === 'LOT') return sim.lots[a.lot].pos;
   if (a.place === 'BOX') { const n = sim.nodes.get(a.boxNode)!.node; return { lat: n.lat, lng: n.lng }; }
   if (a.place === 'OFF' || a.lane < 0) {
-    const n = sim.nodes.get(sim.ambRoute[0]?.from ?? sim.nodeIds[0])!.node;
+    const node = a.type === 'AMBULANCE' ? sim.mission.phase === 'TO_HOSPITAL' ? sim.mission.pickupNode : sim.mission.originNode : sim.nodeIds[0];
+    const n = sim.nodes.get(node)!.node;
     return { lat: n.lat, lng: n.lng };
   }
   const lane = sim.lanes[a.lane];
   const f = a.place === 'CURB' && a.yieldStartT === null ? 1 : a.s / lane.len;
-  const pos = lerp(sim.nodes.get(lane.from)!.node, sim.nodes.get(lane.to)!.node, f);
+  const sample = laneSample(lane, f * lane.len);
+  const pos = sample.pos;
   if (a.yieldStartT !== null) {
     const offset = C.YIELD_OFFSET_M * Math.min(1, (sim.t - a.yieldStartT) / C.YIELD_MANEUVER_S);
-    const theta = lane.headingDeg * Math.PI / 180;
+    const theta = sample.headingDeg * Math.PI / 180;
     pos.lng += Math.cos(theta) * offset / (111320 * Math.cos(pos.lat * Math.PI / 180));
     pos.lat -= Math.sin(theta) * offset / 110540;
   }
@@ -966,28 +1043,36 @@ function ambulanceView(sim: Sim): Ambulance | null {
   const pos = sim.arriveT !== null ? (() => { const n = sim.nodes.get(a.dest)!.node; return { lat: n.lat, lng: n.lng }; })() : agentPos(sim, a);
   let headingDeg = 0;
   if (a.place === 'ROAD') {
-    const next = sim.nodes.get(sim.lanes[a.lane].to)!.node;
-    const here = toXY(sim.graph.center, pos);
-    headingDeg = bearingDeg(next.x - here.x, next.y - here.y);
+    headingDeg = laneSample(sim.lanes[a.lane], a.s).headingDeg;
   } else if (sim.ambRoute[0]) headingDeg = sim.ambRoute[0].headingDeg;
   const status: Ambulance['status'] =
     sim.arriveT !== null ? 'ARRIVED'
     : sim.dispatchT === null ? 'WAITING'
     : a.stoppedS >= C.AMBULANCE_STUCK_S ? 'STUCK' : 'EN_ROUTE';
   const tripS = sim.dispatchT === null ? 0 : (sim.arriveT ?? sim.t) - sim.dispatchT;
-  return { pos, headingDeg, status, tripS };
+  const point = (id: number): LatLng => { const n = sim.nodes.get(id)!.node; return { lat: n.lat, lng: n.lng }; };
+  return { pos, headingDeg, status, tripS, road: agentRoad(sim, a),
+    mission: sim.mission.pickupNode < 0 ? undefined : { origin: point(sim.mission.originNode), pickup: point(sim.mission.pickupNode), hospital: point(sim.mission.hospitalNode),
+      phase: sim.mission.phase, pickupStartedAt: sim.mission.pickupStartedAt, pickupCompleteAt: sim.mission.pickupCompleteAt } };
+}
+
+function agentRoad(sim: Sim, a: Agent): RoadMotion | undefined {
+  if (a.place !== 'ROAD' || a.yieldStartT !== null) return undefined;
+  const lane = sim.lanes[a.lane];
+  return { laneId: lane.id, from: lane.from, to: lane.to, shape: lane.shape };
 }
 
 function vehicleView(sim: Sim, a: Agent): Vehicle {
   return {
     id: a.id,
     pos: agentPos(sim, a),
-    headingDeg: a.lane >= 0 ? sim.lanes[a.lane].headingDeg : 0,
+    headingDeg: a.lane >= 0 ? laneSample(sim.lanes[a.lane], a.s).headingDeg : 0,
     state: a.yieldStartT !== null ? a.place === 'CURB' ? 'YIELDED' : 'YIELDING'
       : a.place === 'LOT' ? 'STAGED'
       : a.requestId ? 'REQUESTING_HELP'
       : a.place === 'ROAD' && a.speed < 0.1 ? 'QUEUED_BEHIND' : 'DRIVING',
     type: a.type === 'PASSENGER' ? 'PASSENGER' : 'EMPTY',
+    road: agentRoad(sim, a),
   };
 }
 
@@ -1003,8 +1088,10 @@ export function getSnapshot(sim: Sim): SimSnapshot {
   const corridor: LatLng[] = [];
   const protocol = corridorView(sim);
   if (protocol.segments.length) {
-    corridor.push(protocol.segments[0].from);
-    for (const segment of protocol.segments) corridor.push(segment.to);
+    for (const lane of remainingAmbulanceLanes(sim)) {
+      if (!sim.corridorEdges.has(lane.edgeId)) continue;
+      corridor.push(...(corridor.length ? lane.shape.slice(1) : lane.shape));
+    }
   }
   const operators = sim.control === 'MANUAL'
     ? [{ id: 'judge', task: sim.review ? sim.review.job.title : 'idle' }]

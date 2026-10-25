@@ -6,7 +6,7 @@ export type LatLng = { lat: number; lng: number };
 
 export type RoadNode = { id: number; lat: number; lng: number; x: number; y: number }; // x,y = meters from center
 // oneway = true: drivable only from -> to. oneway = false: drivable both ways.
-export type RoadEdge = { id: number; from: number; to: number; lengthM: number; oneway: boolean };
+export type RoadEdge = { id: number; from: number; to: number; lengthM: number; oneway: boolean; geometry?: LatLng[] };
 export type RoadGraph = {
   center: LatLng;
   nodes: RoadNode[];
@@ -17,7 +17,10 @@ export type RoadGraph = {
 export type VehicleState = 'DRIVING' | 'REQUESTING_HELP' | 'QUEUED_BEHIND' | 'STAGED' | 'ARRIVED' | 'YIELDING' | 'YIELDED';
 // The ambulance is NOT in vehicles[]; it lives only in SimSnapshot.ambulance.
 export type Vehicle = { id: number; pos: LatLng; headingDeg: number; state: VehicleState;
-                        type: 'PASSENGER' | 'EMPTY' };
+                        type: 'PASSENGER' | 'EMPTY'; road?: RoadMotion };
+
+// Directed street geometry lets the renderer interpolate through bends and intersections.
+export type RoadMotion = { laneId: number; from: number; to: number; shape: LatLng[] };
 
 export type HelpRequest = {
   id: string; vehicleId: number; nodeId: number;
@@ -61,6 +64,12 @@ export type Ambulance = {
   pos: LatLng; headingDeg: number;
   status: 'WAITING' | 'EN_ROUTE' | 'STUCK' | 'ARRIVED';
   tripS: number;                                 // seconds since dispatch
+  road?: RoadMotion;
+  mission?: {
+    origin: LatLng; pickup: LatLng; hospital: LatLng;
+    phase: 'TO_PICKUP' | 'PICKING_UP' | 'TO_HOSPITAL' | 'DELIVERED';
+    pickupStartedAt: number | null; pickupCompleteAt: number | null;
+  };
 };
 
 export type LotState = { pos: LatLng; used: number; cap: number };
@@ -77,7 +86,7 @@ export type YieldCommand = {
 };
 export type CorridorStatus = {
   active: boolean; commands: YieldCommand[];
-  segments: { edgeId: number; from: LatLng; to: LatLng; state: 'RESERVED' | 'CLEARING' | 'CLEAR' }[];
+  segments: { edgeId: number; from: LatLng; to: LatLng; shape?: LatLng[]; state: 'RESERVED' | 'CLEARING' | 'CLEAR' }[];
 };
 export type OutageState = {
   center: LatLng; radiusM: number; startedAt: number; restoreAt: number | null; restoredAt: number | null;
