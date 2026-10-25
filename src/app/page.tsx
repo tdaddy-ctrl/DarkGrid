@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type CSSProperties } from 'react';
 import { Shuffle, TriangleAlert } from 'lucide-react';
-import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
+import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftOpen, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
 import type { Ambulance as AmbulanceState, ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
   answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, revokeZonePolicy, setControl, step, withRoadGeometry, type Sim,
@@ -31,6 +31,60 @@ const FOLLOW_SPEED = 0.3;    // following the ambulance runs the sim in slow mot
 
 type Mode = SimSnapshot['mode'];
 type Surface = 'city' | 'requests' | 'compare' | 'analyze';
+
+function PanelResizeHandle({ side, onResize, onCollapse }: { side: 'left' | 'right'; onResize: (width: number) => void; onCollapse: () => void }) {
+  const drag = useRef<{ id: number; x: number; width: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const minimum = side === 'left' ? 240 : 220;
+  const maximum = side === 'left' ? 520 : 420;
+  const panelId = side === 'left' ? 'request-panel' : 'mission-panel';
+  const resize = (element: HTMLElement, width: number) => {
+    const workspace = element.closest('.workspace-body');
+    if (!workspace) return;
+    const other = workspace.querySelector<HTMLElement>(side === 'left' ? '#mission-panel' : '#request-panel');
+    const available = workspace.clientWidth - (other?.getBoundingClientRect().width ?? 0) - 360;
+    onResize(Math.max(minimum, Math.min(maximum, available, width)));
+  };
+  return <button type="button" className={`panel-resize-handle resize-${side}`} data-dragging={dragging}
+    aria-label={`Resize ${side === 'left' ? 'Live requests' : 'Mission overview'} panel`}
+    aria-controls={panelId} title="Drag to resize; use arrow keys to adjust"
+    onPointerDown={event => {
+      if (event.button !== 0) return;
+      const panel = event.currentTarget.closest('.workspace-body')?.querySelector(`#${panelId}`);
+      if (!panel) return;
+      event.preventDefault();
+      drag.current = { id: event.pointerId, x: event.clientX, width: panel.getBoundingClientRect().width };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setDragging(true);
+    }}
+    onPointerMove={event => {
+      const start = drag.current;
+      if (!start || start.id !== event.pointerId) return;
+      const requestedWidth = start.width + (event.clientX - start.x) * (side === 'left' ? 1 : -1);
+      // The unclamped width measures travel beyond the actual minimum boundary.
+      // Reversing before the threshold naturally consumes that overshoot first.
+      if (minimum - requestedWidth >= minimum * 0.5) {
+        drag.current = null;
+        setDragging(false);
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        onCollapse();
+        return;
+      }
+      resize(event.currentTarget, requestedWidth);
+    }}
+    onPointerUp={event => {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+      drag.current = null; setDragging(false);
+    }}
+    onPointerCancel={() => { drag.current = null; setDragging(false); }}
+    onLostPointerCapture={() => { drag.current = null; setDragging(false); }}
+    onKeyDown={event => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      const panel = event.currentTarget.closest('.workspace-body')?.querySelector(`#${panelId}`);
+      if (panel) resize(event.currentTarget, panel.getBoundingClientRect().width + (event.key === 'ArrowRight' ? 16 : -16) * (side === 'left' ? 1 : -1));
+    }} />;
+}
 type View = {
   fifo: SimSnapshot; darkgrid: SimSnapshot; chart: ChartPoint[];
   historyRange: ReturnType<typeof historyRange>; outageT: number | null; isLive: boolean;
@@ -158,6 +212,10 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
   const [surface, setSurface] = useState<Surface>('city');
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
+  const [leftWidth, setLeftWidth] = useState<number | null>(null);
+  const [rightWidth, setRightWidth] = useState<number | null>(null);
+  const restoreLeft = () => { setLeftWidth(null); setLeftOpen(true); };
+  const restoreRight = () => { setRightWidth(null); setRightOpen(true); };
   const workspaceRef = useRef<{ surface: Surface; follow: boolean }>({ surface: 'city', follow: false });
   const [act, setAct] = useState(0);
   const [follow, setFollow] = useState(false);              // 3D camera chases the ambulance
@@ -386,7 +444,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
     outageT={view.outageT} onScrub={onScrub} onGoLive={onGoLive} />;
   const changeSurface = (next: Surface) => {
     setSurface(next);
-    if (next === 'requests') setLeftOpen(true);
+    if (next === 'requests') restoreLeft();
     // The narrow workspace stacks the map above the feed. Navigation must move
     // to the destination in both directions without changing simulation state.
     if (window.matchMedia('(max-width: 760px)').matches) {
@@ -408,18 +466,6 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
         </span>
         <span className="header-clock" title="Simulation time">T+{formatT(snap.t)}</span>
         <div className="header-actions">
-          {!expanded && <>
-            <button type="button" className="icon-button" aria-label={showLeft ? 'Hide request panel' : 'Show request panel'}
-              aria-expanded={showLeft} aria-controls="request-panel"
-              onClick={() => { if (surface === 'compare' || surface === 'analyze') setSurface('city'); setLeftOpen(!showLeft); }}>
-              {showLeft ? <PanelLeftClose /> : <PanelLeftOpen />}
-            </button>
-            <button type="button" className="icon-button" aria-label={showRight ? 'Hide mission panel' : 'Show mission panel'}
-              aria-expanded={showRight} aria-controls="mission-panel"
-              onClick={() => { if (surface === 'compare' || surface === 'analyze') setSurface('city'); setRightOpen(!showRight); }}>
-              {showRight ? <PanelRightClose /> : <PanelRightOpen />}
-            </button>
-          </>}
           <button type="button" className="present-button" onClick={() => expanded ? exitPresentation() : enterPresentation()}>
             {expanded ? <Minimize2 /> : <Maximize2 />}<span>{expanded ? 'Exit presentation' : 'Present'}</span>
             {expanded && <kbd>Esc</kbd>}
@@ -442,7 +488,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
       </header>
 
       <div ref={workspaceBodyRef} className="workspace-body" data-left={showLeft} data-right={showRight} data-surface={surface}
-        style={{ '--left': showLeft ? surface === 'requests' ? '430px' : undefined : '0px', '--right': showRight ? undefined : '0px' } as CSSProperties}>
+        style={{ '--left-size': leftWidth === null ? undefined : `${leftWidth}px`, '--right-size': rightWidth === null ? undefined : `${rightWidth}px` } as CSSProperties}>
         <aside ref={requestPanelRef} id="request-panel" className="request-panel" hidden={!showLeft} aria-label="Live request panel">
           <RequestFeed snapshot={snap} mode={mode} onModeChange={setMode} onAnswer={onAnswer}
             proposal={outage ? proposal : null} readOnly={!view.isLive} paused={paused}
@@ -451,6 +497,18 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
         </aside>
 
         <div className="workspace-stage">
+          {!expanded && (surface === 'city' || surface === 'requests') && <>
+            {showLeft && <PanelResizeHandle side="left" onResize={setLeftWidth} onCollapse={() => setLeftOpen(false)} />}
+            <button type="button" className="panel-restore restore-left" aria-expanded={showLeft} aria-controls="request-panel"
+              aria-label={showLeft ? 'Collapse request panel' : 'Restore Live requests panel at default width'}
+              onClick={() => showLeft ? setLeftOpen(false) : restoreLeft()}>{showLeft ? <ChevronLeft /> : <PanelLeftOpen />}</button>
+            {surface === 'city' && <>
+              {showRight && <PanelResizeHandle side="right" onResize={setRightWidth} onCollapse={() => setRightOpen(false)} />}
+              <button type="button" className="panel-restore restore-right" aria-expanded={showRight} aria-controls="mission-panel"
+                aria-label={showRight ? 'Collapse mission panel' : 'Restore Mission overview panel at default width'}
+                onClick={() => showRight ? setRightOpen(false) : restoreRight()}>{showRight ? <ChevronRight /> : <PanelRightOpen />}</button>
+            </>}
+          </>}
           {/* Keep the imperative map mounted across destinations and presentation transitions. */}
           <section className={`city-stage ${split || surface === 'analyze' ? 'is-concealed' : ''}`} aria-label="Tactical city map" aria-hidden={split || surface === 'analyze'}>
             <TacticalMap3D snapshot={snap} graph={graph} hazardCenter={hazard?.center} hazardLabel={hazard?.label}

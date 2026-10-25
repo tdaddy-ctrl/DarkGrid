@@ -356,7 +356,34 @@ kbd { font-family: inherit; font-size: 10px; line-height: 18px; padding: 0 4px; 
 .patient-clock.is-arrived > div { border-color: #5fa385; color: #a1eac3; }
 .patient-clock.is-stuck > div { border-color: #b26476; color: #ffb5c4; }
 @media (max-width: 760px) { .patient-clock { top: auto; bottom: 95px; } .patient-clock > div { font-size: 10px; padding: 6px 8px; } .is-presenting .patient-clock { top: 14px; bottom: auto; } }
-:root { --dg-workspace-revision: 3; }
+:root { --dg-workspace-revision: 4; }
+.panel-resize-handle { display: none; }
+.panel-restore { position: absolute; top: 50%; transform: translateY(-50%); z-index: 50; display: grid; place-items: center; width: 30px; height: 38px; border: 1px solid #526573; border-radius: 5px; background: #101a24; color: #c3d7df; pointer-events: auto; }
+.panel-restore svg { width: 18px; height: 18px; }
+/* Edge controls belong to the full-height map stage, not scrolling panel titles. */
+.request-panel .panel-title > button[aria-label="Collapse request panel"],
+.mission-panel .panel-title > button[aria-label="Collapse mission panel"] { display: none; }
+.restore-left { left: 5px; }
+.restore-right { right: 5px; }
+@media (min-width: 981px) {
+  .dg-workspace { container-type: inline-size; }
+  .workspace-body { --left-default: 316px; --right-default: 264px; }
+  .workspace-body[data-surface="requests"] { --left-default: 430px; }
+  .workspace-body { --right-reserved: var(--right-size, var(--right-default)); }
+  .workspace-body[data-right="false"] { --right-reserved: 0px; }
+  .workspace-body[data-left="true"] { --left: min(var(--left-size, var(--left-default)), max(240px, calc(100cqw - 360px - var(--right-reserved)))); }
+  .workspace-body[data-right="true"] { --right: min(var(--right-size, var(--right-default)), max(220px, calc(100cqw - 360px - var(--left)))); }
+  .panel-resize-handle { display: block; position: absolute; top: 0; bottom: 0; width: 8px; padding: 0; border: 0; border-radius: 0; z-index: 50; background: transparent; touch-action: none; pointer-events: auto; }
+  button.panel-resize-handle:hover { cursor: col-resize; }
+  .panel-resize-handle::after { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: #526573; }
+  .resize-left { left: 0; }
+  .resize-right { right: 0; }
+  .resize-right::after { left: auto; right: 0; }
+  .panel-resize-handle:hover::after, .panel-resize-handle:focus-visible::after, .panel-resize-handle[data-dragging="true"]::after { background: #46d6c2; }
+  .workspace-body:has(.panel-resize-handle[data-dragging="true"]), .workspace-body:has(.panel-resize-handle[data-dragging="true"]) * { user-select: none; cursor: col-resize; }
+}
+@media (min-width: 981px) and (max-width: 1150px) { .workspace-body { --left-default: 284px; --right-default: 230px; } }
+@media (min-width: 1600px) { .workspace-body { --left-default: 346px; --right-default: 292px; } }
 @media (max-width: 760px) {
   .workspace-body[data-left="false"][data-right="false"] .workspace-stage { flex: 1; min-height: 0; }
   .workspace-body[data-left="false"][data-right="false"][data-surface="compare"] .workspace-stage { flex: 0 0 1100px; }
