@@ -20,7 +20,7 @@ const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 const GOOGLE_TILES_URL = 'https://tile.googleapis.com/v1/3dtiles/root.json';
 // If no photo tile has loaded by then (blocked key, no network), switch to the OSM blocks
 // (instant, offline). A slow but working network keeps the photo city; it sharpens as tiles arrive.
-const PHOTO_TIMEOUT_MS = 60000;
+const PHOTO_TIMEOUT_MS = 12000;
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
 // Ground overlays respect the city's depth buffer. Buildings occlude routes and
@@ -56,8 +56,12 @@ const WAYMO_GLB = '/models/waymo.glb';
 const AMBULANCE_GLB = '/models/ambulance.glb';
 const CAR_MIN_PX = 1.7;
 // MapView looks at the ambulance; pitch places the eye above and behind that target.
-const CHASE_ZOOM = 18;
-const CHASE_PITCH = 55;
+// Follow camera: a medium chase that keeps the ambulance clearly in frame with room around it.
+// At zoom 19 the camera sits ~280 m from the target, so at this pitch the eye trails roughly
+// 220 m back and ~180 m up: close enough to read the ambulance, far enough to see the street
+// and the cars pulling over ahead of it without being blocked by downtown towers.
+const CHASE_ZOOM = 19;
+const CHASE_PITCH = 50;
 const CAR_LIFT_M = 0.5;           // models sit this far above the sampled ground so small height errors never bury them
 // Models face +X (east) at yaw 0; yaw turns them to the compass heading (clockwise from north).
 const orient = (headingDeg: number): [number, number, number] => [0, 90 - headingDeg, 0];
@@ -314,17 +318,23 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
 
     (async () => {
       try {
-        const core = await import('@deck.gl/core');
-        const L = await import('@deck.gl/layers');
-        const mesh = await import('@deck.gl/mesh-layers');
-        const [waymoParts, ambulanceParts] = await Promise.all([loadCarParts(WAYMO_GLB), loadCarParts(AMBULANCE_GLB)])
-          .catch((): [CarPart[], CarPart[]] => [[], []]);
-        const geo = GOOGLE_KEY ? await import('@deck.gl/geo-layers').catch(() => null) : null;
+        // Load deck.gl, the car models and the map data in parallel: the map paints as soon as the
+        // last of them is ready instead of waiting for each one in turn.
+        const [[core, L, mesh, geo], [waymoParts, ambulanceParts], buildingsRes, groundRes] = await Promise.all([
+          Promise.all([
+            import('@deck.gl/core'),
+            import('@deck.gl/layers'),
+            import('@deck.gl/mesh-layers'),
+            GOOGLE_KEY ? import('@deck.gl/geo-layers').catch(() => null) : Promise.resolve(null),
+          ]),
+          Promise.all([loadCarParts(WAYMO_GLB), loadCarParts(AMBULANCE_GLB)])
+            .catch((): [CarPart[], CarPart[]] => [[], []]),
+          fetch('/data/sf_buildings.json'),
+          fetch('/data/sf_ground.json').catch(() => null),
+        ]);
         let photo = !!geo;
         setSource(photo ? 'google' : 'osm');
-        const res = await fetch('/data/sf_buildings.json');
-        const buildings: Building[] = res.ok ? await res.json() : [];
-        const groundRes = await fetch('/data/sf_ground.json').catch(() => null);
+        const buildings: Building[] = buildingsRes.ok ? await buildingsRes.json() : [];
         const seaLevel = groundSampler(groundRes?.ok ? await groundRes.json() : []);
         // Ground height to draw at: the real street surface in the photo city, flat 0 for the OSM blocks.
         const gz = (lng: number, lat: number) => (photo ? seaLevel(lng, lat) + PHOTO_GROUND_OFFSET_M : 0);
@@ -350,6 +360,24 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           rim: new core.DirectionalLight({ color: [80, 140, 190], intensity: 0.7, direction: [-0.4, -1, -0.6] }),
         });
 
+        const buildingsLayer = (): Layer => new L.PolygonLayer<Building>({
+          id: 'buildings', data: buildings, positionFormat: 'XY',
+          getPolygon: (b) => b[1],
+          // Base each block on the street height under its centroid, so the placeholder blocks sit
+          // on the photoreal ground instead of floating when shown over the streaming tiles.
+          getElevation: (b) => {
+            const ring = b[1];
+            let x = 0, y = 0;
+            for (let i = 0; i < ring.length; i += 2) { x += ring[i]; y += ring[i + 1]; }
+            const n = ring.length / 2;
+            return b[0] + gz(x / n, y / n);
+          },
+          extruded: true, wireframe: true, filled: true, stroked: false, elevationScale: 1.15,
+          // Graphite towers, a shade lighter the taller they are, so the skyline reads above the blocks.
+          getFillColor: (b) => (b[0] > 120 ? [58, 65, 76, 250] : b[0] > 40 ? [44, 50, 59, 248] : [32, 37, 44, 245]),
+          getLineColor: (b) => (b[0] > 120 ? [160, 200, 230, 80] : [120, 140, 160, 34]),
+          material: { ambient: 0.45, diffuse: 0.75, shininess: 40, specularColor: [90, 100, 112] },
+        });
         const osmLayers = (): Layer[] => [
           new L.PathLayer({
             id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 14],
@@ -363,15 +391,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             id: 'roads', data: roads, getPath: (d: Pt[]) => d, getColor: [70, 96, 122, 200],
             getWidth: 1.4, widthUnits: 'pixels',
           }),
-          new L.PolygonLayer<Building>({
-            id: 'buildings', data: buildings, positionFormat: 'XY',
-            getPolygon: (b) => b[1], getElevation: (b) => b[0],
-            extruded: true, wireframe: true, filled: true, stroked: false, elevationScale: 1.15,
-            // Graphite towers, a shade lighter the taller they are, so the skyline reads above the blocks.
-            getFillColor: (b) => (b[0] > 120 ? [58, 65, 76, 250] : b[0] > 40 ? [44, 50, 59, 248] : [32, 37, 44, 245]),
-            getLineColor: (b) => (b[0] > 120 ? [160, 200, 230, 80] : [120, 140, 160, 34]),
-            material: { ambient: 0.45, diffuse: 0.75, shininess: 40, specularColor: [90, 100, 112] },
-          }),
+          buildingsLayer(),
         ];
 
         let lastCredits = '';
@@ -379,11 +399,15 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         let tilesLoaded = 0;
         let photoSince = performance.now();
         let photoAttempt = 0;
+        // Placeholder blocks: drawn over the streaming photoreal tiles so the city is visible
+        // immediately, then removed once enough photo tiles have loaded.
+        let blocksVisible = true;
         const fallBackToOsm = (unavailable = false) => {
           if (!photo) return;
           photo = false;
           photoAttempt++;
           tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
+          blocksVisible = true;
           staticLayers = osmLayers();
           setSource('osm');
           setPhotoNotice(unavailable ? 'Photo unavailable. Showing Blocks; select Photo to retry.' : '');
@@ -394,8 +418,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           if (photo) { setSource('google'); return; }
           photoAttempt++;
           photo = true; tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
+          blocksVisible = true;
           setPhotoNotice('');
-          staticLayers = photoLayers();
+          staticLayers = [...photoLayers(), buildingsLayer()];
           setSource('google');
         };
         const photoLayers = (): Layer[] => {
@@ -408,7 +433,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
               fetch: { headers: { 'X-GOOG-API-KEY': GOOGLE_KEY! } },
               // The default 32 MB cache evicts building-level tiles as soon as they load, so the
               // city stays blurry; give it room and fetch more tiles in parallel.
-              tileset: { maximumMemoryUsage: 1024, memoryCacheOverflow: 256, maximumScreenSpaceError: 6, maxRequests: 48 },
+              // Coarse first: a higher screen-space-error target lets the moving follow camera get
+              // its viewport covered sooner, then tiles keep refining while the view is still.
+              tileset: { maximumMemoryUsage: 1024, memoryCacheOverflow: 256, maximumScreenSpaceError: 16, maxRequests: 48 },
             },
             onTilesetLoad: (tileset) => {
               // Google's terms: show the data providers for the tiles on screen.
@@ -438,7 +465,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           }),
         ];
         };
-        let staticLayers: Layer[] = photo ? photoLayers() : osmLayers();
+        let staticLayers: Layer[] = photo ? [...photoLayers(), buildingsLayer()] : osmLayers();
 
         // The home view is framed for the real San Francisco map; other maps (the test grid) center on themselves.
         const sf = Math.abs(graph.center.lat - 37.77) < 0.02 && Math.abs(graph.center.lng + 122.408) < 0.02;
@@ -570,6 +597,12 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (!activeRef.current) { last = now; lastMotionT = -1; trafficSimT = -1; return; }
           if (photo && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm(true);
+          if (photo && blocksVisible && tilesLoaded >= 8) {
+            // The photoreal city now covers the view: drop the placeholder blocks, keeping the
+            // same tile layer instance so nothing that loaded gets re-fetched.
+            blocksVisible = false;
+            staticLayers = staticLayers.filter((layer) => layer.id !== 'buildings');
+          }
           const dt = (now - last) / 1000; last = now;
           const isPresenting = presentingRef.current;
           if (isPresenting !== wasPresenting) {

@@ -288,7 +288,7 @@ kbd { font-family: inherit; font-size: 10px; line-height: 18px; padding: 0 4px; 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
 
 /* Map chrome stays lightweight; the city and the ambulance carry the scene. */
-.tactical-city { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: #0b151f; }
+.tactical-city { position: relative; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: #1c2a38; }
 .city-atmosphere { position: absolute; inset: 0; pointer-events: none; background: linear-gradient(180deg, #0a141e55, transparent 30%, transparent 80%, #07101955); }
 .hazard-map-label { position: absolute; left: 0; top: 0; pointer-events: none; align-items: center; gap: 7px; background: #18212bf0; color: #f5d5a6; border: 1px solid #b3905b; border-radius: 7px; padding: 8px 11px; font-size: 11px; white-space: nowrap; }
 .hazard-map-label > span { width: 6px; height: 6px; border-radius: 50%; background: #ffbe55; }
