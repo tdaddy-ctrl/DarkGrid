@@ -6,7 +6,7 @@
 // deck.gl is loaded inside useEffect, so nothing WebGL runs during server rendering.
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Ambulance as AmbulanceIcon, ChevronLeft, ChevronRight, Cross, Crosshair, House, Info, Layers3, TriangleAlert } from 'lucide-react';
+import { Ambulance as AmbulanceIcon, Cross, Layers3 } from 'lucide-react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
 import type { Ambulance, LatLng, RoadGraph, SimSnapshot, RoadMotion } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
@@ -34,9 +34,6 @@ const STATE_RGB: Record<string, Rgba> = {
   DRIVING: [52, 211, 153, 235], REQUESTING_HELP: [255, 42, 84, 255], QUEUED_BEHIND: [251, 146, 60, 245],
   STAGED: [56, 189, 248, 245], ARRIVED: [148, 163, 184, 200], YIELDING: [250, 204, 21, 255], YIELDED: [45, 212, 191, 245],
 };
-const LEGEND: [string, string][] = [
-  ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'], ['Civilian cars', '#9ca3af'],
-];
 // Everyday car colors for civilian traffic (the Waymos are all white).
 const CIVILIAN_PAINT: Rgba[] = [[24, 26, 30, 255], [70, 74, 82, 255], [130, 134, 140, 255], [120, 18, 22, 255], [22, 38, 70, 255], [190, 190, 196, 255]];
 // Home view: from the SoMa blackout looking north-northeast at the downtown skyline
@@ -861,20 +858,6 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         ))}
       </div>
       {photoNotice && <p role="status" className="absolute left-4 top-16 z-20 max-w-72 rounded border border-slate-600 bg-slate-950/90 px-3 py-2 text-xs text-slate-200">{photoNotice}</p>}
-      <div role="group" aria-label="Camera" className="map-camera-controls">
-        {(snapshot.incidents ?? []).some(i => i.status !== 'CLEARED') && <button type="button" aria-label="View collision" title="Cycle through active collisions" onClick={() => cameraRef.current?.('incident')}><TriangleAlert /></button>}
-        {([['left', 'Rotate left', ChevronLeft], ['home', 'Reset view', House], ['right', 'Rotate right', ChevronRight]] as const).map(([cmd, label, Icon]) => (
-          <button key={cmd} type="button" aria-label={label} title={label} onClick={() => cameraRef.current?.(cmd)}><Icon /></button>
-        ))}
-        {(['in', 'out'] as const).map(cmd => (
-          <button key={cmd} type="button" aria-label={cmd === 'in' ? 'Zoom in' : 'Zoom out'}
-            onClick={() => cameraRef.current?.(cmd)}>{cmd === 'in' ? '+' : '−'}</button>
-        ))}
-      </div>
-      <button type="button" className="map-follow-button" aria-pressed={follow} disabled={!snapshot.ambulance} onClick={() => onFollowChange?.(!follow)}>
-        <Crosshair />{follow ? snapshot.ambulance?.status === 'WAITING' ? 'Follow when dispatched' : 'Following ambulance' : 'Follow ambulance'}
-      </button>
-      <details className="map-legend"><summary><Info />Map key</summary><ul>{LEGEND.map(([label, color]) => <li key={label}><span style={{ background: color }} />{label}</li>)}<li><span style={{ background: '#f7b84d' }} />Ambulance corridor</li></ul><p>Civilian traffic is visual only.</p><p>Left drag to pan · Right drag to rotate</p></details>
       <p className="map-attribution">{source === 'google' ? <>Google{credits ? ` · ${credits}` : ''} · roads © OpenStreetMap contributors</> : 'Buildings & roads © OpenStreetMap contributors'}</p>
     </div>
   );

@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type CSSProperties } from 'react';
 import { Shuffle, TriangleAlert } from 'lucide-react';
-import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftOpen, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
+import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Info, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
 import type { Ambulance as AmbulanceState, ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
   answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, revokeZonePolicy, setControl, step, withRoadGeometry, type Sim,
@@ -28,6 +28,10 @@ const UI_EVERY_MS = 250;     // React state updates at most 4x per second
 const CHART_EVERY_S = 2;     // one ChartPoint every 2 sim-seconds
 const MAX_FRAME_S = 0.25;    // a stalled tab doesn't fast-forward minutes at once
 const FOLLOW_SPEED = 0.3;    // following the ambulance runs the sim in slow motion (3x instead of 10x) so the camera can keep up
+
+const MAP_LEGEND: [string, string][] = [
+  ['Driving', '#34d399'], ['Needs help', '#ff2a54'], ['Queued', '#fb923c'], ['Staged', '#38bdf8'], ['Civilian cars', '#9ca3af'],
+];
 
 type Mode = SimSnapshot['mode'];
 type Surface = 'city' | 'requests' | 'compare' | 'analyze';
@@ -211,13 +215,11 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
   const [paused, setPaused] = useState(false);
   const [surface, setSurface] = useState<Surface>('city');
   const [leftOpen, setLeftOpen] = useState(true);
-  const [rightOpen, setRightOpen] = useState(true);
   const [leftWidth, setLeftWidth] = useState<number | null>(null);
-  const [rightWidth, setRightWidth] = useState<number | null>(null);
   const restoreLeft = () => { setLeftWidth(null); setLeftOpen(true); };
-  const restoreRight = () => { setRightWidth(null); setRightOpen(true); };
   const workspaceRef = useRef<{ surface: Surface; follow: boolean }>({ surface: 'city', follow: false });
   const [act, setAct] = useState(0);
+  const [followAcknowledged, setFollowAcknowledged] = useState(false);
   const [follow, setFollow] = useState(false);              // 3D camera chases the ambulance
   const [expanded, setExpanded] = useState(false);          // reversible presentation mode
   const split = surface === 'compare';
@@ -370,7 +372,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
     () => { takeOver('FIFO'); setAct(2); setSurface('city'); setFollow(false); },
     () => { takeOver('DARKGRID'); setAct(3); setSurface('city'); setFollow(false); },
     () => { setFollow(false); setSurface('compare'); setAct(4); },
-    () => { enterPresentation('city'); setMode('DARKGRID'); setFollow(true); setAct(5); },
+    () => { enterPresentation('city'); setMode('DARKGRID'); setFollow(true); setFollowAcknowledged(true); setAct(5); },
   ], [onReset, blackout, takeOver, enterPresentation]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -437,7 +439,6 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
   const hazard = snap.outage ? { center: snap.outage.center, label: `${areaName(snap.outage.center)} · ${snap.outage.status === 'RESTORING' ? 'Power restoring' : 'Power outage'}` } : null;
   const pendingPolicy = snap.jobs.some(j => j.kind === 'ZONE_POLICY');
   const showLeft = !expanded && surface !== 'compare' && surface !== 'analyze' && leftOpen;
-  const showRight = !expanded && surface === 'city' && rightOpen;
   const contextualQueue = expanded && !split && !follow && (snap.control === 'MANUAL' || pendingPolicy);
   const demoStep = follow ? 5 : split ? 4 : snap.control === 'MANUAL' ? (mode === 'FIFO' ? 2 : 3) : act;
   const timeline = <TimelineScrubber range={view.historyRange} t={snap.t} isLive={view.isLive}
@@ -466,17 +467,18 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
         </span>
         <span className="header-clock" title="Simulation time">T+{formatT(snap.t)}</span>
         <div className="header-actions">
+          <button type="button" className="action-button warning header-blackout" disabled={view.outageT !== null || !view.isLive} onClick={director[1]}><Zap />Trigger blackout</button>
           <button type="button" className="present-button" onClick={() => expanded ? exitPresentation() : enterPresentation()}>
             {expanded ? <Minimize2 /> : <Maximize2 />}<span>{expanded ? 'Exit presentation' : 'Present'}</span>
             {expanded && <kbd>Esc</kbd>}
           </button>
-          <details className="session-menu">
+          <details className="header-map-legend"><summary className="present-button"><Info />Map key</summary><div className="header-legend-content"><ul>{MAP_LEGEND.map(([label, color]) => <li key={label}><span style={{ background: color }} />{label}</li>)}<li><span style={{ background: '#f7b84d' }} />Ambulance corridor</li></ul><p>Civilian traffic is visual only.</p><p>Left drag to pan · Right drag to rotate</p></div></details>
+          <details className="session-menu" hidden>
             <summary className="icon-button" aria-label="Session controls"><MoreHorizontal /></summary>
             <div className="session-menu-content">
               <p>Simulation controls</p>
               <button onClick={onNewScenario}><Shuffle />New random scenario</button>
               <button disabled={!view.isLive || (snap.incidents?.length ?? 0) >= MAX_COLLISION_INCIDENTS} onClick={collision}><TriangleAlert />Inject collision</button>
-              <button disabled={view.outageT !== null} onClick={director[1]}><Zap />Trigger blackout <kbd>1</kbd></button>
               <button onClick={director[2]}><UsersRound />Judge takes over FIFO <kbd>2</kbd></button>
               <button onClick={director[3]}><ShieldCheck />Operate DARK GRID <kbd>3</kbd></button>
               <button onClick={() => takeOver(null)}><Radio />Automatic operators</button>
@@ -487,13 +489,13 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
         </div>
       </header>
 
-      <div ref={workspaceBodyRef} className="workspace-body" data-left={showLeft} data-right={showRight} data-surface={surface}
-        style={{ '--left-size': leftWidth === null ? undefined : `${leftWidth}px`, '--right-size': rightWidth === null ? undefined : `${rightWidth}px` } as CSSProperties}>
+      <div ref={workspaceBodyRef} className="workspace-body" data-left={showLeft} data-right="false" data-surface={surface}
+        style={{ '--left-size': leftWidth === null ? undefined : `${leftWidth}px` } as CSSProperties}>
         <aside ref={requestPanelRef} id="request-panel" className="request-panel" hidden={!showLeft} aria-label="Live request panel">
           <RequestFeed snapshot={snap} mode={mode} onModeChange={setMode} onAnswer={onAnswer}
             proposal={outage ? proposal : null} readOnly={!view.isLive} paused={paused}
             onTakeOver={() => takeOver(snap.control === 'MANUAL' ? null : mode)}
-            onBlackout={director[1]} onRevoke={onRevoke} onCollapse={() => setLeftOpen(false)} />
+            onRevoke={onRevoke} onCollapse={() => setLeftOpen(false)} />
         </aside>
 
         <div className="workspace-stage">
@@ -502,12 +504,6 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
             <button type="button" className="panel-restore restore-left" aria-expanded={showLeft} aria-controls="request-panel"
               aria-label={showLeft ? 'Collapse request panel' : 'Restore Live requests panel at default width'}
               onClick={() => showLeft ? setLeftOpen(false) : restoreLeft()}>{showLeft ? <ChevronLeft /> : <PanelLeftOpen />}</button>
-            {surface === 'city' && <>
-              {showRight && <PanelResizeHandle side="right" onResize={setRightWidth} onCollapse={() => setRightOpen(false)} />}
-              <button type="button" className="panel-restore restore-right" aria-expanded={showRight} aria-controls="mission-panel"
-                aria-label={showRight ? 'Collapse mission panel' : 'Restore Mission overview panel at default width'}
-                onClick={() => showRight ? setRightOpen(false) : restoreRight()}>{showRight ? <ChevronRight /> : <PanelRightOpen />}</button>
-            </>}
           </>}
           {/* Keep the imperative map mounted across destinations and presentation transitions. */}
           <section className={`city-stage ${split || surface === 'analyze' ? 'is-concealed' : ''}`} aria-label="Tactical city map" aria-hidden={split || surface === 'analyze'}>
@@ -543,26 +539,31 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
               proposal={outage ? proposal : null} readOnly={!view.isLive} onAnswer={onAnswer} /> :
               <RequestFeed snapshot={snap} mode={mode} onModeChange={setMode} onAnswer={onAnswer}
                 proposal={outage ? proposal : null} readOnly={!view.isLive} paused={paused} compact
-                onTakeOver={() => takeOver(snap.control === 'MANUAL' ? null : mode)} onBlackout={director[1]} />}
+                onTakeOver={() => takeOver(snap.control === 'MANUAL' ? null : mode)} />}
           </div>}
 
-          {surface !== 'analyze' && <div className={`playback-dock ${expanded ? 'with-director' : ''}`}>
+          {surface !== 'analyze' && <div className="playback-controls"><div className={`playback-dock ${expanded ? 'with-director' : ''}`}>
             {expanded && <nav className="demo-act-nav" aria-label="Demo director">
               {['Blackout', 'Judge', 'Dark Grid', 'Compare', 'Follow'].map((label, i) =>
                 <button key={label} aria-current={demoStep === i + 1 ? 'step' : undefined} onClick={director[i + 1]}><span>{i + 1}</span>{label}</button>)}
             </nav>}
             <div className="playback-row"><button className="play-toggle" aria-label={paused ? 'Resume simulation' : 'Pause simulation'} onClick={togglePause}>{paused ? <Play /> : <Pause />}</button>
               <span className="playback-state">{!view.isLive ? 'Replay' : paused ? 'Paused' : 'Running'}</span>{timeline}
+
               {expanded && <button className="dock-reset" onClick={onReset}><RotateCcw />Reset</button>}
             </div>
+          </div>
+              <button type="button" className={`timeline-follow-button${view.outageT !== null && !follow && !followAcknowledged ? ' follow-prompt' : ''}`}
+                aria-label="Follow Ambulance" title="Follow Ambulance" aria-pressed={follow} disabled={!snap.ambulance}
+                onClick={() => { setFollowAcknowledged(true); setFollow(value => !value); }}><Crosshair /></button>
           </div>}
           {expanded && <span className="presentation-footnote">Deterministic simulation</span>}
 
         </div>
 
-        <aside id="mission-panel" className="mission-panel" hidden={!showRight} aria-label="Mission overview">
+        <aside id="mission-panel" className="mission-panel" hidden aria-label="Mission overview">
           <MissionOverview snapshot={snap} rival={rival} graph={graph} follow={follow} onFollow={() => setFollow(v => !v)}
-            onCollapse={() => setRightOpen(false)} onCompare={() => changeSurface('compare')}
+            onCompare={() => changeSurface('compare')}
             scenarioControls={<ScenarioControls snapshot={snap} readOnly={!view.isLive} onNew={onNewScenario} onCollision={collision} />} />
         </aside>
       </div>
@@ -893,10 +894,10 @@ const CAUSE_DETAIL: Record<string, string> = {
   'stuck': 'Waiting in traffic long enough to request operator assistance.',
 };
 
-function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnly, paused, onTakeOver, onBlackout, onRevoke, onCollapse, compact = false }: {
+function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnly, paused, onTakeOver, onRevoke, onCollapse, compact = false }: {
   snapshot: SimSnapshot; mode: Mode; onModeChange: (mode: Mode) => void;
   onAnswer: (id: string, city: Mode) => void; proposal?: ChaosResult | null;
-  readOnly: boolean; paused: boolean; onTakeOver: () => void; onBlackout: () => void; onRevoke?: () => void; onCollapse?: () => void; compact?: boolean;
+  readOnly: boolean; paused: boolean; onTakeOver: () => void; onRevoke?: () => void; onCollapse?: () => void; compact?: boolean;
 }) {
   const [filter, setFilter] = useState<'all' | 'corridor' | 'blocking'>('all');
   const manual = snapshot.control === 'MANUAL';
@@ -959,7 +960,6 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
       {filtered.length > shown.length && <p className="queue-tail">{filtered.length - shown.length} more jobs waiting{compact ? ' · exit presentation to see all' : ''}</p>}
       {!zone && !shown.length && <div className="queue-empty"><ShieldCheck /><h3>{locked ? 'Review in progress' : filter === 'all' ? 'The queue is clear.' : 'No matching requests.'}</h3>
         <p>{locked ? 'The current review will finish as simulation time advances.' : snapshot.outage?.status === 'RESTORED' ? 'Power is restored. Start a new scenario for another incident.' : snapshot.darkNodes.length ? 'Requests will appear here when a vehicle needs assistance.' : 'The city is moving. Trigger a blackout to begin the demonstration.'}</p>
-        {!snapshot.outage && !readOnly && <button className="action-button warning" onClick={onBlackout}><Zap />Trigger blackout</button>}
       </div>}
     </div>
     <div className="queue-control">
@@ -1004,9 +1004,9 @@ function CorridorProtocol({ snapshot }: { snapshot: SimSnapshot }) {
   </div>;
 }
 
-function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse, onCompare, scenarioControls }: {
+function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCompare, scenarioControls }: {
   snapshot: SimSnapshot; rival: SimSnapshot; graph: RoadGraph; follow: boolean;
-  onFollow: () => void; onCollapse: () => void; onCompare: () => void;
+  onFollow: () => void; onCompare: () => void;
   scenarioControls: ReactNode;
 }) {
   const amb = snapshot.ambulance;
@@ -1020,7 +1020,7 @@ function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse,
     : zone?.endReason === 'POWER_RESTORED' ? 'Ended' : zone?.endReason === 'EXPIRED' && snapshot.darkNodes.length ? 'Needs renewal'
     : !zone && snapshot.darkNodes.length && dg ? 'Needs approval' : 'Standby';
   return <section className="mission-overview">
-    <div className="panel-title"><h2>Mission overview</h2><button className="icon-button" aria-label="Collapse mission panel" onClick={onCollapse}><ChevronRight /></button></div>
+    <div className="panel-title"><h2>Mission overview</h2></div>
     <div className={`ambulance-summary ${amb?.status === 'ARRIVED' ? 'has-arrived' : ''}`}><div className="ambulance-icon"><Ambulance /></div><div><h3>{status}</h3><p>{routeLabel}</p>{amb && amb.status !== 'WAITING' && <strong className="mission-time">{formatT(amb.tripS)}<span> elapsed</span></strong>}</div></div>
     <button className="action-button secondary follow-button" disabled={!amb} aria-pressed={follow} onClick={onFollow}><Crosshair />{follow ? 'Stop following' : 'Follow ambulance'}</button>
     {scenarioControls}
