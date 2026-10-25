@@ -264,6 +264,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   useEffect(() => { motionRef.current = motion; }, [motion]);
   const [failed, setFailed] = useState(false);
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
+  const [photoNotice, setPhotoNotice] = useState('');
   const [credits, setCredits] = useState('');
   const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
   const cameraRef = useRef<((cmd: 'left' | 'right' | 'home' | 'in' | 'out' | 'incident') => void) | null>(null);
@@ -377,23 +378,29 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         let tileErrors = 0;
         let tilesLoaded = 0;
         let photoSince = performance.now();
-        let autoFallback = true;   // off once the presenter picks a mode by hand
-        const fallBackToOsm = () => {
+        let photoAttempt = 0;
+        const fallBackToOsm = (unavailable = false) => {
           if (!photo) return;
           photo = false;
+          photoAttempt++;
+          tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
           staticLayers = osmLayers();
           setSource('osm');
+          setPhotoNotice(unavailable ? 'Photo unavailable. Showing Blocks; select Photo to retry.' : '');
         };
         switchRef.current = (to) => {
-          autoFallback = false;
-          if (to === 'osm') { fallBackToOsm(); return; }
+          if (to === 'osm') { fallBackToOsm(); setPhotoNotice(''); return; }
           if (!geo) return;
           if (photo) { setSource('google'); return; }
-          photo = true; tileErrors = 0; photoSince = performance.now();
+          photoAttempt++;
+          photo = true; tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
+          setPhotoNotice('');
           staticLayers = photoLayers();
           setSource('google');
         };
-        const photoLayers = (): Layer[] => [
+        const photoLayers = (): Layer[] => {
+          const attempt = photoAttempt;
+          return [
           new geo!.Tile3DLayer({
             id: 'google-3d',
             data: GOOGLE_TILES_URL,
@@ -416,8 +423,10 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
                 return selected;
               };
             },
-            onTileLoad: () => { tilesLoaded++; },
-            onTileError: () => { if (autoFallback && ++tileErrors > 5) fallBackToOsm(); },
+            onTileLoad: () => { if (photo && attempt === photoAttempt) tilesLoaded++; },
+            onTileError: () => {
+              if (photo && attempt === photoAttempt && ++tileErrors > 5) fallBackToOsm(true);
+            },
           }),
           new L.PathLayer({
             id: 'grid', data: grid, getPath: (d: Pt[]) => d, getColor: [56, 189, 248, 12], parameters: SURFACE_DEPTH,
@@ -428,6 +437,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             getWidth: 1, widthUnits: 'pixels',
           }),
         ];
+        };
         let staticLayers: Layer[] = photo ? photoLayers() : osmLayers();
 
         // The home view is framed for the real San Francisco map; other maps (the test grid) center on themselves.
@@ -493,7 +503,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             }
           },
           onInteractionStateChange: (s) => { interacting = !!(s.isDragging || s.isPanning || s.isRotating || s.isZooming); if (interacting) lastTouch = performance.now(); },
-          onError: () => { if (photo) fallBackToOsm(); else setFailed(true); },
+          onError: () => { if (photo) fallBackToOsm(true); else setFailed(true); },
         });
 
         // Cars: white Waymo models gliding between updates (headlights and taillights glow). A car that is
@@ -559,7 +569,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (!activeRef.current) { last = now; lastMotionT = -1; trafficSimT = -1; return; }
-          if (photo && autoFallback && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm();
+          if (photo && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm(true);
           const dt = (now - last) / 1000; last = now;
           const isPresenting = presentingRef.current;
           if (isPresenting !== wasPresenting) {
@@ -817,6 +827,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             onClick={() => switchRef.current?.(value)}>{label}</button>
         ))}
       </div>
+      {photoNotice && <p role="status" className="absolute left-4 top-16 z-20 max-w-72 rounded border border-slate-600 bg-slate-950/90 px-3 py-2 text-xs text-slate-200">{photoNotice}</p>}
       <div role="group" aria-label="Camera" className="map-camera-controls">
         {(snapshot.incidents ?? []).some(i => i.status !== 'CLEARED') && <button type="button" aria-label="View collision" title="Cycle through active collisions" onClick={() => cameraRef.current?.('incident')}><TriangleAlert /></button>}
         {([['left', 'Rotate left', ChevronLeft], ['home', 'Reset view', House], ['right', 'Rotate right', ChevronRight]] as const).map(([cmd, label, Icon]) => (
