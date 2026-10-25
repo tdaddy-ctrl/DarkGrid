@@ -9,7 +9,6 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Deck, Layer, MapViewState } from '@deck.gl/core';
 import type { Ambulance, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import { OUTAGE_RADIUS_M } from '@/lib/config';
-import { followCamera } from '@/lib/followCamera';
 import { civilianPos, createTraffic, updateTraffic } from './civilianTraffic';
 
 type Building = [height: number, ring: number[]];   // ring = flat [lng, lat, lng, lat, ...]
@@ -55,9 +54,10 @@ const TRAIL_POINTS = 5;           // ~1 s of positions at 4 updates/s
 const WAYMO_GLB = '/models/waymo.glb';
 const AMBULANCE_GLB = '/models/ambulance.glb';
 const CAR_MIN_PX = 1.7;
-const CHASE_PITCH = 66;           // low enough to see the towers around the street
+// MapView looks at the ambulance; pitch places the eye above and behind that target.
+const CHASE_ZOOM = 18;
+const CHASE_PITCH = 55;
 const CAR_LIFT_M = 0.5;           // models sit this far above the sampled ground so small height errors never bury them
-const CHASE_ZOOM = 18.6;          // follow mode: close enough to see the ambulance and the cars around it
 // Models face +X (east) at yaw 0; yaw turns them to the compass heading (clockwise from north).
 const orient = (headingDeg: number): [number, number, number] => [0, 90 - headingDeg, 0];
 // Painted parts take the scene lights like the buildings; lamps and beacons ignore lighting so they glow.
@@ -189,6 +189,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const hazardRef = useRef<LatLng | undefined>(hazardCenter);
   useEffect(() => { hazardRef.current = hazardCenter; }, [hazardCenter]);
   const followRef = useRef(follow);
+  const dragButtonRef = useRef<number | null>(null);
   const onFollowRef = useRef(onFollowChange);
   useEffect(() => { followRef.current = follow; onFollowRef.current = onFollowChange; }, [follow, onFollowChange]);
   const motionRef = useRef(motion);
@@ -197,7 +198,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
   const [credits, setCredits] = useState('');
   const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
-  const cameraRef = useRef<((cmd: 'left' | 'right' | 'home') => void) | null>(null);
+  const cameraRef = useRef<((cmd: 'left' | 'right' | 'home' | 'in' | 'out') => void) | null>(null);
   const trailsRef = useRef<{ map: Map<number, Pt[]>; data: { path: Pt[]; state: string }[] }>({ map: new Map(), data: [] });
   const carsRef = useRef(new Glider());
   const ambRef = useRef(new Glider());
@@ -364,12 +365,28 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         let swayT = 0;
         let lastTouch = 0;
         let interacting = false;
+        let preserveView = false;
+        let chasing = false;
+        let alignHeading = true;
+        let settleZoom = true;
+        let settlePitch = true;
         // On-map buttons ease the camera toward a target instead of jumping.
         let target: MapViewState | null = null;
         cameraRef.current = (cmd) => {
-          if (followRef.current) onFollowRef.current?.(false);
+          if (followRef.current) {
+            if (cmd === 'left' || cmd === 'right') alignHeading = false;
+            if (cmd === 'in' || cmd === 'out') settleZoom = false;
+          }
+          if (cmd === 'home' && followRef.current) {
+            followRef.current = false;
+            onFollowRef.current?.(false);
+          }
           const from = target ?? view;
-          target = cmd === 'home' ? home : { ...from, bearing: (from.bearing ?? 0) + (cmd === 'left' ? -ROTATE_STEP_DEG : ROTATE_STEP_DEG) };
+          const next = cmd === 'home' ? home : cmd === 'in' || cmd === 'out'
+            ? { ...from, zoom: Math.max(0, Math.min(20, from.zoom + (cmd === 'in' ? 0.5 : -0.5))) }
+            : { ...from, bearing: (from.bearing ?? 0) + (cmd === 'left' ? -ROTATE_STEP_DEG : ROTATE_STEP_DEG) };
+          if (followRef.current) { view = next; target = null; }
+          else target = next;
           lastTouch = performance.now();
         };
 
@@ -377,12 +394,22 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           parent: host,
           width: '100%', height: '100%',
           viewState: view,
-          // Left drag orbits the camera (rotate + tilt); Shift/Ctrl/Cmd + drag pans.
-          controller: { inertia: 400, dragMode: 'rotate', dragRotate: true, touchRotate: true },
+          // Left drag pans; right drag rotates and tilts. No inertia competes with tracking.
+          controller: { inertia: false, dragMode: 'pan', dragRotate: true, touchRotate: true },
           effects: [lighting],
-          onViewStateChange: ({ viewState }) => {
+          onViewStateChange: ({ viewState, interactionState }) => {
+            if (followRef.current) {
+              if (interactionState.isRotating) {
+                alignHeading = false;
+                settlePitch = false;
+              }
+              if (interactionState.isZooming) settleZoom = false;
+            }
             view = viewState as MapViewState; target = null; lastTouch = performance.now();
-            if (followRef.current) onFollowRef.current?.(false);   // grabbing the map ends the chase
+            if (followRef.current && interactionState.isDragging && dragButtonRef.current === 0) {
+              followRef.current = false;
+              onFollowRef.current?.(false);
+            }
           },
           onInteractionStateChange: (s) => { interacting = !!(s.isDragging || s.isPanning || s.isRotating || s.isZooming); if (interacting) lastTouch = performance.now(); },
           onError: () => { if (photo) fallBackToOsm(); else setFailed(true); },
@@ -438,7 +465,6 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         const nodeIdAt = new Map(graph.nodes.map((n) => [`${n.lat},${n.lng}`, n.id]));
         let darkIds = new Set<number>();
         let trafficSimT = -1;
-        const mPerLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
 
         // Streetlights at every lit intersection; the ones inside the blackout go out.
         let lightsFor: SimSnapshot | null = null;
@@ -462,18 +488,26 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             : snapRef.current.ambulance;
           const chase = followRef.current ? ambNow : null;
           if (chase) {
-            const next = followCamera(chase, { latitude: view.latitude, longitude: view.longitude, zoom: view.zoom, pitch: view.pitch ?? 0, bearing: view.bearing ?? 0 });
-            // Fly in, then stay locked on the ambulance (its position is already smoothed), a bit lower and closer.
-            const away = Math.hypot((chase.pos.lng - view.longitude) * mPerLng, (chase.pos.lat - view.latitude) * 110540);
-            const k = away > 40 ? 1 - Math.exp(-dt * 4) : 1;
-            view = { ...view, ...next, zoom: view.zoom + (CHASE_ZOOM - view.zoom) * (1 - Math.exp(-dt * 2)),
-              pitch: (view.pitch ?? 0) + (CHASE_PITCH - (view.pitch ?? 0)) * (1 - Math.exp(-dt * 2)),
+            if (!chasing) {
+              alignHeading = true;
+              settleZoom = true;
+              settlePitch = true;
+              chasing = true;
+            }
+            // One frame-rate-independent animation, with shortest-path heading interpolation.
+            const k = 1 - Math.exp(-Math.min(dt, 0.1) * 4);
+            const perspectiveK = 1 - Math.exp(-Math.min(dt, 0.1) * 2.5);
+            const headingDelta = (((chase.headingDeg - (view.bearing ?? 0)) % 360) + 540) % 360 - 180;
+            const ground = gz(chase.pos.lng, chase.pos.lat) + CAR_LIFT_M;
+            view = { ...view,
+              bearing: alignHeading ? (view.bearing ?? 0) + headingDelta * k : view.bearing,
+              zoom: settleZoom ? view.zoom + (CHASE_ZOOM - view.zoom) * perspectiveK : view.zoom,
+              pitch: settlePitch ? (view.pitch ?? 0) + (CHASE_PITCH - (view.pitch ?? 0)) * perspectiveK : view.pitch,
               latitude: view.latitude + (chase.pos.lat - view.latitude) * k, longitude: view.longitude + (chase.pos.lng - view.longitude) * k,
-              position: [0, 0, gz(chase.pos.lng, chase.pos.lat)] };   // aim at the street, not at height 0
+              position: [0, 0, (view.position?.[2] ?? 0) + (ground - (view.position?.[2] ?? 0)) * k] };
             target = null; lastTouch = now;
+            preserveView = true;
             swayBase = view.bearing ?? 0; swayT = 0;
-          } else if (view.position && view.position[2] !== 0) {
-            view = { ...view, position: [0, 0, 0] };   // leaving follow mode: aim at height 0 again
           } else if (target) {
             const k = Math.min(1, dt * 6), t = target;
             const ease = (a: number | undefined, b: number | undefined) => (a ?? 0) + ((b ?? 0) - (a ?? 0)) * k;
@@ -482,13 +516,14 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             if (Math.abs((view.bearing ?? 0) - (t.bearing ?? 0)) < 0.1 && Math.abs(view.zoom - t.zoom) < 0.001) { view = { ...t }; target = null; }
             lastTouch = now;
             swayBase = view.bearing ?? 0; swayT = 0;
-          } else if (!interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
+          } else if (!preserveView && !interacting && now - lastTouch > IDLE_BEFORE_ORBIT_MS) {
             swayT += dt;
             view = { ...view, bearing: swayBase + SWAY_DEG * Math.sin((2 * Math.PI * swayT) / SWAY_PERIOD_S) };
           } else {
             swayBase = view.bearing ?? 0;   // after the user moves the camera, sway around where they left it
             swayT = 0;
           }
+          if (!chase) chasing = false;
           const snap = snapRef.current;
           const hz = hazardRef.current ?? graph.center;
           const center: [number, number, number] = [hz.lng, hz.lat, gz(hz.lng, hz.lat)];
@@ -625,7 +660,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const outage = snapshot.darkNodes.length > 0;
   return (
     <div className="relative h-full min-h-0 overflow-hidden bg-[#070a0f]">
-      <div ref={hostRef} className="absolute inset-0" />
+      <div ref={hostRef} className="absolute inset-0"
+        onPointerDownCapture={event => { dragButtonRef.current = event.button; }}
+        onContextMenu={event => event.preventDefault()} />
 
       {/* depth: distance haze toward the horizon (top of the frame is farthest away) */}
       <div aria-hidden="true" className="pointer-events-none absolute inset-0 [background:linear-gradient(180deg,rgba(9,14,22,0.8)_0%,rgba(9,14,22,0.4)_12%,rgba(9,14,22,0.08)_30%,transparent_45%)]" />
@@ -687,10 +724,17 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>
           </button>
         ))}
+        {(['in', 'out'] as const).map(cmd => (
+          <button key={cmd} type="button" aria-label={cmd === 'in' ? 'Zoom in' : 'Zoom out'}
+            onClick={() => cameraRef.current?.(cmd)}
+            className="min-h-7 rounded text-dg-label hover:text-dg-cyan">
+            {cmd === 'in' ? '+' : '−'}
+          </button>
+        ))}
         <button type="button" aria-pressed={follow} disabled={!snapshot.ambulance} onClick={() => onFollowChange?.(!follow)}
           className={`col-span-3 mt-0.5 min-h-7 rounded font-mono text-[9px] font-semibold uppercase tracking-[0.12em] transition-colors disabled:opacity-40 ${
             follow ? 'bg-dg-amber/20 text-dg-amber' : 'text-dg-label hover:bg-dg-cyan/15 hover:text-dg-cyan'}`}>
-          Follow amb.
+          {follow ? 'Cancel follow' : 'Follow amb.'}
         </button>
       </div>
 
@@ -715,9 +759,9 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
       </dl>
 
       {follow ? (
-        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap rounded-full border border-dg-amber/40 bg-black/55 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.16em] text-dg-amber backdrop-blur">Following ambulance · drag to stop</p>
+        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap rounded-full border border-dg-amber/40 bg-black/55 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.16em] text-dg-amber backdrop-blur">Following ambulance · left drag to stop · right drag to rotate</p>
       ) : !outage && (
-        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Drag: rotate · Shift+drag: pan · Scroll: zoom</p>
+        <p className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.16em] text-dg-label">Left drag: pan · Right drag: rotate · Scroll: zoom</p>
       )}
       <p className="pointer-events-none absolute bottom-1 left-1/2 max-w-[70%] -translate-x-1/2 truncate text-center font-mono text-[9px] text-slate-500">
         {source === 'google'
