@@ -10,9 +10,9 @@ import { Shuffle, TriangleAlert } from 'lucide-react';
 import { Ambulance, ArrowRight, CarFront, ChartNoAxesCombined, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Crosshair, Layers3, ListFilter, Map as MapIcon, MapPin, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Pause, Play, Radio, RotateCcw, Route, ShieldCheck, Sparkles, UsersRound, Zap } from 'lucide-react';
 import type { Ambulance as AmbulanceState, ChartPoint, FrameLite, Job, LatLng, RoadGraph, SimSnapshot } from '@/types/sim';
 import {
-  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, setControl, step, withRoadGeometry, type Sim,
+  answerJob, createSim, getMotion, getSnapshot, injectEvent, makeGridGraph, pickCollisionEdge, revokeZonePolicy, setControl, step, withRoadGeometry, type Sim,
 } from '@/lib/sim';
-import { HISTORY_EVERY_S, MAX_COLLISION_INCIDENTS, SEED, SIM_SPEED } from '@/lib/config';
+import { HISTORY_EVERY_S, MAX_COLLISION_INCIDENTS, SEED, SIM_SPEED, ZONE_POLICY_TTL_S } from '@/lib/config';
 import { loadRoadGraph } from '@/lib/graph';
 import { createHistory, push as pushHistory, frameAt, range as historyRange, type History } from '@/lib/history';
 import type { ChaosResult } from '@/app/api/analyze-chaos/route';
@@ -198,7 +198,9 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
   }, []);
 
   const freshSims = useCallback(() => {
-    simsRef.current = { fifo: createSim(graph, seed, 'FIFO', { randomEvents: true }), darkgrid: createSim(graph, seed, 'DARKGRID', { randomEvents: true }) };
+    // Manual scenario: the blackout and collisions fire only when triggered (key 1 / the Collision
+    // button), never on their own. The seed still fixes the same outage spot and timing for both cities.
+    simsRef.current = { fifo: createSim(graph, seed, 'FIFO'), darkgrid: createSim(graph, seed, 'DARKGRID') };
     chartRef.current = [];
     historyRef.current = createHistory();
     historyContextRef.current.clear();
@@ -241,6 +243,14 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
     const job = target.jobs.find(j => j.id === jobId);
     if (target.control !== 'MANUAL' && job?.kind !== 'ZONE_POLICY') return;
     answerJob(target, jobId);
+    publish();
+  }, [publish]);
+
+  // A human ends the zone policy in the city on screen (only DARK GRID ever has one).
+  const onRevoke = useCallback(() => {
+    const sims = simsRef.current;
+    if (!sims || playbackTRef.current !== null) return;
+    revokeZonePolicy(sims.darkgrid);
     publish();
   }, [publish]);
 
@@ -437,7 +447,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
           <RequestFeed snapshot={snap} mode={mode} onModeChange={setMode} onAnswer={onAnswer}
             proposal={outage ? proposal : null} readOnly={!view.isLive} paused={paused}
             onTakeOver={() => takeOver(snap.control === 'MANUAL' ? null : mode)}
-            onBlackout={director[1]} onCollapse={() => setLeftOpen(false)} />
+            onBlackout={director[1]} onRevoke={onRevoke} onCollapse={() => setLeftOpen(false)} />
         </aside>
 
         <div className="workspace-stage">
@@ -791,9 +801,9 @@ function ZonePolicyCard({ job, snapshot, proposal, readOnly, onAnswer, cinematic
     <div className="request-meta"><span className="request-kind policy-kind"><ShieldCheck />{cinematic ? 'Human approval required' : 'Human approval'}</span>
       {proposal && <span className="draft-source">{proposal.source === 'CLAUDE' ? 'Claude draft' : 'Offline draft'}</span>}
     </div>
-    <h3>Approve zone policy</h3>
-    <p>{cinematic ? 'Treat dark signals as four-way stops.' : 'Treat dark signals as four-way stops across the outage zone.'}</p>
-    {!cinematic && <div className="policy-scope"><Zap />{contribution(job, 'dark signals')} dark signals · {contribution(job, 'confirm requests cleared')} confirmations to clear</div>}
+    <h3>{job.title.startsWith('Renew') ? 'Renew zone policy' : 'Approve zone policy'}</h3>
+    <p>{cinematic ? 'Share outage information for the dark signals.' : 'Share outage information for the dark signals in the outage zone. Vehicles still check conflicts, the intersection and exit room.'}</p>
+    {!cinematic && <div className="policy-scope"><Zap />{contribution(job, 'dark signals')} dark signals · {contribution(job, 'outage-info requests answered')} outage-info requests answered · expires after {Math.round(ZONE_POLICY_TTL_S / 60)} min</div>}
     {!cinematic && proposal && <details className="job-explanation"><summary>Review the draft<ChevronRight /></summary><p>{proposal.rationale}</p></details>}
     <div className={cinematic ? 'cinematic-policy-actions' : 'policy-action'}>
       <button className="action-button primary" disabled={readOnly || locked} onClick={() => onAnswer(job.id, snapshot.mode)}>
@@ -805,10 +815,30 @@ function ZonePolicyCard({ job, snapshot, proposal, readOnly, onAnswer, cinematic
   </article>;
 }
 
-function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnly, paused, onTakeOver, onBlackout, onCollapse, compact = false }: {
+// What each request cause asks of the operator. Only the outage-information question is answered by a zone policy.
+const CAUSE_LABEL: Record<string, string> = {
+  'sightline occluded': 'Sightline', 'priority ambiguous': 'Right of way', 'exit blocked': 'Exit blocked',
+  'incident': 'Road closed', 'vehicle fault': 'Fault', 'corridor blocked': 'Corridor', 'stuck': 'Stuck',
+};
+const CAUSE_HEADLINE: Record<string, string> = {
+  'sightline occluded': 'Confirm a blind crossing', 'priority ambiguous': 'Set right of way', 'exit blocked': 'Find another exit',
+  'incident': 'Route around a closed road', 'vehicle fault': 'Handle a vehicle fault', 'corridor blocked': 'Clear the ambulance corridor',
+  'stuck': 'Vehicle unable to proceed',
+};
+const CAUSE_DETAIL: Record<string, string> = {
+  'sightline occluded': 'This approach cannot see cross traffic at the dark signal. Outage information does not fix this.',
+  'priority ambiguous': 'Every vehicle at the four-way stop has another on its right; nobody can go by the rules.',
+  'exit blocked': 'No room past the intersection; the vehicle will not enter and block it.',
+  'incident': 'The next road is closed and the vehicle found no detour.',
+  'vehicle fault': 'Stopped in its lane with a fault. A hard fault needs a tow.',
+  'corridor blocked': 'Asked to clear the ambulance route but has no free curb and no exit.',
+  'stuck': 'Waiting in traffic long enough to request operator assistance.',
+};
+
+function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnly, paused, onTakeOver, onBlackout, onRevoke, onCollapse, compact = false }: {
   snapshot: SimSnapshot; mode: Mode; onModeChange: (mode: Mode) => void;
   onAnswer: (id: string, city: Mode) => void; proposal?: ChaosResult | null;
-  readOnly: boolean; paused: boolean; onTakeOver: () => void; onBlackout: () => void; onCollapse?: () => void; compact?: boolean;
+  readOnly: boolean; paused: boolean; onTakeOver: () => void; onBlackout: () => void; onRevoke?: () => void; onCollapse?: () => void; compact?: boolean;
 }) {
   const [filter, setFilter] = useState<'all' | 'corridor' | 'blocking'>('all');
   const manual = snapshot.control === 'MANUAL';
@@ -818,7 +848,7 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
   const filtered = jobs.filter(job => filter === 'all' || contribution(job, filter === 'corridor' ? 'on corridor' : 'inside box') > 0);
   const shown = filtered.slice(0, compact ? 3 : 40);
   const busy = snapshot.operators.filter(operator => operator.task !== 'idle').length;
-  const policyActive = snapshot.policy.darkSignalsAsFourWayStop.length > 0;
+  const policy = snapshot.zonePolicy;
   return <section className={`request-feed ${compact ? 'is-compact' : ''}`}>
     <div className="panel-title"><h2>{compact ? `${cityShort(mode)} · ${manual ? 'You are the operator' : 'Policy review'}` : 'Live requests'}</h2>
       {onCollapse && <button className="icon-button" aria-label="Collapse request panel" onClick={onCollapse}><ChevronLeft /></button>}
@@ -833,7 +863,9 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
     </>}
     {readOnly && <p className="queue-notice"><Clock3 />Recorded queue, up to 8 jobs. Return to LIVE to review.</p>}
     {locked && <p className="queue-notice is-review" role="status"><Clock3 /><span>{paused ? 'Review paused. Resume to finish.' : `Reviewing · ${Math.ceil(snapshot.manual.lockRemainingS * SIM_SPEED)} sim s remaining`}</span></p>}
-    {policyActive && <p className="policy-active"><Check />Zone policy active</p>}
+    {policy?.status === 'ACTIVE' && <p className="policy-active"><Check />Zone policy active · {policy.areaNodes} signals · expires in {formatT(Math.max(0, policy.expiresAt - snapshot.t))}
+      {onRevoke && !readOnly && <button type="button" className="text-button" onClick={onRevoke}>Revoke</button>}</p>}
+    {policy && policy.status !== 'ACTIVE' && <p className="queue-notice"><ShieldCheck />Zone policy {policy.endReason === 'EXPIRED' ? 'expired' : policy.endReason === 'POWER_RESTORED' ? 'ended · power restored' : 'revoked by operator'}</p>}
     <div className="request-scroll">
       {zone && <ZonePolicyCard job={zone} snapshot={snapshot} proposal={proposal} readOnly={readOnly} onAnswer={onAnswer} />}
       {shown.map(job => {
@@ -842,9 +874,11 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
         const blocking = contribution(job, 'inside box') > 0;
         const passenger = contribution(job, 'passenger') > 0;
         const batch = job.requestIds.length > 1;
-        const stuck = job.kind === 'STUCK' || job.title.startsWith('Stuck');
-        const label = collision ? 'Collision' : mode === 'FIFO' ? 'FIFO' : corridor ? 'Corridor' : blocking ? 'Blocking' : batch ? 'Batch' : stuck ? 'Stuck' : 'Confirmation';
-        const title = collision ? 'Dispatch road recovery' : blocking ? 'Clear a blocked intersection' : stuck ? 'Vehicle unable to proceed' : batch ? 'Confirm dark signals' : 'Confirm a dark signal';
+        // Single jobs name their cause, e.g. "node 12 · exit blocked"; batches are always outage-information requests.
+        const cause = !batch && !collision ? job.sub.split(' · ')[1] : undefined;
+        const stuck = !batch && (job.kind === 'STUCK' || (!!cause && cause !== 'missing outage info'));
+        const label = collision ? 'Collision' : mode === 'FIFO' ? 'FIFO' : corridor ? 'Corridor' : blocking ? 'Blocking' : batch ? 'Batch' : stuck ? (CAUSE_LABEL[cause ?? ''] ?? 'Stuck') : 'Confirmation';
+        const title = collision ? 'Dispatch road recovery' : blocking ? 'Clear a blocked intersection' : stuck ? (CAUSE_HEADLINE[cause ?? ''] ?? 'Vehicle unable to proceed') : batch ? 'Confirm dark signals' : 'Confirm a dark signal';
         const node = job.sub.match(/node\s+(-?\d+)/)?.[1];
         const weight = snapshot.policy.triageWeights.perQueuedBehind;
         const behind = weight > 0 ? contribution(job, 'queued behind') / weight : null;
@@ -854,7 +888,7 @@ function RequestFeed({ snapshot, mode, onModeChange, onAnswer, proposal, readOnl
           </div>
           <h3>{title}</h3>
           <div className="request-location">{collision ? <TriangleAlert /> : <CarFront />}{collision ? 'Two-vehicle incident · road closed' : batch ? `${job.vehicleIds.length} vehicles` : `Vehicle #${job.vehicleIds[0]}`}{node && <> · Node {node}</>}</div>
-          <p>{collision ? job.sub : blocking ? `Stopped inside an intersection${corridor ? ' on the ambulance route' : ''}.` : stuck ? 'Waiting in traffic long enough to request operator assistance.' : batch ? 'Answer compatible confirmation requests at this intersection together.' : 'Waiting for an operator to confirm passage through a dark signal.'}</p>
+          <p>{collision ? job.sub : blocking ? `Stopped inside an intersection${corridor ? ' on the ambulance route' : ''}.` : stuck ? (CAUSE_DETAIL[cause ?? ''] ?? 'Waiting in traffic long enough to request operator assistance.') : batch ? 'Answer outage-information requests at this intersection together.' : 'Cannot confirm this is a power outage; waiting for outage information.'}</p>
           <div className="request-tags">{corridor && <span><Route />Ambulance route</span>}{blocking && <span>Inside intersection</span>}{passenger && <span>Passenger</span>}{batch && <span><Layers3 />{job.requestIds.length} requests</span>}</div>
           <details className="job-explanation"><summary><span>{behind !== null && behind > 0 ? `${behind} queued behind · ` : ''}{job.p} s handling</span><CircleHelp /></summary>
             <div><p>Priority {job.w.toFixed(1)} / {job.p} s = {(job.w / job.p).toFixed(2)} per second.</p>{job.breakdown.map(term => <span className="breakdown-term" key={term.label}>{term.label}<strong>{term.value.toFixed(1)}</strong></span>)}</div>
@@ -883,7 +917,7 @@ function ScenarioControls({ snapshot, readOnly, onNew, onCollision }: {
   const outage = snapshot.outage;
   return <section className="scenario-controls" aria-label="Scenario controls">
     <div className="scenario-heading"><span>Random scenario</span><code>Seed {snapshot.scenario?.seed}</code></div>
-    <p>{!outage ? `Blackout scheduled · T+${formatT(snapshot.scenario?.outageAt ?? 0)}` : outage.status === 'RESTORED' ? 'Power restored across the affected area' : `${Math.round(outage.radiusM)} m outage · ${outage.status === 'RESTORING' ? 'restoring power' : 'active'}`}</p>
+    <p>{!outage ? 'Blackout ready · press 1 to trigger' : outage.status === 'RESTORED' ? 'Power restored across the affected area' : `${Math.round(outage.radiusM)} m outage · ${outage.status === 'RESTORING' ? 'restoring power' : 'active'}`}</p>
     <div className="scenario-actions"><button type="button" className="action-button secondary" onClick={onNew}><Shuffle />New scenario</button>
       <button type="button" className="action-button secondary" disabled={readOnly || (snapshot.incidents?.length ?? 0) >= MAX_COLLISION_INCIDENTS} onClick={onCollision}><TriangleAlert />Collision</button></div>
     <small>Reset replays this seed. Both cities receive the same incidents.</small>
@@ -894,13 +928,16 @@ function CorridorProtocol({ snapshot }: { snapshot: SimSnapshot }) {
   const protocol = snapshot.corridorStatus;
   const incidents = snapshot.incidents ?? [];
   const commands = protocol?.commands ?? [];
-  const blocked = commands.filter(c => c.state === 'BLOCKED').length;
-  const clear = commands.filter(c => c.state === 'CLEARED').length;
+  const clearing = commands.filter(c => c.kind === 'CLEAR');
+  const count = (...states: string[]) => clearing.filter(c => states.includes(c.state)).length;
+  const rerouted = commands.filter(c => c.kind === 'REROUTE' && c.state === 'REROUTED').length;
+  const unable = count('UNABLE', 'ESCALATED');
   return <div className="mission-section corridor-protocol">
     <h3><Radio />Road response</h3>
     {protocol?.active ? <>
       <p className="protocol-summary">{protocol.segments.filter(s => s.state === 'CLEAR').length}/{protocol.segments.length} reserved road segments free of modeled obstructions</p>
-      <div className="protocol-counts"><span>{commands.length} sent</span><span>{clear} cleared</span><span className={blocked ? 'text-dg-red' : ''}>{blocked} blocked</span></div>
+      <div className="protocol-counts"><span>{clearing.length} sent</span><span>{count('ACKNOWLEDGED')} acknowledged</span><span>{count('EXECUTING')} executing</span><span>{count('CLEARED')} cleared</span><span className={unable ? 'text-dg-red' : ''}>{unable} unable</span></div>
+      <p className="protocol-summary">{rerouted} vehicle{rerouted === 1 ? '' : 's'} rerouted around the reserved road{protocol.ambulanceReroutes ? ` · ambulance detoured ${protocol.ambulanceReroutes}×` : ''}</p>
       <details><summary>Vehicle acknowledgements<ChevronRight /></summary><ul>{commands.slice(-12).reverse().map(c => <li key={c.vehicleId}><span>Vehicle #{c.vehicleId}<small>{c.reason}</small></span><strong>{c.state.toLowerCase()}</strong></li>)}</ul></details>
     </> : <p className="protocol-summary">{snapshot.mode === 'FIFO' ? 'Local emergency yielding · no fleet reservation' : snapshot.ambulance?.status === 'ARRIVED' ? 'Corridor released after delivery' : 'Reservation begins before ambulance dispatch'}</p>}
     {incidents.map(incident => <div className={`collision-ledger ${incident.status === 'CLEARED' ? 'is-cleared' : ''}`} key={incident.id}>
@@ -919,8 +956,11 @@ function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse,
   const status = amb ? ambulanceLabel(amb) : 'Standing by';
   const routeLabel = amb?.mission ? `${downtown ? 'Station 35' : 'Fire station'} → ${areaName(amb.mission.pickup)} pickup → ${downtown ? 'Chinese Hospital' : 'Hospital'}`
     : 'Rescue task follows the next blackout';
-  const policyActive = snapshot.policy.darkSignalsAsFourWayStop.length > 0;
+  const zone = snapshot.zonePolicy;
   const dg = snapshot.mode === 'DARKGRID';
+  const zoneState = zone?.status === 'ACTIVE' ? 'Approved' : zone?.endReason === 'MANUAL' ? 'Revoked'
+    : zone?.endReason === 'POWER_RESTORED' ? 'Ended' : zone?.endReason === 'EXPIRED' && snapshot.darkNodes.length ? 'Needs renewal'
+    : !zone && snapshot.darkNodes.length && dg ? 'Needs approval' : 'Standby';
   return <section className="mission-overview">
     <div className="panel-title"><h2>Mission overview</h2><button className="icon-button" aria-label="Collapse mission panel" onClick={onCollapse}><ChevronRight /></button></div>
     <div className={`ambulance-summary ${amb?.status === 'ARRIVED' ? 'has-arrived' : ''}`}><div className="ambulance-icon"><Ambulance /></div><div><h3>{status}</h3><p>{routeLabel}</p>{amb && amb.status !== 'WAITING' && <strong className="mission-time">{formatT(amb.tripS)}<span> elapsed</span></strong>}</div></div>
@@ -931,9 +971,9 @@ function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCollapse,
       <ul className="strategy-list">
         <li><ListFilter /><span>{dg ? 'WSPT triage' : 'First come, first served'}</span><span className="strategy-state">{dg ? 'Impact first' : 'Oldest first'}</span></li>
         <li><Layers3 /><span>Batch confirmations</span>{dg ? <Check /> : <span className="strategy-state">Off</span>}</li>
-        <li><MapPin /><span>Curb & staging</span>{dg && snapshot.darkNodes.length ? <Check /> : <span className="strategy-state">{dg ? 'Standby' : 'Off'}</span>}</li>
+        <li><MapPin /><span>Empty-car staging</span>{dg && snapshot.darkNodes.length ? <Check /> : <span className="strategy-state">{dg ? 'Standby' : 'Off'}</span>}</li>
         <li><Ambulance /><span>Ambulance corridor</span>{snapshot.corridor.length ? <Check /> : <span className="strategy-state">Standby</span>}</li>
-        <li><ShieldCheck /><span>Zone policy</span><span className={`strategy-state ${policyActive ? 'is-active' : ''}`}>{policyActive ? 'Approved' : snapshot.darkNodes.length && dg ? 'Needs approval' : 'Standby'}</span></li>
+        <li><ShieldCheck /><span>Zone policy</span><span className={`strategy-state ${zone?.status === 'ACTIVE' ? 'is-active' : ''}`}>{zoneState}</span></li>
       </ul>
     </div>
     <div className="mission-section"><h3><ChartNoAxesCombined />Live metrics</h3><dl className="mission-metrics">

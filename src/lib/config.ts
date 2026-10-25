@@ -10,9 +10,19 @@ export const CRUISE_MPS = 9;
 export const GAP_M = 8;                      // bumper-to-bumper spacing in a queue
 
 export const DARK_HEADWAY_S = 4;             // a dark node lets 1 vehicle through every 4 s
-export const P_CONFIRM_DARK = 0.35;          // chance a car asks for help at a dark node
-export const P_CONFIRM_DARK_ZONE_POLICY = 0.03; // same, once the zone policy is approved
-export const P_STOP_INSIDE_BOX = 0.3;        // chance a car asking for help stops inside the box
+
+// Why vehicles ask for help. Same rules in FIFO and DARK GRID; each draw is a hash of
+// (seed, vehicle or lane, node), so the same car at the same intersection gets the same answer in both.
+// Share of (vehicle, dark intersection) pairs where the vehicle cannot tell an outage from a signal
+// fault without outage information. Shared information (zone policy) removes exactly this cause.
+export const UNSURE_WITHOUT_OUTAGE_INFO = 0.35;
+export const OCCLUDED_APPROACH_SHARE = 0.05;  // approaches whose view of cross traffic is blocked
+export const ARRIVAL_TIE_S = 2;              // four-way stop: arrivals this close count as simultaneous
+export const PRIORITY_DEADLOCK_S = 6;        // a right-of-way deadlock lasting this long asks for help
+export const EXIT_WAIT_S = 30;               // no room past the intersection this long asks for help
+export const FAULTS_PER_RUN = 3;             // vehicles that develop a fault after the outage
+export const FAULT_AFTER_OUTAGE_S = [40, 400] as const;
+export const HARD_FAULT_SHARE = 0.5;         // hard faults need a tow (COLLISION_CLEARANCE_S); soft ones a remote reset
 export const STUCK_TIMEOUT_S = 45;
 export const AMBULANCE_STUCK_S = 20;
 
@@ -44,8 +54,11 @@ export const CORRIDOR_LOOKAHEAD_M = 650;
 export const YIELD_ACK_S = 1;
 export const YIELD_MANEUVER_S = 4;
 export const YIELD_OFFSET_M = 4;
-export const CURB_SLOTS_PER_LANE = 3;
 export const LOCAL_EMERGENCY_YIELD_M = 90;
+export const CURB_SPACING_M = 8;             // pulled-over cars need this much curb each
+export const AMBULANCE_REROUTE_M = 250;      // within this distance of an unclearable vehicle, try a detour
+export const AMBULANCE_DETOUR_MAX_M = 800;   // ...accepted only if at most this much longer
+export const ZONE_POLICY_TTL_S = 600;        // an approved zone policy expires after this; a renewal card follows
 export const PATIENT_LOADING_S = 20; // Prototype assumption; included in the measured rescue trip.
 
 // Real OSM way shapes keyed by endpoint coordinates. Populated from public OSM geometry;
