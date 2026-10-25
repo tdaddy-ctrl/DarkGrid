@@ -20,7 +20,6 @@ import ChaosInjectorPanel from '@/components/ChaosInjectorPanel';
 import AskWhyBar from '@/components/AskWhyBar';
 import TacticalMap3D from '@/components/TacticalMap3D';
 import TimelineScrubber from '@/components/TimelineScrubber';
-import MetricsChart from '@/components/MetricsChart';
 import ArrivalOverlay from '@/components/ArrivalOverlay';
 
 const STEP_S = 0.5;          // fixed sim timestep
@@ -521,9 +520,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
           </div>}
 
           {split && <section className="comparison-workspace" aria-label="FIFO and DARK GRID comparison">
-            <div className="surface-heading"><div><h2>Same city. Different decisions.</h2><p>Same seed, same blackout. Rewind to see where the two runs diverge.</p></div><span className="quiet-badge">{view.isLive ? 'Live comparison' : 'Recorded comparison'}</span></div>
             <div className="comparison-maps"><MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} /><MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} /></div>
-            <div className="comparison-data"><MetricsChart data={view.chart} /><ComparisonMetrics fifo={view.fifo} darkgrid={view.darkgrid} /></div>
           </section>}
 
           {/* Keep these forms mounted so switching destinations never loses an analysis or voice session. */}
@@ -571,8 +568,8 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
       {!expanded && <footer className="workspace-footer">
         <span className="simulation-label"><span />Deterministic simulation</span>
         <nav aria-label="Workspace" className="workspace-navigation">
-          {([{ id: 'city', label: 'City', icon: MapIcon }, { id: 'requests', label: 'Requests', icon: ListFilter },
-            { id: 'compare', label: 'Compare', icon: ChartNoAxesCombined }, { id: 'analyze', label: 'Analyze', icon: Sparkles }] as const).map(item => (
+          {([{ id: 'city', label: 'City', icon: MapIcon },
+            { id: 'compare', label: 'Compare', icon: ChartNoAxesCombined }] as const).map(item => (
               <button key={item.id} aria-current={surface === item.id ? 'page' : undefined} onClick={() => changeSurface(item.id)}><item.icon /><span>{item.label}</span></button>
             ))}
         </nav>
@@ -650,15 +647,21 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
   snapshot: SimSnapshot; graph: RoadGraph; other?: SimSnapshot; rival?: SimSnapshot;
 }) {
   const uid = useId().replace(/:/g, '');
-  const lats = graph.nodes.map((n) => n.lat), lngs = graph.nodes.map((n) => n.lng);
-  const minLat = Math.min(...lats), maxLat = Math.max(...lats), minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+  // Project in meters around the graph centre so the map keeps its real aspect (no lat/lng stretch),
+  // and draw the OSM bend geometry so roads never cut straight across blocks.
+  const mPerLng = 111320 * Math.cos((graph.center.lat * Math.PI) / 180);
+  const xs = graph.nodes.map((n) => (n.lng - graph.center.lng) * mPerLng);
+  const ys = graph.nodes.map((n) => (n.lat - graph.center.lat) * 110540);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
   const W = 1000, H = 600, pad = 45;
-  const px = (p: LatLng) => pad + ((p.lng - minLng) / (maxLng - minLng || 1)) * (W - 2 * pad);
-  const py = (p: LatLng) => H - pad - ((p.lat - minLat) / (maxLat - minLat || 1)) * (H - 2 * pad);
+  const scale = Math.min((W - 2 * pad) / (maxX - minX || 1), (H - 2 * pad) / (maxY - minY || 1));
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const px = (p: LatLng) => W / 2 + ((p.lng - graph.center.lng) * mPerLng - cx) * scale;
+  const py = (p: LatLng) => H / 2 - ((p.lat - graph.center.lat) * 110540 - cy) * scale;
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
   const roads = graph.edges.map((e) => {
-    const a = byId.get(e.from)!, b = byId.get(e.to)!;
-    return { id: e.id, x1: px(a), y1: py(a), x2: px(b), y2: py(b) };
+    const shape = (e.geometry && e.geometry.length ? e.geometry : [byId.get(e.from)!, byId.get(e.to)!]);
+    return { id: e.id, points: shape.map((p) => `${px(p)},${py(p)}`).join(' ') };
   });
   const amb = snapshot.ambulance;
   const outage = snapshot.darkNodes.length > 0;
@@ -676,7 +679,7 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
       <div className="relative flex-1">
         <Brackets />
         <PatientClock snapshot={snapshot} rival={rival} />
-        <svg viewBox={`0 0 ${W} ${H}`} className="absolute inset-0 h-full w-full" role="img"
+        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid slice" className="absolute inset-0 h-full w-full" role="img"
           aria-label={`${cityShort(snapshot.mode)} city: ${snapshot.vehicles.length} vehicles, ${snapshot.darkNodes.length} dark intersections`}>
           <defs>
             <pattern id={`${uid}grid`} width="25" height="25" patternUnits="userSpaceOnUse">
@@ -689,11 +692,11 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
           </defs>
           <rect width={W} height={H} fill={`url(#${uid}grid)`} />
 
-          <g stroke="rgb(56 189 248 / 0.07)" strokeWidth={14} strokeLinecap="round">
-            {roads.map(({ id, ...r }) => <line key={id} {...r} />)}
+          <g stroke="rgb(56 189 248 / 0.07)" strokeWidth={14} strokeLinecap="round" strokeLinejoin="round" fill="none">
+            {roads.map(({ id, points }) => <polyline key={id} points={points} />)}
           </g>
-          <g stroke="#2a3a55" strokeWidth={3} strokeLinecap="round">
-            {roads.map(({ id, ...r }) => <line key={id} {...r} />)}
+          <g stroke="#2a3a55" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" fill="none">
+            {roads.map(({ id, points }) => <polyline key={id} points={points} />)}
           </g>
 
           {snapshot.corridor.length > 1 && (
@@ -1039,17 +1042,6 @@ function MissionOverview({ snapshot, rival, graph, follow, onFollow, onCompare, 
     </dl><button className="text-button" onClick={onCompare}>Open comparison<ArrowRight /></button></div>
     <div className="mission-footnote"><span className="quiet-badge">Same seed · same outage</span><p>{cityShort(rival.mode)} is running alongside this city. Civilian traffic is visual only.</p></div>
   </section>;
-}
-
-function ComparisonMetrics({ fifo, darkgrid }: { fifo: SimSnapshot; darkgrid: SimSnapshot }) {
-  const rows = [
-    ['Requests waiting', fifo.metrics.requests.toString(), darkgrid.metrics.requests.toString()],
-    ['Operator load ρ', fifo.metrics.rho.toFixed(2), darkgrid.metrics.rho.toFixed(2)],
-    ['Stuck vehicles', fifo.metrics.stuck.toString(), darkgrid.metrics.stuck.toString()],
-    ['Blocking vehicle-min', fifo.metrics.blockingVehMin.toFixed(0), darkgrid.metrics.blockingVehMin.toFixed(0)],
-    ['Ambulance trip', fifo.metrics.ambulanceTripS === null ? 'Not arrived' : formatT(fifo.metrics.ambulanceTripS), darkgrid.metrics.ambulanceTripS === null ? 'Not arrived' : formatT(darkgrid.metrics.ambulanceTripS)],
-  ];
-  return <section className="comparison-metrics"><h3>From this simulation</h3><table><thead><tr><th scope="col">Metric</th><th scope="col">FIFO</th><th scope="col">DARK GRID</th></tr></thead><tbody>{rows.map(([label, f, d]) => <tr key={label}><th scope="row">{label}</th><td>{f}</td><td>{d}</td></tr>)}</tbody></table></section>;
 }
 
 // Scene-local CSS: the approved presentation composition, separate from the

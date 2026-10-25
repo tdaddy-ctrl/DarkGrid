@@ -214,11 +214,11 @@ kbd { font-family: inherit; font-size: 10px; line-height: 18px; padding: 0 4px; 
 .reset-button { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: 1; border: 0; background: transparent; color: #c3d0da; font-size: 12px; }
 .reset-button svg { width: 15px; height: 15px; }
 
-.comparison-workspace { position: absolute; inset: 0 0 105px; display: flex; flex-direction: column; gap: 16px; padding: 23px 28px 0; }
+.comparison-workspace { position: absolute; inset: 0 0 96px; display: flex; flex-direction: column; gap: 12px; padding: 12px 14px 0; }
 .surface-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .surface-heading h2 { margin: 0 0 7px; font-size: 23px; line-height: 1.2; letter-spacing: -.03em; font-weight: 500; }
 .surface-heading p { margin: 0; font-size: 12px; color: #aabecf; line-height: 1.5; }
-.comparison-maps { min-height: 230px; flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.comparison-maps { min-height: 0; flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .comparison-maps > section { min-height: 0; }
 .comparison-maps > section > div:first-child { padding: 11px 14px; }
 .comparison-maps svg[role="img"] { min-height: 0; }
