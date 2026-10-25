@@ -20,7 +20,7 @@ const GOOGLE_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 const GOOGLE_TILES_URL = 'https://tile.googleapis.com/v1/3dtiles/root.json';
 // If no photo tile has loaded by then (blocked key, no network), switch to the OSM blocks
 // (instant, offline). A slow but working network keeps the photo city; it sharpens as tiles arrive.
-const PHOTO_TIMEOUT_MS = 12000;
+const PHOTO_TIMEOUT_MS = 60000;
 type Rgba = [number, number, number, number];
 type Pt = [number, number] | [number, number, number];
 // Ground overlays respect the city's depth buffer. Buildings occlude routes and
@@ -399,12 +399,13 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         // Placeholder blocks: drawn over the streaming photoreal tiles so the city is visible
         // immediately, then removed once enough photo tiles have loaded.
         let blocksVisible = true;
+        let manualPhoto = false;    // the user explicitly chose Photo while following
         const fallBackToOsm = (unavailable = false) => {
           if (!photo) return;
           photo = false;
           photoAttempt++;
           tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
-          blocksVisible = true;
+          blocksVisible = true; manualPhoto = false;
           staticLayers = osmLayers();
           setSource('osm');
           setPhotoNotice(unavailable ? 'Photo unavailable. Showing Blocks; select Photo to retry.' : '');
@@ -412,12 +413,20 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
         switchRef.current = (to) => {
           if (to === 'osm') { fallBackToOsm(); setPhotoNotice(''); return; }
           if (!geo) return;
-          if (photo) { setSource('google'); return; }
+          if (photo) {
+            // Photo was already the mode; force its layers back even if follow had swapped to blocks.
+            manualPhoto = followRef.current;
+            blocksVisible = !manualPhoto; tilesLoaded = 0;
+            staticLayers = manualPhoto ? photoLayers() : [...photoLayers(), buildingsLayer()];
+            setPhotoNotice('');
+            setSource('google');
+            return;
+          }
           photoAttempt++;
           photo = true; tileErrors = 0; tilesLoaded = 0; photoSince = performance.now();
-          blocksVisible = true;
+          manualPhoto = followRef.current; blocksVisible = !manualPhoto;
           setPhotoNotice('');
-          staticLayers = [...photoLayers(), buildingsLayer()];
+          staticLayers = manualPhoto ? photoLayers() : [...photoLayers(), buildingsLayer()];
           setSource('google');
         };
         const photoLayers = (): Layer[] => {
@@ -432,7 +441,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
               // city stays blurry; give it room and fetch more tiles in parallel.
               // Coarse first: a higher screen-space-error target lets the moving follow camera get
               // its viewport covered sooner, then tiles keep refining while the view is still.
-              tileset: { maximumMemoryUsage: 1024, memoryCacheOverflow: 256, maximumScreenSpaceError: 16, maxRequests: 48 },
+              tileset: { maximumMemoryUsage: 1024, memoryCacheOverflow: 256, maximumScreenSpaceError: 24, maxRequests: 48 },
             },
             onTilesetLoad: (tileset) => {
               // Google's terms: show the data providers for the tiles on screen.
@@ -590,15 +599,35 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
 
         let last = performance.now();
         let lastMotionT = -1;
+        let lastFollowOn = false;
         const frame = (now: number) => {
           raf = requestAnimationFrame(frame);   // schedule first: one bad frame must not stop the loop
           if (!activeRef.current) { last = now; lastMotionT = -1; trafficSimT = -1; return; }
           if (photo && tilesLoaded === 0 && now - photoSince > PHOTO_TIMEOUT_MS) fallBackToOsm(true);
-          if (photo && blocksVisible && tilesLoaded >= 8) {
+          if (photo && !followRef.current && blocksVisible && tilesLoaded >= 8) {
             // The photoreal city now covers the view: drop the placeholder blocks, keeping the
             // same tile layer instance so nothing that loaded gets re-fetched.
             blocksVisible = false;
             staticLayers = staticLayers.filter((layer) => layer.id !== 'buildings');
+          }
+          // While chasing the ambulance, the streaming photoreal tiles cannot keep up with the
+          // moving camera, so the area ahead turns into a black void. Swap to the local block city
+          // for the whole chase (instant, fully covered); the photo mode resumes when follow ends.
+          // A manual Photo click during follow wins over the automatic swap.
+          const followOn = followRef.current;
+          if (followOn !== lastFollowOn) {
+            lastFollowOn = followOn;
+            manualPhoto = false;   // a follow toggle re-arms the automatic behavior
+            if (photo) {
+              if (followOn) {
+                staticLayers = osmLayers();
+                setSource('osm');
+              } else {
+                blocksVisible = true; tilesLoaded = 0;
+                staticLayers = [...photoLayers(), buildingsLayer()];
+                setSource('google');
+              }
+            }
           }
           const dt = (now - last) / 1000; last = now;
           const isPresenting = presentingRef.current;
@@ -626,13 +655,14 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
             const k = 1 - Math.exp(-Math.min(dt, 0.1) * 4);
             const perspectiveK = 1 - Math.exp(-Math.min(dt, 0.1) * 2.5);
             const headingDelta = (((chase.headingDeg - (view.bearing ?? 0)) % 360) + 540) % 360 - 180;
-            const ground = gz(chase.pos.lng, chase.pos.lat) + CAR_LIFT_M;
+            // The chase target keeps the world height the home view uses (no per-frame ground-sampler
+            // override): a bad or missing ground sample here used to sink the camera below the
+            // photoreal terrain, turning the whole view black.
             view = { ...view,
               bearing: alignHeading ? (view.bearing ?? 0) + headingDelta * k : view.bearing,
               zoom: settleZoom ? view.zoom + (CHASE_ZOOM - view.zoom) * perspectiveK : view.zoom,
               pitch: settlePitch ? (view.pitch ?? 0) + (CHASE_PITCH - (view.pitch ?? 0)) * perspectiveK : view.pitch,
-              latitude: view.latitude + (chase.pos.lat - view.latitude) * k, longitude: view.longitude + (chase.pos.lng - view.longitude) * k,
-              position: [0, 0, (view.position?.[2] ?? 0) + (ground - (view.position?.[2] ?? 0)) * k] };
+              latitude: view.latitude + (chase.pos.lat - view.latitude) * k, longitude: view.longitude + (chase.pos.lng - view.longitude) * k };
             target = null; lastTouch = now;
             preserveView = true;
             swayBase = view.bearing ?? 0; swayT = 0;
