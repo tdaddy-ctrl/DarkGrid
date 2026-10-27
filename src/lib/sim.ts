@@ -555,7 +555,7 @@ function resolveJob(sim: Sim, job: Job, byHuman: boolean) {
       incident.status = 'RESPONDING'; incident.clearAt = sim.t + incident.clearanceS;
     }
   }
-  for (const id of job.requestIds) resolveRequest(sim, id);
+  for (const id of job.requestIds) if (sim.requests.has(id)) resolveRequest(sim, id);
 }
 
 // ---------- zone policy ----------
@@ -1163,6 +1163,14 @@ function tick(sim: Sim, dt: number) {
 
   // Operators.
   for (const op of sim.operators) {
+    // Cancellation has already run for this tick. Independent tasks have no request members;
+    // partial batches keep their original deadline while any member still needs an answer.
+    if (op.job && op.job.kind !== 'COLLISION' && op.job.kind !== 'ZONE_POLICY'
+      && op.job.requestIds.length > 0 && !op.job.requestIds.some(id => sim.requests.has(id))) {
+      op.job = null;
+      op.doneT = 0;
+      continue;
+    }
     if (op.job && sim.t >= op.doneT) { resolveJob(sim, op.job, false); op.job = null; }
   }
   if (sim.review && sim.t >= sim.review.endT) {

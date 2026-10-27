@@ -231,3 +231,162 @@ describe('ambulance corridor', () => {
     expect(problems).toEqual([]);
   });
 });
+
+
+describe('operator jobs after request cancellation', () => {
+  // Keep real scheduling and intersection rules, but isolate the request lifecycle from other traffic.
+  function fixture(mode: 'FIFO' | 'DARKGRID', count = 1) {
+    const sim = createSim(graph, 71, mode, { features: { corridor: false, staging: false, zonePolicy: false, incidentBroadcast: false } });
+    for (const lane of sim.lanes) lane.cars = [];
+    for (const a of sim.agents) { a.place = 'OFF'; a.requestId = null; a.held = false; }
+    sim.plannedFaults = [];
+    injectEvent(sim, { type: 'OUTAGE', center: graph.center, radiusM: 100000, restoreAfterS: 100000 });
+    const node = [...sim.nodes.values()].find(n => n.in.length >= 2 && n.out.length > 0)!;
+    const add = (index: number, sameNode = true) => {
+      const lane = sameNode ? node.in[index] : sim.lanes.find(l => l.to !== node.node.id && sim.nodes.get(l.to)!.out.length > 0)!;
+      const next = sim.nodes.get(lane.to)!.out[0];
+      const a = sim.agents[index];
+      a.place = 'ROAD'; a.lane = lane.id; a.s = lane.len; a.route = [next]; a.dest = next.to;
+      a.held = true; a.known.clear(); a.grants.clear(); lane.occluded = false; lane.cars.push(a);
+      const id = 'lifecycle-' + index;
+      a.requestId = id;
+      sim.requests.set(id, { id, vehicleId: a.id, nodeId: lane.to, cause: 'MISSING_OUTAGE_INFO', reason: 'DARK_SIGNAL_CONFIRM',
+        createdAt: sim.t, onCorridor: false, insideBox: false, queuedBehind: 0, passenger: false, assigned: false });
+      return id;
+    };
+    const ids = Array.from({ length: count }, (_, i) => add(i));
+    const restore = () => {
+      sim.outage!.restoreAt = sim.t + DT;
+      sim.restoreTimes.set(node.node.id, sim.t + DT);
+    };
+    return { sim, ids, add, restore };
+  }
+
+  for (const mode of ['FIFO', 'DARKGRID'] as const) {
+    it(mode + ': releases a canceled single job without applying its answer', () => {
+      const { sim, ids, restore } = fixture(mode);
+      step(sim, DT);
+      const op = sim.operators.find(o => o.job?.requestIds.includes(ids[0]))!;
+      const job = op.job!;
+      const a = sim.agents[0];
+      restore();
+      step(sim, DT);
+      expect(sim.requests.has(ids[0])).toBe(false);
+      expect(sim.operators.some(o => o.job === job)).toBe(false);
+      expect(op.job).toBeNull();
+      expect(op.doneT).toBe(0);
+      expect(a.requestId).toBeNull();
+      expect(a.held).toBe(false);
+      expect(a.known.has(sim.lanes[a.lane].from)).toBe(false);
+      expect(sim.answered).toBe(0);
+      expect(sim.jobs.some(j => j.requestIds.includes(ids[0]))).toBe(false);
+    });
+
+    it(mode + ': reuses the released operator for another valid request in the same tick', () => {
+      const { sim, ids, add, restore } = fixture(mode);
+      step(sim, DT);
+      const op = sim.operators.find(o => o.job?.requestIds.includes(ids[0]))!;
+      const next = add(1, false);
+      restore();
+      step(sim, DT);
+      expect(op.job?.requestIds).toEqual([next]);
+      expect(sim.requests.get(next)?.assigned).toBe(true);
+      expect(op.doneT).toBe(sim.t + C.SERVICE_SINGLE_S);
+    });
+
+    it(mode + ': keeps the normal single-job deadline at 30 simulation seconds', () => {
+      const { sim, ids } = fixture(mode);
+      step(sim, DT);
+      const op = sim.operators.find(o => o.job?.requestIds.includes(ids[0]))!;
+      const job = op.job!;
+      expect(op.doneT - sim.t).toBe(30);
+      step(sim, C.SERVICE_SINGLE_S - DT);
+      expect(op.job).toBe(job);
+      expect(sim.requests.has(ids[0])).toBe(true);
+      step(sim, DT);
+      expect(sim.requests.has(ids[0])).toBe(false);
+      expect(sim.agents[0].known.size).toBe(1);
+    });
+
+    it(mode + ': releases a replaced request without answering the new fault early', () => {
+      const { sim, ids } = fixture(mode);
+      step(sim, DT);
+      const op = sim.operators.find(o => o.job?.requestIds.includes(ids[0]))!;
+      const oldJob = op.job!;
+      sim.plannedFaults.push({ vehicleId: 0, delayS: sim.t + DT, hard: false, fired: false });
+      step(sim, DT);
+      const replacement = sim.agents[0].requestId!;
+      expect(replacement).not.toBe(ids[0]);
+      expect(sim.requests.has(ids[0])).toBe(false);
+      expect(sim.operators.some(o => o.job === oldJob)).toBe(false);
+      expect(op.job?.requestIds).toEqual([replacement]);
+      expect(sim.requests.get(replacement)?.cause).toBe('VEHICLE_FAULT');
+      expect(sim.agents[0].fault).not.toBeNull();
+      expect(sim.agents[0].held).toBe(true);
+      step(sim, C.SERVICE_SINGLE_S - DT);
+      expect(sim.agents[0].fault).not.toBeNull();
+      step(sim, DT);
+      expect(sim.agents[0].fault).toBeNull();
+    });
+  }
+
+  it('keeps a partial batch and its original 45-second deadline', () => {
+    const { sim, ids } = fixture('DARKGRID', 2);
+    step(sim, DT);
+    const op = sim.operators.find(o => o.job?.kind === 'BATCH')!;
+    const job = op.job!, deadline = op.doneT;
+    expect(deadline - sim.t).toBe(45);
+    // Simulate one member receiving independent outage information: the other still needs review.
+    sim.requests.delete(ids[0]); sim.agents[0].requestId = null; sim.agents[0].held = false;
+    sim.agents[0].known.add(sim.lanes[sim.agents[0].lane].to);
+    step(sim, DT);
+    expect(op.job).toBe(job);
+    expect(op.doneT).toBe(deadline);
+    expect(sim.requests.get(ids[1])?.assigned).toBe(true);
+    expect(sim.operators.filter(o => o.job?.requestIds.includes(ids[1]))).toHaveLength(1);
+    step(sim, deadline - sim.t - DT);
+    expect(sim.requests.has(ids[1])).toBe(true);
+    step(sim, DT);
+    expect(sim.requests.has(ids[1])).toBe(false);
+    expect(sim.agents[1].known.size).toBe(1);
+  });
+
+  it('releases a batch when restoration cancels all members', () => {
+    const { sim, ids, restore } = fixture('DARKGRID', 2);
+    step(sim, DT);
+    const op = sim.operators.find(o => o.job?.kind === 'BATCH')!;
+    restore(); step(sim, DT);
+    expect(ids.every(id => !sim.requests.has(id))).toBe(true);
+    expect(op.job).toBeNull();
+    expect(op.doneT).toBe(0);
+    expect(sim.agents.slice(0, 2).every(a => a.known.size === 0)).toBe(true);
+  });
+
+  it('preserves independent collision recovery with no request members', () => {
+    const { sim } = fixture('FIFO', 0);
+    injectEvent(sim, { type: 'COLLISION', edgeId: graph.edges[0].id });
+    step(sim, DT);
+    const op = sim.operators.find(o => o.job?.kind === 'COLLISION')!;
+    const job = op.job!;
+    expect(job.requestIds).toEqual([]);
+    step(sim, C.SERVICE_SINGLE_S - DT);
+    expect(op.job).toBe(job);
+    expect(sim.incidents[0].status).toBe('BLOCKED');
+    step(sim, DT);
+    expect(sim.incidents[0].status).toBe('RESPONDING');
+  });
+
+  it('preserves human zone-policy review with no request members', () => {
+    const { sim } = fixture('DARKGRID', 0);
+    sim.features.zonePolicy = true;
+    step(sim, DT);
+    expect(answerJob(sim, 'job-zone-policy')).toBe(true);
+    expect(sim.review!.job.requestIds).toEqual([]);
+    step(sim, C.SERVICE_SINGLE_S - DT);
+    expect(sim.review).not.toBeNull();
+    expect(sim.zone).toBeNull();
+    step(sim, DT);
+    expect(sim.zone?.status).toBe('ACTIVE');
+    expect(sim.answered).toBe(1);
+  });
+});
