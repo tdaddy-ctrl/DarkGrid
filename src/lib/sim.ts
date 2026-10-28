@@ -838,6 +838,56 @@ function startPullOver(sim: Sim, a: Agent) {
   a.yieldStartT = sim.t; a.speed = 0;
 }
 
+// A live, vehicle-specific proof, not a cached/global reservation exemption. Follow only the
+// ambulance's directed route ahead, then leave at a usable non-reserved exit and keep the trip
+// destination. Recomputing the proof also revokes it on route, closure, capacity or state changes.
+function corridorEgress(sim: Sim, a: Agent): { path: Lane[]; prefixLength: number } | null {
+  const c = sim.yieldCommands.get(a.id);
+  if (sim.mode !== 'DARKGRID' || !sim.features.corridor || !sim.corridorActive || a.type === 'AMBULANCE'
+    || a.place !== 'ROAD' || a.held || a.fault || a.yieldStartT !== null || curbRoom(sim, a)
+    || !c || c.vehicleId !== a.id || c.kind !== 'CLEAR'
+    || !['ACKNOWLEDGED', 'ESCALATED', 'EXECUTING'].includes(c.state)) return null;
+  const here = sim.lanes[a.lane];
+  if (!here.cars.includes(a) || !sim.corridorEdges.has(here.edgeId) || edgeBlocked(sim, here.edgeId)
+    || a.s < here.len - 0.01 || darkCauses(sim, a, here).length && sim.nodes.get(here.to)!.dark) return null;
+  const ambulanceRoute = remainingAmbulanceLanes(sim);
+  let index = ambulanceRoute.findIndex(l => l.id === here.id);
+  if (index < 0 || sim.amb.place !== 'ROAD'
+    || a.lane === sim.amb.lane && a.s <= sim.amb.s) return null;
+  const usable = (lane: Lane) => !edgeBlocked(sim, lane.edgeId)
+    && !lane.cars.some(car => car.type === 'AMBULANCE')
+    && (!lane.cars.length || lane.cars[lane.cars.length - 1].s >= C.GAP_M);
+  const prefix: Lane[] = [];
+  const visited = new Set<number>([here.from]);
+  let previous = here;
+  for (;;) {
+    if (visited.has(previous.to)) return null;
+    visited.add(previous.to);
+    const ns = sim.nodes.get(previous.to)!;
+    if (ns.box.length) return null;
+    const ambulanceLane = sim.lanes[sim.amb.lane];
+    if (ambulanceLane.id !== previous.id && ambulanceLane.to === ns.node.id
+      && sim.amb.s >= ambulanceLane.len - C.GAP_M) return null;
+    for (const exit of [...ns.out].sort((a, b) => a.id - b.id)) {
+      if (sim.corridorEdges.has(exit.edgeId) || visited.has(exit.to) || !usable(exit)) continue;
+      const rest = route(sim, exit.to, a.dest, true);
+      if (rest === null) continue;
+      if (!prefix.length) return null; // A suitable immediate exit needs no special permission.
+      return { path: [...prefix, exit, ...rest], prefixLength: prefix.length + 1 };
+    }
+    const next = ambulanceRoute[++index];
+    if (!next || next.from !== previous.to || !sim.corridorEdges.has(next.edgeId) || !usable(next)) return null;
+    prefix.push(next);
+    previous = next;
+  }
+}
+
+function hasCorridorEgress(sim: Sim, a: Agent, next: Lane): boolean {
+  const egress = corridorEgress(sim, a);
+  return egress !== null && egress.path[0].id === next.id
+    && egress.path.slice(0, egress.prefixLength).every((lane, i) => a.route[i]?.id === lane.id);
+}
+
 // One step of a vehicle's corridor command. CLEARED is only ever set from the vehicle's position.
 function progressCommand(sim: Sim, a: Agent, c: YieldCommand, reserved: boolean) {
   if (c.kind === 'REROUTE') {
@@ -859,6 +909,12 @@ function progressCommand(sim: Sim, a: Agent, c: YieldCommand, reserved: boolean)
     c.state = 'ACKNOWLEDGED'; c.reason = 'Acknowledged; looking for a safe way off';
   }
   const unable = a.fault ? 'Vehicle fault; cannot move' : a.held ? 'Waiting for a safety answer; cannot move' : null;
+  const egress = corridorEgress(sim, a);
+  if (egress) {
+    a.route = egress.path;
+    c.state = 'EXECUTING'; c.reason = 'Driving along a validated corridor egress route to a non-reserved exit';
+    return;
+  }
   if (c.state === 'ACKNOWLEDGED' || c.state === 'ESCALATED') {
     if (a.yieldStartT !== null) { c.state = 'EXECUTING'; c.reason = 'Pulling over into free curb space'; }
     else if (!unable && curbRoom(sim, a)) {
@@ -939,7 +995,8 @@ function corridorView(sim: Sim): CorridorStatus {
 }
 
 function canEnter(sim: Sim, a: Agent, lane: Lane): boolean {
-  if (edgeBlocked(sim, lane.edgeId) || (a.type !== 'AMBULANCE' && sim.corridorActive && sim.corridorEdges.has(lane.edgeId))) return false;
+  if (edgeBlocked(sim, lane.edgeId) || (a.type !== 'AMBULANCE' && sim.corridorActive
+    && sim.corridorEdges.has(lane.edgeId) && !hasCorridorEgress(sim, a, lane))) return false;
   const back = lane.cars[lane.cars.length - 1];
   return !(back && back.s < C.GAP_M);
 }
@@ -998,7 +1055,8 @@ function atStopLine(sim: Sim, a: Agent, lane: Lane) {
   if (a.yieldStartT !== null || a.fault) return;
   if (a.arrivedT === null) a.arrivedT = sim.t;
 
-  if (a.route.length && (edgeBlocked(sim, a.route[0].edgeId) || a.type !== 'AMBULANCE' && sim.corridorEdges.has(a.route[0].edgeId))) {
+  if (a.route.length && (edgeBlocked(sim, a.route[0].edgeId) || a.type !== 'AMBULANCE'
+    && sim.corridorEdges.has(a.route[0].edgeId) && !hasCorridorEgress(sim, a, a.route[0]))) {
     const detour = route(sim, lane.to, a.dest, a.type !== 'AMBULANCE' && sim.corridorActive);
     const exit = a.type === 'AMBULANCE' ? undefined : ns.out.find(l => !edgeBlocked(sim, l.edgeId) && !sim.corridorEdges.has(l.edgeId));
     if (detour?.length) a.route = detour;
