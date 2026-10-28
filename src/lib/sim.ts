@@ -75,6 +75,7 @@ type Operator = { id: string; job: Job | null; doneT: number };
 
 export type Sim = {
   graph: RoadGraph; mode: SimMode; features: Features; rng: () => number; t: number;
+  directEmergencyPriority: boolean; // engine-only experiment; FIFO never uses it
   control: ControlMode; policy: Policy;
   lanes: Lane[]; laneByStep: Map<string, Lane>; nodes: Map<number, NodeState>; nodeIds: number[];
   agents: Agent[]; amb: Agent; ambRoute: Lane[];
@@ -321,7 +322,7 @@ function policyFor(features: Features): Policy {
 }
 
 export function createSim(graph: RoadGraph, seed: number, mode: SimMode,
-  options: { randomEvents?: boolean; features?: Partial<Features> } = {}): Sim {
+  options: { randomEvents?: boolean; features?: Partial<Features>; directEmergencyPriority?: boolean } = {}): Sim {
   const features = { ...(mode === 'DARKGRID' ? ALL_FEATURES : NO_FEATURES), ...options.features };
   graph = withRoadGeometry(graph);
   const nodes = new Map<number, NodeState>();
@@ -356,7 +357,8 @@ export function createSim(graph: RoadGraph, seed: number, mode: SimMode,
   });
 
   const sim: Sim = {
-    graph, mode, features, rng: mulberry32(seed), t: 0, control: 'AUTO', policy: policyFor(features),
+    graph, mode, features, directEmergencyPriority: mode === 'DARKGRID' && (options.directEmergencyPriority ?? true),
+    rng: mulberry32(seed), t: 0, control: 'AUTO', policy: policyFor(features),
     lanes, laneByStep, nodes, nodeIds: graph.nodes.map((n) => n.id),
     agents: [], amb: blankAgent(C.VEHICLES, 'AMBULANCE'), ambRoute: [],
     mission: { originNode: nearestNode(graph, graph.pois.fireStation), pickupNode: -1,
@@ -639,6 +641,39 @@ function queuedBehind(sim: Sim, a: Agent): number {
   return cars.length - 1 - cars.indexOf(a);
 }
 
+// Prove one local dependency chain, without mutating requests, routes or intersection grants.
+// A nearby road/node is insufficient: the ambulance must be stopped in a contiguous same-lane
+// queue whose front car could pass if its outage-information request were answered now.
+function directActionableRequest(sim: Sim): string | null {
+  const amb = sim.amb;
+  if (!sim.directEmergencyPriority || sim.mode !== 'DARKGRID' || !sim.features.triage
+    || sim.dispatchT === null || sim.arriveT !== null || amb.place !== 'ROAD' || amb.speed >= 0.1) return null;
+  const lane = sim.lanes[amb.lane];
+  const index = lane.cars.indexOf(amb);
+  if (index <= 0 || edgeBlocked(sim, lane.edgeId)) return null;
+  for (let i = index; i > 0; i--) {
+    const front = lane.cars[i - 1], back = lane.cars[i];
+    const gap = front.s - back.s;
+    if (gap < 0 || gap > C.GAP_M + 1e-6 || front.speed >= 0.1 || front.fault || front.yieldStartT !== null) return null;
+    if (i > 1 && front.held) return null; // another independent information/safety hold in the chain
+  }
+  const root = lane.cars[0];
+  const request = root.requestId ? sim.requests.get(root.requestId) : undefined;
+  const ns = sim.nodes.get(lane.to)!;
+  const next = root.route[0];
+  if (!request || request.assigned || request.vehicleId !== root.id || request.nodeId !== lane.to
+    || request.cause !== 'MISSING_OUTAGE_INFO' || root.place !== 'ROAD' || root.lane !== lane.id
+    || !root.held || root.s < lane.len - 0.01 || root.arrivedT === null || !ns.dark
+    || ns.box.length > 0 || sim.t < ns.nextPassT || !next || next.from !== lane.to || !canEnter(sim, root, next)) return null;
+  const causes = darkCauses(sim, root, lane);
+  if (causes.length !== 1 || causes[0] !== 'MISSING_OUTAGE_INFO') return null;
+  const turn = fourWayStopTurn([...waitingAt(sim, ns), {
+    id: root.id, arrivedT: root.arrivedT, headingDeg: lane.headingDeg,
+    token: root.grants.has('PRIORITY_AMBIGUOUS'),
+  }]);
+  return turn.go === root.id ? request.id : null;
+}
+
 function currentJobs(sim: Sim): Job[] {
   const open: HelpRequest[] = [];
   for (const r of sim.requests.values()) {
@@ -662,7 +697,9 @@ function currentJobs(sim: Sim): Job[] {
       breakdown: [{ label: 'on corridor', value: corridor ? C.DEFAULT_WEIGHTS.onCorridor : 0 },
         { label: 'inside box', value: 0 }, { label: 'queued behind', value: queued }, { label: 'road obstruction', value: C.DEFAULT_WEIGHTS.insideBox }] });
   }
-  jobs.sort((a, b) => (sim.features.triage ? b.w / b.p - a.w / a.p : 0)
+  const emergencyRequest = directActionableRequest(sim);
+  const emergency = (job: Job) => emergencyRequest !== null && job.requestIds.includes(emergencyRequest) ? 1 : 0;
+  jobs.sort((a, b) => emergency(b) - emergency(a) || (sim.features.triage ? b.w / b.p - a.w / a.p : 0)
     || a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const zone = zoneJob(sim);
   return zone ? [zone, ...jobs] : jobs;
