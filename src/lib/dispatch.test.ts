@@ -35,7 +35,7 @@ describe('original brief scenario', () => {
     const jobs = orderJobs(scenario(), policy());
     expect(jobs.map(j => j.requestIds)).toEqual([['R1'], ['R2', 'R3', 'R4'], ['R5']]);
     expect(jobs.map(j => j.w)).toEqual([14.5, 6, 3]);
-    expect(jobs.map(j => j.p)).toEqual([30, 45, 30]);
+    expect(jobs.map(j => j.p)).toEqual([60, 90, 60]);
     expect(jobs.map(j => j.kind)).toEqual(['CORRIDOR', 'BATCH', 'STUCK']);
     expect(jobs.map(j => j.createdAt)).toEqual([1, 2, 5]);
     expect(jobs[1].vehicleIds).toEqual([2, 3, 4]);
@@ -44,12 +44,12 @@ describe('original brief scenario', () => {
   it('WSPT batchMax=1: R1, R5, R2, R3, R4', () => {
     const jobs = orderJobs(scenario(), policy(1));
     expect(jobs.map(j => j.requestIds)).toEqual([['R1'], ['R5'], ['R2'], ['R3'], ['R4']]);
-    expect(jobs.every(j => j.p === 30)).toBe(true);
+    expect(jobs.every(j => j.p === 60)).toBe(true);
   });
   it('FIFO: R1, R2, R3, R4, R5, regardless of input order or weight', () => {
     const jobs = orderJobs(scenario().reverse(), policy(40, 'FIFO'));
     expect(jobs.map(j => j.requestIds)).toEqual([['R1'], ['R2'], ['R3'], ['R4'], ['R5']]);
-    expect(jobs.every(j => j.kind === 'FIFO' && j.p === 30)).toBe(true);
+    expect(jobs.every(j => j.kind === 'FIFO' && j.p === 60)).toBe(true);
   });
 });
 
@@ -61,13 +61,13 @@ describe('batching and priorities', () => {
   });
   it('batches compatible requests despite different triage flags', () => {
     const jobs = orderJobs([request('a'), request('b', { onCorridor: true, insideBox: true })], policy());
-    expect(jobs).toHaveLength(1); expect(jobs[0].w).toBe(13); expect(jobs[0].p).toBe(45);
+    expect(jobs).toHaveLength(1); expect(jobs[0].w).toBe(13); expect(jobs[0].p).toBe(90);
   });
-  it('chunks oldest-first at batchMax and charges 30 seconds for a leftover singleton', () => {
+  it('chunks oldest-first at batchMax and charges 60 seconds for a leftover singleton', () => {
     const requests = Array.from({ length: 5 }, (_, i) => request(`r${i}`, { createdAt: i, queuedBehind: 1 }));
     const jobs = orderJobs(requests.reverse(), policy(2));
     expect(jobs.map(j => j.requestIds)).toEqual([['r0', 'r1'], ['r2', 'r3'], ['r4']]);
-    expect(jobs.map(j => j.p)).toEqual([45, 45, 30]);
+    expect(jobs.map(j => j.p)).toEqual([90, 90, 60]);
   });
   it('ranks by weight/time rather than raw weight', () => {
     const jobs = orderJobs([request('a', { queuedBehind: 2 }), request('b', { queuedBehind: 2 }),

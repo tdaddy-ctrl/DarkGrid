@@ -223,6 +223,15 @@ kbd { font-family: inherit; font-size: 10px; line-height: 18px; padding: 0 4px; 
 .comparison-maps > section > div:first-child { padding: 11px 14px; }
 .comparison-maps svg[role="img"] { min-height: 0; }
 .comparison-maps .dg-label { font-size: 11px; }
+.comparison-maps .policy-alert { --alert-color: #ff2a54; animation: policy-alert-flash .6s ease-in-out 3; }
+.comparison-maps .policy-alert-arrived { --alert-color: #34d399; }
+@keyframes policy-alert-flash {
+  0%, 100% { background: transparent; box-shadow: none; }
+  20%, 65% { background: color-mix(in srgb, var(--alert-color) 35%, transparent); box-shadow: 0 0 14px 3px var(--alert-color); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .comparison-maps .policy-alert { animation: none; background: color-mix(in srgb, var(--alert-color) 35%, transparent); box-shadow: 0 0 0 2px var(--alert-color); }
+}
 .comparison-maps section > div:last-child > div { padding: 9px 12px; }
 .comparison-maps section > div:last-child p { font-family: var(--font-plex), sans-serif; letter-spacing: 0; }
 .comparison-data { height: 205px; flex: 0 0 205px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }

@@ -10,6 +10,8 @@ export type TimelineScrubberProps = {
   outageT: number | null;
   onScrub(t: number): void;
   onGoLive(): void;
+  speed: 1 | 2 | 4;
+  onSpeedChange(speed: 1 | 2 | 4): void;
 };
 
 function formatTime(t: number): string {
@@ -19,7 +21,7 @@ function formatTime(t: number): string {
 }
 
 /** Controlled display only: the parent owns recording, playback and the live clock. */
-export default function TimelineScrubber({ range, t, isLive, outageT, onScrub, onGoLive }: TimelineScrubberProps) {
+export default function TimelineScrubber({ range, t, isLive, outageT, onScrub, onGoLive, speed, onSpeedChange }: TimelineScrubberProps) {
   const helpId = useId();
   const hasRange = range !== null && Number.isFinite(range.start)
     && Number.isFinite(range.end) && range.end >= range.start;
@@ -77,6 +79,18 @@ export default function TimelineScrubber({ range, t, isLive, outageT, onScrub, o
         {canScrub ? `Use arrow keys to move ${HISTORY_EVERY_S} simulation seconds. Recorded range ${formatTime(start)} to ${formatTime(end)}.`
           : hasRange ? 'Only one recorded timestamp is available.' : 'No recorded history is available.'}
       </span>
+      <div role="group" aria-label="Simulation speed" className="flex shrink-0 gap-0.5">
+        {([1, 2, 4] as const).map(value => (
+          <button key={value} type="button" aria-label={`Simulation speed ${value}× demo speed`}
+            aria-pressed={speed === value} title="1× is the existing demo speed (10 simulation seconds per second before follow slowdown)"
+            onClick={() => onSpeedChange(value)}
+            className={`h-8 rounded-md border px-2 font-mono text-[11px] font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-dg-cyan ${
+              speed === value ? 'border-dg-cyan/60 bg-dg-cyan/15 text-dg-cyan'
+                : 'border-dg-line text-dg-label hover:border-dg-cyan/50 hover:text-dg-cyan'}`}>
+            {value}×
+          </button>
+        ))}
+      </div>
       <button type="button" aria-label="Go live" aria-pressed={isLive} onClick={onGoLive}
         className={`flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-2 font-mono text-[11px] font-semibold tracking-widest transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-dg-cyan ${
           isLive ? 'border-dg-cyan/60 bg-dg-cyan/15 text-dg-cyan shadow-[0_0_12px_rgba(56,189,248,0.3)]'

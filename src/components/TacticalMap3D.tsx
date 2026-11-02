@@ -264,7 +264,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
   const motionRef = useRef(motion);
   useEffect(() => { motionRef.current = motion; }, [motion]);
   const [failed, setFailed] = useState(false);
-  const [source, setSource] = useState<'google' | 'osm'>(GOOGLE_KEY ? 'google' : 'osm');
+  const [source, setSource] = useState<'google' | 'osm'>('osm');
   const [photoNotice, setPhotoNotice] = useState('');
   const [credits, setCredits] = useState('');
   const switchRef = useRef<((to: 'google' | 'osm') => void) | null>(null);
@@ -329,7 +329,7 @@ export default function TacticalMap3D({ snapshot, graph, fallback, hazardCenter,
           fetch('/data/sf_buildings.json'),
           fetch('/data/sf_ground.json').catch(() => null),
         ]);
-        let photo = !!geo;
+        let photo = false;
         setSource(photo ? 'google' : 'osm');
         const buildings: Building[] = buildingsRes.ok ? await buildingsRes.json() : [];
         const seaLevel = groundSampler(groundRes?.ok ? await groundRes.json() : []);

@@ -3,11 +3,53 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import * as C from './config';
 import { loadRoadGraph } from './graph';
-import { answerJob, createSim, injectEvent, pickCollisionEdge, revokeZonePolicy, setControl, step, type Features, type Sim } from './sim';
+import { answerJob, createSim, getSnapshot, injectEvent, pickCollisionEdge, revokeZonePolicy, setControl, step, type Features, type Sim } from './sim';
 
 const graph = loadRoadGraph(JSON.parse(readFileSync('public/data/downtown_roads.json', 'utf8')));
 const DT = 0.5;   // the sim's own substep
 const NO_FEATURES: Features = { triage: false, batching: false, zonePolicy: false, corridor: false, staging: false, incidentBroadcast: false };
+
+describe('demo blackout and fixed-step progression', () => {
+  it('enlarges coverage on existing nodes consistently in both cities and snapshots', () => {
+    const original = createSim(graph, C.SEED, 'FIFO');
+    const fifo = createSim(graph, C.SEED, 'FIFO');
+    const darkgrid = createSim(graph, C.SEED, 'DARKGRID');
+    const plan = fifo.plannedOutage;
+    const event = { type: 'OUTAGE' as const, center: plan.center, radiusM: plan.radiusM * 2, restoreAfterS: plan.restoreAfterS };
+    injectEvent(original, { ...event, radiusM: plan.radiusM });
+    injectEvent(fifo, event);
+    injectEvent(darkgrid, event);
+    const before = getSnapshot(original), after = getSnapshot(fifo), rival = getSnapshot(darkgrid);
+    expect(after.outage?.radiusM).toBe(plan.radiusM * 2);
+    expect(after.darkNodes.length).toBeGreaterThan(before.darkNodes.length);
+    expect(after.darkNodes).toEqual(expect.arrayContaining(before.darkNodes));
+    expect(after.metrics.darkCount).toBe(after.darkNodes.length);
+    expect(rival.darkNodes).toEqual(after.darkNodes);
+    expect(rival.outage).toEqual(after.outage);
+    expect(rival.metrics.darkCount).toBe(after.darkNodes.length);
+    for (const node of after.darkNodes) {
+      expect(graph.nodes.some(n => n.lat === node.lat && n.lng === node.lng)).toBe(true);
+      const dx = (node.lng - event.center.lng) * 111320 * Math.cos(graph.center.lat * Math.PI / 180);
+      const dy = (node.lat - event.center.lat) * 110540;
+      expect(Math.hypot(dx, dy)).toBeLessThanOrEqual(event.radiusM + 1e-6);
+    }
+    expect(fifo.plannedOutage).toEqual(plan);
+  });
+
+  it('grouping fixed steps at 1×, 2× and 4× preserves events, movement and metrics at equal simulation time', () => {
+    const snapshots = [1, 2, 4].map(multiplier => {
+      const sim = createSim(graph, 23, 'DARKGRID', { randomEvents: true });
+      for (let frame = 0; frame < 400 / multiplier; frame++) {
+        for (let substep = 0; substep < multiplier; substep++) step(sim, DT);
+      }
+      expect(sim.t).toBe(200);
+      expect(sim.outageT).not.toBeNull();
+      return getSnapshot(sim);
+    });
+    expect(snapshots[1]).toEqual(snapshots[0]);
+    expect(snapshots[2]).toEqual(snapshots[0]);
+  });
+});
 
 /** Everything that moves or decides, as one string. Excludes the mode label on purpose. */
 function state(sim: Sim): string {
@@ -294,12 +336,12 @@ describe('operator jobs after request cancellation', () => {
       expect(op.doneT).toBe(sim.t + C.SERVICE_SINGLE_S);
     });
 
-    it(mode + ': keeps the normal single-job deadline at 30 simulation seconds', () => {
+    it(mode + ': keeps the normal single-job deadline at 60 simulation seconds', () => {
       const { sim, ids } = fixture(mode);
       step(sim, DT);
       const op = sim.operators.find(o => o.job?.requestIds.includes(ids[0]))!;
       const job = op.job!;
-      expect(op.doneT - sim.t).toBe(30);
+      expect(op.doneT - sim.t).toBe(60);
       step(sim, C.SERVICE_SINGLE_S - DT);
       expect(op.job).toBe(job);
       expect(sim.requests.has(ids[0])).toBe(true);
@@ -330,12 +372,12 @@ describe('operator jobs after request cancellation', () => {
     });
   }
 
-  it('keeps a partial batch and its original 45-second deadline', () => {
+  it('keeps a partial batch and its original 90-second deadline', () => {
     const { sim, ids } = fixture('DARKGRID', 2);
     step(sim, DT);
     const op = sim.operators.find(o => o.job?.kind === 'BATCH')!;
     const job = op.job!, deadline = op.doneT;
-    expect(deadline - sim.t).toBe(45);
+    expect(deadline - sim.t).toBe(90);
     // Simulate one member receiving independent outage information: the other still needs review.
     sim.requests.delete(ids[0]); sim.agents[0].requestId = null; sim.agents[0].held = false;
     sim.agents[0].known.add(sim.lanes[sim.agents[0].lane].to);

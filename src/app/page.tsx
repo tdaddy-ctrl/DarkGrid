@@ -21,6 +21,8 @@ import AskWhyBar from '@/components/AskWhyBar';
 import TacticalMap3D from '@/components/TacticalMap3D';
 import TimelineScrubber from '@/components/TimelineScrubber';
 import ArrivalOverlay from '@/components/ArrivalOverlay';
+import { useIncidentAlerts } from '@/components/useIncidentAlerts';
+import type { AlertKind } from '@/lib/incident-alerts';
 
 const STEP_S = 0.5;          // fixed sim timestep
 const UI_EVERY_MS = 250;     // React state updates at most 4x per second
@@ -198,9 +200,11 @@ export default function Home() {
 
 // Each environment/run gets its own component instance: refs, clocks and controls reset together.
 function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph: RoadGraph; seed: number; onReset: () => void; onNewScenario: () => void; envSelect: ReactNode }) {
+  const { alerts, observe: observeAlerts, blackout: playBlackout, muted, toggleMuted } = useIncidentAlerts();
   const simsRef = useRef<{ fifo: Sim; darkgrid: Sim } | null>(null);
   const chartRef = useRef<ChartPoint[]>([]);
   const pausedRef = useRef(false);
+  const speedRef = useRef<1 | 2 | 4>(1);
   const historyRef = useRef<History | null>(null);
   const historyContextRef = useRef(new Map<number, {
     fifo: ReturnType<typeof historyContext>; darkgrid: ReturnType<typeof historyContext>;
@@ -212,6 +216,11 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
   const [view, setView] = useState<View | null>(null);
   const [mode, setMode] = useState<Mode>('DARKGRID');
   const [paused, setPaused] = useState(false);
+  const [speed, setSpeed] = useState<1 | 2 | 4>(1);
+  const onSpeedChange = (next: 1 | 2 | 4) => {
+    speedRef.current = next;
+    setSpeed(next);
+  };
   const [surface, setSurface] = useState<Surface>('city');
   const [leftOpen, setLeftOpen] = useState(true);
   const [leftWidth, setLeftWidth] = useState<number | null>(null);
@@ -239,10 +248,11 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
     const fifo: SimSnapshot = recorded && context ? { ...context.fifo, ...recorded.fifo } : getSnapshot(sims.fifo);
     const darkgrid: SimSnapshot = recorded && context ? { ...context.darkgrid, ...recorded.darkgrid } : getSnapshot(sims.darkgrid);
     playbackTRef.current = isLive ? null : fifo.t;
+    observeAlerts(isLive ? fifo : getSnapshot(sims.fifo), isLive ? darkgrid : getSnapshot(sims.darkgrid), isLive);
     setView({ fifo, darkgrid,
       chart: isLive ? [...chartRef.current] : chartRef.current.filter(point => point.t <= fifo.t),
       historyRange: bounds, outageT: sims.fifo.outageT, isLive });
-  }, []);
+  }, [observeAlerts]);
 
   const recordHistory = useCallback(() => {
     const sims = simsRef.current, history = historyRef.current;
@@ -367,7 +377,11 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
 
   const director = useMemo(() => [
     onReset,
-    () => { blackout(); setAct(1); setSurface('city'); setFollow(false); },
+    () => {
+      const plan = simsRef.current?.fifo.plannedOutage;
+      if (plan) blackout(plan.radiusM * 2);
+      setAct(1); setSurface('city'); setFollow(false);
+    },
     () => { takeOver('FIFO'); setAct(2); setSurface('city'); setFollow(false); },
     () => { takeOver('DARKGRID'); setAct(3); setSurface('city'); setFollow(false); },
     () => { setFollow(false); setSurface('compare'); setAct(4); },
@@ -396,7 +410,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
       const realDt = Math.min(MAX_FRAME_S, (now - last) / 1000);
       last = now;
       if (sims && !pausedRef.current) {
-        acc += realDt * SIM_SPEED * (slowRef.current ? FOLLOW_SPEED : 1);
+        acc += realDt * SIM_SPEED * speedRef.current * (slowRef.current ? FOLLOW_SPEED : 1);
         while (acc >= STEP_S) {
           const before = sims.fifo.t;
           step(sims.fifo, STEP_S);
@@ -441,7 +455,8 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
   const contextualQueue = expanded && !split && !follow && (snap.control === 'MANUAL' || pendingPolicy);
   const demoStep = follow ? 5 : split ? 4 : snap.control === 'MANUAL' ? (mode === 'FIFO' ? 2 : 3) : act;
   const timeline = <TimelineScrubber range={view.historyRange} t={snap.t} isLive={view.isLive}
-    outageT={view.outageT} onScrub={onScrub} onGoLive={onGoLive} />;
+    outageT={view.outageT} onScrub={onScrub} onGoLive={onGoLive}
+    speed={speed} onSpeedChange={onSpeedChange} />;
   const changeSurface = (next: Surface) => {
     setSurface(next);
     if (next === 'requests') restoreLeft();
@@ -466,7 +481,8 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
         </span>
         <span className="header-clock" title="Simulation time">T+{formatT(snap.t)}</span>
         <div className="header-actions">
-          <button type="button" className="action-button warning header-blackout" disabled={view.outageT !== null || !view.isLive} onClick={director[1]}><Zap />Trigger blackout</button>
+          <button type="button" className="action-button warning header-blackout" disabled={view.outageT !== null || !view.isLive} onClick={() => { director[1](); playBlackout(); }}><Zap />Trigger blackout</button>
+          <button type="button" className="present-button" aria-label="Mute sound effects" aria-pressed={muted} onClick={toggleMuted}>{muted ? 'Sound off' : 'Sound on'}</button>
           <button type="button" className="present-button" onClick={() => expanded ? exitPresentation() : enterPresentation()}>
             {expanded ? <Minimize2 /> : <Maximize2 />}<span>{expanded ? 'Exit presentation' : 'Present'}</span>
             {expanded && <kbd>Esc</kbd>}
@@ -520,7 +536,7 @@ function Simulation({ graph, seed, onReset, onNewScenario, envSelect }: { graph:
           </div>}
 
           {split && <section className="comparison-workspace" aria-label="FIFO and DARK GRID comparison">
-            <div className="comparison-maps"><MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} /><MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} /></div>
+            <div className="comparison-maps"><MapPlaceholder snapshot={view.fifo} graph={graph} other={view.darkgrid} alert={view.isLive ? alerts.FIFO : undefined} /><MapPlaceholder snapshot={view.darkgrid} graph={graph} other={view.fifo} alert={view.isLive ? alerts.DARKGRID : undefined} /></div>
           </section>}
 
           {/* Keep these forms mounted so switching destinations never loses an analysis or voice session. */}
@@ -614,10 +630,10 @@ function Badge({ children, tone = 'idle' }: { children: ReactNode; tone?: Tone }
   );
 }
 
-function PanelHeader({ title, tone, titleClass = '', children }: { title: string; tone: Tone; titleClass?: string; children?: ReactNode }) {
+function PanelHeader({ title, tone, titleClass = '', titleKey, children }: { title: string; tone: Tone; titleClass?: string; titleKey?: number; children?: ReactNode }) {
   return (
     <div className="flex items-center justify-between gap-3 border-b border-dg-line px-4 py-3">
-      <h2 className={`dg-label flex items-center gap-2 ${titleClass}`}><Dot tone={tone} />{title}</h2>
+      <h2 key={titleKey} className={`dg-label flex items-center gap-2 ${titleClass}`}><Dot tone={tone} />{title}</h2>
       {children && <div className="flex shrink-0 items-center gap-1.5">{children}</div>}
     </div>
   );
@@ -643,8 +659,8 @@ const LEGEND: [string, string][] = [
 
 // Stand-in for MapView: an SVG of the road graph. With `other`, it is one half of the split
 // view: the header names the policy and a strip under the map compares the two cities.
-function MapPlaceholder({ snapshot, graph, other, rival = other }: {
-  snapshot: SimSnapshot; graph: RoadGraph; other?: SimSnapshot; rival?: SimSnapshot;
+function MapPlaceholder({ snapshot, graph, other, rival = other, alert }: {
+  snapshot: SimSnapshot; graph: RoadGraph; other?: SimSnapshot; rival?: SimSnapshot; alert?: { kind: AlertKind; id: number };
 }) {
   const uid = useId().replace(/:/g, '');
   // Project in meters around the graph centre so the map keeps its real aspect (no lat/lng stretch),
@@ -672,7 +688,8 @@ function MapPlaceholder({ snapshot, graph, other, rival = other }: {
       <PanelHeader
         title={other ? (snapshot.mode === 'FIFO' ? 'First come, first served' : 'DARK GRID') : `Tactical map · ${cityShort(snapshot.mode)}`}
         tone={other ? (snapshot.mode === 'FIFO' ? 'red' : 'cyan') : outage ? 'amber' : 'cyan'}
-        titleClass={other ? `font-display text-[13px]! font-semibold ${snapshot.mode === 'FIFO' ? 'text-dg-red!' : 'text-dg-cyan!'}` : ''}>
+        titleClass={other ? `font-display text-[13px]! font-semibold ${snapshot.mode === 'FIFO' ? 'text-dg-red!' : 'text-dg-cyan!'} ${alert ? `policy-alert policy-alert-${alert.kind}` : ''}` : ''}
+        titleKey={alert?.id}>
         <Badge>{snapshot.vehicles.length} units</Badge>
         {outage && <Badge tone="amber">{snapshot.darkNodes.length} dark</Badge>}
       </PanelHeader>

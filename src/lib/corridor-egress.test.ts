@@ -1,9 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import type { RoadGraph } from '../types/sim';
 import { loadRoadGraph } from './graph';
 import { createSim, getSnapshot, injectEvent, step, type Sim } from './sim';
 import * as C from './config';
+
+// The exact connector regression predates the shorter lookahead and longer service times.
+// Pin only that historical fixture; every other case uses the current app defaults.
+const fixtureConfig = vi.hoisted(() => ({ historical: false }));
+vi.mock('./config', async importOriginal => {
+  const actual = await importOriginal<typeof import('./config')>();
+  return { ...actual,
+    get CORRIDOR_LOOKAHEAD_M() { return fixtureConfig.historical ? 650 : actual.CORRIDOR_LOOKAHEAD_M; },
+    get SERVICE_SINGLE_S() { return fixtureConfig.historical ? 30 : actual.SERVICE_SINGLE_S; },
+    get SERVICE_BATCH_S() { return fixtureConfig.historical ? 45 : actual.SERVICE_BATCH_S; },
+  };
+});
 
 const DT = 0.5;
 function network(immediateExit = false): RoadGraph {
@@ -213,19 +225,29 @@ describe('controlled corridor egress', () => {
     expect(sim.yieldCommands.size).toBe(0);
   });
 
-  it('regresses the exact Downtown t=22 blackout through t=2269', () => {
-    const graph = loadRoadGraph(JSON.parse(readFileSync('public/data/downtown_roads.json', 'utf8')));
-    const sim = createSim(graph, 20251220, 'DARKGRID');
-    let crossedConnector = false;
-    for (let t = 0; t < 2269; t += DT) {
-      if (t === 22) injectEvent(sim, { type: 'OUTAGE', center: sim.plannedOutage.center, radiusM: 1394, restoreAfterS: sim.plannedOutage.restoreAfterS });
-      const old = sim.agents[48].lane;
-      safeStep(sim);
-      if (old === 1795 && sim.agents[48].lane === 1880) crossedConnector = true;
-    }
-    expect(crossedConnector).toBe(true);
-    expect(sim.arriveT).not.toBeNull();
-    expect(sim.metrics.ambulanceTripS).toBeLessThan(2187);
-    expect(getSnapshot(sim).ambulance?.status).toBe('ARRIVED');
+  it.each([
+    { scenario: 'historical connector fixture', historical: true, restoreAfterS: 349 },
+    { scenario: 'current app defaults', historical: false, restoreAfterS: undefined },
+  ])('regresses the Downtown t=22 blackout through t=2269: $scenario', ({ historical, restoreAfterS }) => {
+    fixtureConfig.historical = historical;
+    try {
+      const graph = loadRoadGraph(JSON.parse(readFileSync('public/data/downtown_roads.json', 'utf8')));
+      const sim = createSim(graph, 20251220, 'DARKGRID');
+      let crossedConnector = false;
+      for (let t = 0; t < 2269; t += DT) {
+        // 349 s is this seed's original restoration delay; 0 now means permanent blackout.
+        if (t === 22) injectEvent(sim, { type: 'OUTAGE', center: sim.plannedOutage.center, radiusM: 1394, restoreAfterS: restoreAfterS ?? sim.plannedOutage.restoreAfterS });
+        const old = sim.agents[48].lane;
+        safeStep(sim);
+        if (old === 1795 && sim.agents[48].lane === 1880) {
+          crossedConnector = true;
+          if (historical && sim.arriveT === null) expect(sim.yieldCommands.get(48)?.reason).toContain('validated corridor egress');
+        }
+      }
+      if (historical) expect(crossedConnector).toBe(true);
+      expect(sim.arriveT).not.toBeNull();
+      expect(sim.metrics.ambulanceTripS).toBeLessThan(2187);
+      expect(getSnapshot(sim).ambulance?.status).toBe('ARRIVED');
+    } finally { fixtureConfig.historical = false; }
   }, 60000);
 });
